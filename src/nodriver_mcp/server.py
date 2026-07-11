@@ -27,36 +27,57 @@ logger = logging.getLogger("nodriver-mcp")
 _browser: uc.Browser | None = None
 _browser_lock = asyncio.Lock()
 
+# Chrome profile (user-data-dir) selection.
+# Default None -> ephemeral temp profile that nodriver creates and auto-deletes,
+# so multiple nodriver instances (Claude Desktop, Claude Code, VS Code, ...) can
+# run at the same time without ever colliding on a shared profile. Selectable at
+# runtime via use_profile()/use_temp_profile(); NODRIVER_USER_DATA_DIR still
+# works as an explicit persistent override.
+_selected_profile_dir: str | None = None
+_selected_profile_name: str | None = None
+_PROFILES_DIR = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "profiles")
+
 
 async def _get_browser() -> uc.Browser:
-    """Start the browser on first tool call (lazy init, protected by mutex)."""
+    """Start the browser on first tool call (lazy init, protected by mutex).
+
+    Profile precedence:
+      1. a persistent profile selected at runtime via use_profile()
+      2. the NODRIVER_USER_DATA_DIR env var (explicit persistent dir)
+      3. default: an ephemeral temp profile nodriver creates and deletes itself.
+    """
     global _browser
     async with _browser_lock:
         if _browser is None or _browser.stopped:
             headless = os.environ.get("NODRIVER_HEADLESS", "").lower() in ("1", "true", "yes")
-            user_data_dir = os.environ.get(
-                "NODRIVER_USER_DATA_DIR",
-                os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "chrome-profile"),
-            )
             browser_path = os.environ.get("NODRIVER_BROWSER_PATH", None)
             proxy = os.environ.get("NODRIVER_PROXY", None)
 
-            os.makedirs(user_data_dir, exist_ok=True)
-            kwargs: dict[str, Any] = {"headless": headless, "user_data_dir": user_data_dir}
-            logger.info("Using user data dir: %s", user_data_dir)
+            kwargs: dict[str, Any] = {"headless": headless}
+
+            data_dir = _selected_profile_dir or os.environ.get("NODRIVER_USER_DATA_DIR")
+            if data_dir:
+                os.makedirs(data_dir, exist_ok=True)
+                kwargs["user_data_dir"] = data_dir
+                logger.info("Using persistent profile dir: %s", data_dir)
+            else:
+                # Omit user_data_dir -> nodriver uses a fresh temp profile it
+                # auto-removes on exit. No collisions between concurrent instances.
+                logger.info("Using an ephemeral temp profile (auto-cleaned)")
+
             if browser_path:
                 kwargs["browser_executable_path"] = browser_path
 
-            browser_args = []
             if proxy:
-                browser_args.append(f"--proxy-server={proxy}")
+                kwargs["browser_args"] = [f"--proxy-server={proxy}"]
                 logger.info("Proxy configured: %s", proxy)
-            if browser_args:
-                kwargs["browser_args"] = browser_args
 
             _browser = await uc.start(**kwargs)
 
-            logger.info("Browser started (headless=%s)", headless)
+            logger.info(
+                "Browser started (headless=%s, profile=%s)",
+                headless, _selected_profile_name or "temp",
+            )
 
             # Auto-enable network collection on the first tab.
             # Console collection is opt-in because Runtime.enable() can be detected.
@@ -821,6 +842,29 @@ async def _format_pages() -> str:
     for i, tab in enumerate(browser.tabs):
         lines.append(f"  [{i}] {tab.target.url} — {tab.target.title}")
     return "\n".join(lines)
+
+
+def _safe_profile_name(name: str) -> str:
+    """Sanitize a profile name to a safe directory name."""
+    return "".join(c for c in (name or "").strip() if c.isalnum() or c in "-_")
+
+
+async def _restart_browser_with(profile_dir: str | None, profile_name: str | None) -> None:
+    """Select a profile and drop the current browser so the next tool call
+    relaunches Chrome with it. Any open pages are closed."""
+    global _browser, _selected_profile_dir, _selected_profile_name, _selected_target_id
+    _selected_profile_dir = profile_dir
+    _selected_profile_name = profile_name
+    if _browser is not None and not _browser.stopped:
+        try:
+            _browser.stop()
+        except Exception:
+            pass
+    _browser = None
+    _selected_target_id = None
+    _network_collection_enabled_tabs.clear()
+    _console_collection_enabled_tabs.clear()
+    _named_browser_contexts.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -2293,6 +2337,122 @@ async def list_sessions() -> str:
             lines.append(f"  {f} (unable to read)")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Chrome profile (user-data-dir) management
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def list_profiles() -> str:
+    """List saved persistent Chrome profiles and show which profile is active.
+
+    By default the browser uses a fresh ephemeral temp profile per session
+    (auto-deleted), so multiple nodriver instances never collide on one profile.
+    Persistent profiles let you reuse logins/cookies across sessions.
+    """
+    os.makedirs(_PROFILES_DIR, exist_ok=True)
+    names = sorted(
+        d for d in os.listdir(_PROFILES_DIR)
+        if os.path.isdir(os.path.join(_PROFILES_DIR, d))
+    )
+    running = bool(_browser and not _browser.stopped)
+    active = _selected_profile_name or "temp (ephemeral, auto-deleted)"
+    lines = [
+        f"Active profile: {active}",
+        f"Browser running: {running}",
+        "",
+        f"Persistent profiles ({len(names)}) under {_PROFILES_DIR}:",
+    ]
+    if not names:
+        lines.append("  (none yet — create one with create_profile)")
+    for n in names:
+        mark = "  <- ACTIVE" if n == _selected_profile_name else ""
+        lines.append(f"  - {n}{mark}")
+    lines += [
+        "",
+        "Default = ephemeral temp profile per session. Switch with use_profile(name); "
+        "return to ephemeral with use_temp_profile().",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def create_profile(name: str, activate: bool = False) -> str:
+    """Create a new named persistent Chrome profile (a reusable user-data dir).
+
+    Args:
+        name: Profile name (letters, digits, '-' or '_'), e.g. "google-login".
+        activate: If true, switch the browser to this profile now (restarts the browser).
+    """
+    safe = _safe_profile_name(name)
+    if not safe:
+        return "Error: invalid profile name. Use letters, digits, '-' or '_'."
+    path = os.path.join(_PROFILES_DIR, safe)
+    existed = os.path.isdir(path)
+    os.makedirs(path, exist_ok=True)
+    msg = f"Profile '{safe}' {'already exists' if existed else 'created'} at {path}."
+    if activate:
+        await _restart_browser_with(path, safe)
+        msg += f"\nActivated — the browser will use profile '{safe}' on the next action."
+    else:
+        msg += f"\nActivate it with use_profile(\"{safe}\")."
+    return msg
+
+
+@mcp.tool()
+async def use_temp_profile() -> str:
+    """Switch to a fresh ephemeral temp profile (auto-created and deleted per
+    session). This is the default, and lets many nodriver instances run at once
+    without colliding. Restarts the browser (open pages are closed).
+    """
+    await _restart_browser_with(None, None)
+    return "Switched to an ephemeral temp profile (auto-deleted after the session)."
+
+
+@mcp.tool()
+async def use_profile(name: str) -> str:
+    """Switch the browser to a persistent profile by name. Restarts the browser
+    (any open pages are closed). Pass "" or "temp" to return to an ephemeral
+    temp profile.
+
+    Args:
+        name: The persistent profile name (see list_profiles), or "" / "temp".
+    """
+    if not name or name.strip().lower() in ("temp", "ephemeral", "none"):
+        return await use_temp_profile()
+    safe = _safe_profile_name(name)
+    if not safe:
+        return "Error: invalid profile name."
+    path = os.path.join(_PROFILES_DIR, safe)
+    if not os.path.isdir(path):
+        return (f"Error: profile '{safe}' does not exist. "
+                f"Create it with create_profile(\"{safe}\") or see list_profiles().")
+    await _restart_browser_with(path, safe)
+    return f"Switched to persistent profile '{safe}' ({path}). It starts on the next action."
+
+
+@mcp.tool()
+async def delete_profile(name: str) -> str:
+    """Delete a persistent Chrome profile directory (cannot delete the active one).
+
+    Args:
+        name: The persistent profile name to delete.
+    """
+    safe = _safe_profile_name(name)
+    if not safe:
+        return "Error: invalid profile name."
+    if _selected_profile_name == safe:
+        return f"Error: '{safe}' is the active profile. Switch away first with use_temp_profile()."
+    path = os.path.join(_PROFILES_DIR, safe)
+    if not os.path.isdir(path):
+        return f"Error: profile '{safe}' does not exist."
+    import shutil
+    try:
+        shutil.rmtree(path)
+    except Exception as e:
+        return f"Error deleting profile '{safe}': {e}"
+    return f"Deleted profile '{safe}'."
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0 — ephemeral profiles by default + profile management
+
+- **Temp profile by default.** The browser now launches with a fresh ephemeral
+  Chrome profile (created and auto-deleted by nodriver) instead of a single
+  shared `~/.nodriver-mcp/chrome-profile`. This lets multiple nodriver instances
+  (Claude Desktop, Claude Code, VS Code, …) run **at the same time** without
+  colliding on one profile — no detection logic or prompts needed. Verified with
+  two independent browsers navigating concurrently.
+- **Named persistent profiles** for reusing logins across sessions, via 5 new
+  tools: `list_profiles`, `create_profile`, `use_profile`, `use_temp_profile`,
+  `delete_profile`. Stored under `~/.nodriver-mcp/profiles/<name>`.
+- `NODRIVER_USER_DATA_DIR` still works as an explicit persistent override.
+- Tool count: 42 → 47.
+
 ## 1.3.0 — audit fixes & upstream nodriver
 
 Backend migrated from the `Saber-CC/nodriver` fork (0.48.1, pinned at a moving
