@@ -1,0 +1,82 @@
+# Changelog
+
+## 1.3.0 — audit fixes & upstream nodriver
+
+Backend migrated from the `Saber-CC/nodriver` fork (0.48.1, pinned at a moving
+`@main`) to **upstream `nodriver>=0.50.3`**. The Chrome 146+ CDP fixes that once
+required the fork (`sameParty` removed from `Cookie`,
+`privateNetworkRequestPolicy` → `localNetworkAccessRequestPolicy`) are upstream
+as of 0.50.x. Verified working against **Chrome 150** (navigate, a11y snapshot,
+screenshot, cookie parsing, UA client-hints and device-metrics emulation).
+
+`mcp` is now bounded `>=1.26.0,<2` to avoid the upcoming breaking v2.
+
+### Fixed (all verified end-to-end against Chrome 150)
+
+- **`select_page` had no effect** (critical). `_active_tab()` always returned
+  `browser.tabs[-1]`, so every tool after `select_page(N)` acted on the
+  last-opened tab, not the selected one. A selected `target_id` is now tracked
+  and honored; `close_page` clears it; a foreground `new_page` selects itself.
+- **`fill` / `fill_form` always failed** (critical). nodriver returns a
+  `(RemoteObject, ExceptionDetails)` tuple from `Runtime.callFunctionOn`; the
+  code read `.value` on the tuple → `AttributeError`. Added a tuple-safe
+  `_call_function_on` helper that also surfaces JS exceptions. `fill_form` now
+  reports per-field failures accurately instead of always saying "filled".
+- **`evaluate_script(function, args=[…])` always errored** (critical) with
+  `Either objectId or executionContextId must be specified`. It now binds the
+  first resolved element as the call target and surfaces JS exceptions.
+- **`press_key` modifier combos did nothing** (high). `Control+A`, `Control+C`,
+  etc. never applied the CDP modifier bitmask. Modifiers (Alt=1/Ctrl=2/Meta=4/
+  Shift=8) are now applied, plus `code`/`windowsVirtualKeyCode`/`text` for named
+  and printable keys. `type_text`'s `submit_key` uses the same descriptor.
+- **`get_network_request` / `get_console_message` returned the wrong item**
+  (high). List views showed positional indices over a filtered/paginated/
+  preserved set while the getters indexed the raw list. Each collected request/
+  message now carries a stable monotonic `seq`; lists show it and the getters
+  resolve by it.
+- **`nodriver-mcp install --scope project` crashed** (high) with argparse exit 2
+  (`--scope` was only on the parent parser). It is now accepted on the
+  `install`/`uninstall` subcommands.
+- **`--list-clients` / installer crashed on Windows cp1252 consoles** (high) when
+  printing `✓`/`✗`. Replaced with ASCII status; CLI output is also reconfigured
+  to UTF-8 defensively (so non-ASCII config paths never crash either).
+- **`dbl_click` never fired a `dblclick`** (medium). Two `mouse_click`s produce
+  two `click_count=1` clicks; a proper escalating `click_count` 1→2 sequence is
+  now dispatched.
+- **`ipad_air` preset was actually an Android Pixel Tablet** (medium): wrong UA
+  and Android UA-CH client hints. Now uses a real iPad Safari UA and sends no
+  UA-CH (Safari doesn't). All device presets now default to `en-US` Accept-
+  Language instead of `zh-CN`, and their Chrome UA is bumped to 150.
+- **`handle_dialog` / emulation input validation** (low). `handle_dialog`
+  rejects unknown actions and fails gracefully when no dialog is open; malformed
+  `viewport` / `geolocation` strings now return a clear error instead of a raw
+  `ValueError`/`IndexError`.
+
+### Known limitations (not changed in this release)
+
+These are real but were left as-is to avoid larger refactors / behavior changes;
+they mostly affect multi-tab or niche flows:
+
+- **Console & network collection is process-global**, not per-tab, even though
+  the tool docstrings say "the currently selected page". With multiple tabs the
+  streams interleave, and a navigation on any tab rotates the preserved history
+  for all of them.
+- **Tab identity for the collection-enabled sets uses `id(tab)`**, which Python
+  can recycle after a tab object is freed.
+- **`new_page(isolated_context=…)`** uses `create_target(for_tab=True)`; matching
+  the returned tab target can be brittle — prefer the default context if you hit
+  timeouts opening isolated pages.
+- **Named browser contexts and the tracing flag** are not disposed on browser
+  restart.
+- **Character typing (`type_text`, `fill`)** sends `text`-only key events, so
+  literal newlines/Tabs inside typed text aren't submitted, and non-BMP
+  characters (emoji, astral CJK) may split. Use `press_key` / `submit_key` for
+  named keys.
+- **`save_session` / `load_session`** only capture localStorage for the active
+  tab's origin.
+- **`resize_page`** sets the OS window size (no-op in headless); it does not set
+  the content viewport. Use `emulate(viewport=…)` for a deterministic viewport.
+- **`wait_for`** matches `document.body.innerText` only (misses inputs, aria,
+  shadow DOM).
+- **Error-handling contract is mixed**: some tools return `"Error: …"` strings,
+  others let exceptions propagate to the MCP client.
