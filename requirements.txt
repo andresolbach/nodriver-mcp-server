@@ -1,0 +1,18 @@
+# Runtime dependencies for nodriver-mcp-server.
+#
+# Recommended install is `uv tool install` (uses pyproject.toml + uv.lock for a
+# fully pinned, reproducible tree). These are the pip packages/versions if you
+# prefer plain pip:  pip install -r requirements.txt
+#
+# Verified with: Python 3.12.11, Google Chrome 150, Windows 11
+# (also works on macOS and Linux).
+#
+# Exact versions used during testing are shown in the trailing comments.
+
+mcp>=1.26.0,<2      # tested: 1.26.0  — Model Context Protocol server SDK
+nodriver>=0.50.3    # tested: 0.50.3  — undetected Chrome automation (CDP backend)
+pillow>=12.1.1      # tested: 12.1.1  — screenshot/image handling
+tomli-w>=1.0.0      # tested: 1.2.0   — TOML config writing (Codex client)
+
+# Python 3.12+ is required.
+# Google Chrome must be installed locally (auto-detected, or set NODRIVER_BROWSER_PATH).

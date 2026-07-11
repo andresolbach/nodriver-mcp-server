@@ -14,13 +14,13 @@
 
 `chrome-devtools-mcp` and most Playwright/Puppeteer-based servers drive Chrome through CDP/WebDriver in a way that leaves detectable fingerprints (`navigator.webdriver`, CDP artifacts). Anti-bot systems (Cloudflare, hCaptcha, DataDome, etc.) flag these instantly.
 
-`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (42 tools), so your agent gets a familiar API with far better stealth.
+`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (47 tools), so your agent gets a familiar API with far better stealth.
 
 ## Features
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` is `undefined`, no CDP fingerprints.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **42 tools** covering navigation, input, snapshots, screenshots, network + console inspection, device emulation, cookies/storage, sessions, and performance tracing.
+- 🧩 **47 tools** covering navigation, input, snapshots, screenshots, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 📄 **Accessibility-tree snapshots** (`take_snapshot`) — searchable, LLM-friendly page text that's far smaller and faster than screenshots.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - 💾 **Session save/restore** — persist logins across runs.
@@ -45,6 +45,22 @@ You'll also need a local installation of **Google Chrome** (auto-detected).
 ```bash
 uv tool upgrade nodriver-mcp
 ```
+
+## Requirements & tested versions
+
+Every tool in this server was tested **end-to-end against Google Chrome 150** with **nodriver 0.50.3** on **Python 3.12.11 / Windows 11** (macOS and Linux are supported too). Because nodriver talks to Chrome directly over CDP and tracks upstream Chrome changes, it keeps working as Chrome auto-updates.
+
+| Component | Requirement | Verified version |
+|-----------|-------------|------------------|
+| Python | 3.12+ | 3.12.11 |
+| Google Chrome | any recent stable | 150.0.7871.101 |
+| Operating system | Windows / macOS / Linux | Windows 11 |
+| `nodriver` | >= 0.50.3 | 0.50.3 |
+| `mcp` (MCP SDK) | >= 1.26.0, < 2 | 1.26.0 |
+| `pillow` | >= 12.1.1 | 12.1.1 |
+| `tomli-w` | >= 1.0.0 | 1.2.0 |
+
+The pip packages/versions are also listed in [`requirements.txt`](requirements.txt) (`pip install -r requirements.txt`), though `uv tool install` is recommended for a fully pinned, reproducible install.
 
 ## One-command MCP client setup
 
@@ -128,9 +144,41 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
 
+## Use cases
+
+- **Scrape sites behind Cloudflare / anti-bot** (DataDome, PerimeterX, hCaptcha challenges) without being fingerprinted or blocked.
+- **Let an AI agent browse the real web** — Claude, Cursor, Windsurf and other LLM agents can log in, fill forms, click, read pages, and screenshot.
+- **Automate authenticated workflows** and reuse the login across sessions with persistent profiles.
+- **LLM-driven web research & data extraction** using compact accessibility-tree snapshots instead of brittle screenshots.
+- **End-to-end / QA testing** with device emulation, network + console inspection, and performance traces.
+- An **undetected alternative to Playwright, Puppeteer and Selenium** for agentic browsing.
+
+## FAQ
+
+**Is this an undetected alternative to chrome-devtools-mcp?**
+Yes. It exposes the same tool surface but drives Chrome through nodriver (direct CDP), so `navigator.webdriver` is `undefined` and there are no WebDriver/CDP fingerprints for anti-bot systems to detect.
+
+**Can it bypass Cloudflare?**
+It ships a `cf_verify` tool that solves the Cloudflare "verify you are human" challenge, and its undetected profile avoids most bot checks. (No tool can guarantee bypassing every protection.)
+
+**Which clients are supported?**
+One command installs it into 15+ MCP clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Copilot CLI, Kiro, VS Code, Cline, Roo Code, Amazon Q, Warp, Opencode, Trae.
+
+**Can I run it in several clients at the same time?**
+Yes. Each instance uses its own ephemeral Chrome profile by default, so Claude Desktop, Claude Code and the VS Code extension can all use nodriver **simultaneously** without colliding.
+
+**Headless or visible browser?**
+A real Chrome window by default; set `NODRIVER_HEADLESS=true` for headless.
+
+**How do I keep a login between sessions?**
+Create a persistent profile with `create_profile` and switch to it with `use_profile`, or use `save_session` / `load_session`.
+
+**Does it work on Windows / macOS / Linux?**
+Yes, all three. Tested on Windows 11 with Chrome 150 and Python 3.12.
+
 ## Changelog
 
-See [CHANGES.md](CHANGES.md). Highlights of the latest release: migrated to upstream `nodriver 0.50.3` (Chrome 150 verified) and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
+See [CHANGES.md](CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 150 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
 
 ## Credits
 
