@@ -39,6 +39,8 @@ _PROFILES_DIR = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "profiles
 # Runtime overrides for the clean-launch flags (None -> use the env-var default).
 _enable_translate: bool | None = None
 _enable_extensions: bool | None = None
+# Arbitrary extra Chrome launch flags set at runtime via set_browser_flags.
+_extra_browser_args: list[str] = []
 
 
 def _feature_enabled(override: bool | None, env_name: str) -> bool:
@@ -122,6 +124,7 @@ async def _get_browser() -> uc.Browser:
                 browser_args.append("--disable-features=Translate")
             if not _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS"):
                 browser_args.append("--disable-extensions")
+            browser_args.extend(_extra_browser_args)
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
                 logger.info("Proxy configured: %s", proxy)
@@ -2462,6 +2465,104 @@ async def get_page_content(format: str = "text", max_chars: int = 100000, file_p
 
 
 @mcp.tool()
+async def query_selector(selector: str, limit: int = 20) -> str:
+    """Find elements matching a CSS selector and list their tag, text and key attributes.
+
+    Args:
+        selector: CSS selector (e.g. "a.result", "#nav li").
+        limit: Maximum number of elements to return (default 20).
+    """
+    tab = await _active_tab()
+    sel = json.dumps(selector)
+    expr = (
+        "JSON.stringify([...document.querySelectorAll(%s)].slice(0,%d).map(el=>({"
+        "tag:el.tagName.toLowerCase(),"
+        "text:(el.innerText||el.textContent||'').trim().slice(0,200),"
+        "href:el.getAttribute('href')||null,"
+        "id:el.id||null,"
+        "cls:(typeof el.className==='string'&&el.className)||null"
+        "})))" % (sel, int(limit))
+    )
+    try:
+        raw = await tab.evaluate(expr)
+        items = json.loads(raw) if raw else []
+    except Exception as e:
+        return f"Error querying '{selector}': {e}"
+    if not items:
+        return f"No elements match '{selector}'."
+    lines = [f"{len(items)} element(s) for '{selector}':"]
+    for i, el in enumerate(items):
+        parts = [el.get("tag", "?")]
+        if el.get("id"):
+            parts.append(f"#{el['id']}")
+        if el.get("href"):
+            parts.append(f"href={el['href']}")
+        line = f"  [{i}] " + " ".join(parts)
+        if el.get("text"):
+            line += f' — "{el["text"]}"'
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def scroll_to_selector(selector: str) -> str:
+    """Scroll the element matching a CSS selector into view (centered).
+
+    Args:
+        selector: CSS selector of the element to scroll to.
+    """
+    tab = await _active_tab()
+    sel = json.dumps(selector)
+    expr = (
+        "(() => { const el=document.querySelector(%s); if(!el) return false; "
+        "el.scrollIntoView({block:'center', inline:'center'}); return true; })()" % sel
+    )
+    try:
+        ok = await tab.evaluate(expr)
+    except Exception as e:
+        return f"Error: {e}"
+    return f"Scrolled to '{selector}'." if ok else f"No element matches '{selector}'."
+
+
+_RESOURCE_EXTS: dict[str, list[str]] = {
+    "image": ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "avif"],
+    "font": ["woff", "woff2", "ttf", "otf", "eot"],
+    "stylesheet": ["css"],
+    "media": ["mp4", "webm", "ogg", "mp3", "wav", "m4a", "mov"],
+}
+
+
+@mcp.tool()
+async def block_resources(types: list[str] | None = None) -> str:
+    """Block resource types to speed up scraping / save bandwidth (applies to the
+    current page session).
+
+    Args:
+        types: Types to block — any of "image", "font", "stylesheet", "media".
+            Pass an empty list (or omit) to unblock everything.
+    """
+    tab = await _active_tab()
+    import nodriver.cdp.network as cdp_net
+    types = types or []
+    valid, unknown, patterns = [], [], []
+    for t in types:
+        key = (t or "").strip().lower()
+        if key in _RESOURCE_EXTS:
+            valid.append(key)
+            patterns.extend(f"*.{ext}*" for ext in _RESOURCE_EXTS[key])
+        elif key:
+            unknown.append(t)
+    await tab.send(cdp_net.set_blocked_ur_ls(urls=patterns))
+    if not valid:
+        base = "Resource blocking disabled (all resources allowed)."
+    else:
+        base = f"Blocking resource types: {', '.join(sorted(set(valid)))}."
+    if unknown:
+        base += f" Ignored unknown: {', '.join(unknown)} (valid: image, font, stylesheet, media)."
+    return base
+
+
+@mcp.tool()
 async def wait_for_selector(selector: str, timeout: int = 30000, visible: bool = False) -> str:
     """Wait for an element matching a CSS selector to appear on the page.
 
@@ -2524,18 +2625,22 @@ async def clear_cookies() -> str:
 async def set_browser_flags(
     translate: bool | None = None,
     extensions: bool | None = None,
+    extra_args: list[str] | None = None,
     restart: bool = True,
 ) -> str:
-    """Enable/disable the Google Translate popup and externally-installed Chrome
-    extensions at runtime (overrides the NODRIVER_ENABLE_* env vars). These are
-    Chrome launch flags, so the browser is restarted to apply them.
+    """Change the Chrome launch flags at runtime (overrides the NODRIVER_ENABLE_*
+    env vars). Because these are launch flags, the browser is restarted to apply
+    them. Call with no arguments to just view the current flags.
 
     Args:
         translate: true = allow the Google Translate popup; false = suppress it. Omit to leave unchanged.
         extensions: true = allow external Chrome extensions; false = block them. Omit to leave unchanged.
-        restart: restart the browser now so the change applies (default true).
+        extra_args: Replace the set of arbitrary extra Chrome flags with this list
+            (e.g. ["--lang=de-DE", "--window-size=1280,800"]). Pass [] to clear them.
+            Omit to leave unchanged. A leading "--" is added if missing.
+        restart: restart the browser now so the changes apply (default true).
     """
-    global _enable_translate, _enable_extensions
+    global _enable_translate, _enable_extensions, _extra_browser_args
     changed = []
     if translate is not None:
         _enable_translate = translate
@@ -2543,14 +2648,35 @@ async def set_browser_flags(
     if extensions is not None:
         _enable_extensions = extensions
         changed.append(f"extensions={'on' if extensions else 'off'}")
+    if extra_args is not None:
+        cleaned = []
+        for a in extra_args:
+            a = (a or "").strip()
+            if not a:
+                continue
+            if not a.startswith("-"):
+                a = "--" + a
+            cleaned.append(a)
+        _extra_browser_args = cleaned
+        changed.append(f"extra_args={cleaned or '(cleared)'}")
 
     eff_t = _feature_enabled(_enable_translate, "NODRIVER_ENABLE_TRANSLATE")
     eff_e = _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS")
-    status = (f"Google Translate popup: {'enabled' if eff_t else 'disabled'} | "
-              f"External extensions: {'enabled' if eff_e else 'disabled'}")
+    effective = []
+    if not eff_t:
+        effective.append("--disable-features=Translate")
+    if not eff_e:
+        effective.append("--disable-extensions")
+    effective.extend(_extra_browser_args)
+    status = (
+        f"Google Translate popup: {'enabled' if eff_t else 'disabled'} | "
+        f"External extensions: {'enabled' if eff_e else 'disabled'}\n"
+        f"Extra flags: {_extra_browser_args or '(none)'}\n"
+        f"Effective launch flags: {effective or '(none)'}"
+    )
 
     if not changed:
-        return f"Current flags — {status}\n(Pass translate= / extensions= to change.)"
+        return f"Current browser flags:\n{status}\n(Pass translate= / extensions= / extra_args= to change.)"
 
     msg = "Updated: " + ", ".join(changed) + f"\n{status}"
     if restart:

@@ -9,7 +9,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 53](https://img.shields.io/badge/tools-53-orange.svg)
+![Tools: 56](https://img.shields.io/badge/tools-56-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -18,13 +18,13 @@
 
 `chrome-devtools-mcp` and most Playwright/Puppeteer-based servers drive Chrome through CDP/WebDriver in a way that leaves detectable fingerprints (`navigator.webdriver`, CDP artifacts). Anti-bot systems (Cloudflare, hCaptcha, DataDome, etc.) flag these instantly.
 
-`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (53 tools), so your agent gets a familiar API with far better stealth.
+`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (56 tools), so your agent gets a familiar API with far better stealth.
 
 ## Features
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` is `undefined`, no CDP fingerprints.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **53 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **56 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 📄 **Accessibility-tree snapshots** (`take_snapshot`) — searchable, LLM-friendly page text that's far smaller and faster than screenshots.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - 💾 **Session save/restore** — persist logins across runs.
@@ -103,7 +103,7 @@ nodriver-mcp install --scope project
 | `NODRIVER_ENABLE_TRANSLATE` | Set `true` to re-enable Chrome's Google Translate popup | Disabled |
 | `NODRIVER_ENABLE_EXTENSIONS` | Set `true` to allow externally-installed Chrome extensions (and their prompts) | Disabled |
 
-By default the browser starts clean for automation: the **Google Translate popup is suppressed** and **externally-installed Chrome extensions are blocked** (so you don't get "an extension requires your attention" prompts). Re-enable either via the env vars above **or at runtime with the `set_browser_flags` tool**. The browser also **auto-recovers** if Chrome is closed or crashes between calls — tools relaunch it instead of failing.
+By default the browser starts clean for automation: the **Google Translate popup is suppressed** and **externally-installed Chrome extensions are blocked** (so you don't get "an extension requires your attention" prompts). Re-enable either via the env vars above **or at runtime with the `set_browser_flags` tool** — which can also set **any other Chrome launch flags** (e.g. `--lang=de-DE`, `--window-size=1280,800`) via its `extra_args` parameter. The browser also **auto-recovers** if Chrome is closed or crashes between calls — tools relaunch it instead of failing.
 
 ## Profiles & running multiple instances at once
 
@@ -119,7 +119,7 @@ When you want to **reuse a login across sessions**, create a named persistent pr
 
 Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
 
-## Tools (53)
+## Tools (56)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
@@ -128,9 +128,9 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | Category | Tools |
 |----------|-------|
 | **Input automation (10)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
-| **Navigation (9)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `wait_for_selector` · `scroll_page` |
-| **Snapshots & debugging (9)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `evaluate_script` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
-| **Network monitoring (2)** | `list_network_requests` · `get_network_request` |
+| **Navigation (10)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `wait_for_selector` · `scroll_page` · `scroll_to_selector` |
+| **Snapshots & debugging (10)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `query_selector` · `evaluate_script` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
+| **Network monitoring (3)** | `list_network_requests` · `get_network_request` · `block_resources` |
 | **Device emulation (4)** | `emulate` · `emulate_device` · `reset_emulation` · `resize_page` |
 | **Performance (3)** | `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot` |
 | **Cookies & storage (5)** | `get_cookies` · `set_cookie` · `clear_cookies` · `get_local_storage` · `set_local_storage` |
@@ -148,7 +148,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
 | Install method | npx | uv tool install |
 | Language | TypeScript / Node.js | Python |
-| Tool coverage | 29 tools | 53 tools |
+| Tool coverage | 29 tools | 56 tools |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
 

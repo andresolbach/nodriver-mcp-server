@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.5.1 — selector query/scroll, resource blocking, arbitrary Chrome flags
+
+- **`set_browser_flags` now sets arbitrary Chrome launch flags** via `extra_args`
+  (e.g. `["--lang=de-DE", "--window-size=1280,800"]`), on top of the named
+  translate/extensions toggles.
+- **`query_selector`** — find elements by CSS selector and list their tag, text,
+  href and id.
+- **`scroll_to_selector`** — scroll a specific element into view.
+- **`block_resources`** — block images/fonts/stylesheets/media to speed up
+  scraping and save bandwidth (pass `[]` to unblock).
+
+Tool count: 53 → 56.
+
 ## 1.5.0 — content/PDF export, selector waits, cookie clearing, runtime flags
 
 Five new tools (count 48 → 53):
