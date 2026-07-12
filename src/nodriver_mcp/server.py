@@ -38,6 +38,34 @@ _selected_profile_name: str | None = None
 _PROFILES_DIR = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "profiles")
 
 
+def _feature_disabled_by_default(env_name: str) -> bool:
+    """A default-on cleanup is disabled unless its env toggle is truthy."""
+    return os.environ.get(env_name, "").lower() not in ("1", "true", "yes")
+
+
+async def _browser_alive(b: uc.Browser) -> bool:
+    """Cheap CDP probe to confirm the browser is still usable.
+
+    Probes over a tab connection (what the tools actually use), not the
+    browser-level object, so a dropped tab websocket is detected too.
+    """
+    try:
+        import nodriver.cdp.target as cdp_target
+        conn = None
+        if b.tabs:
+            conn = b.tabs[0]
+        elif getattr(b, "main_tab", None) is not None:
+            conn = b.main_tab
+        elif getattr(b, "connection", None) is not None:
+            conn = b.connection
+        if conn is None:
+            return False
+        await asyncio.wait_for(conn.send(cdp_target.get_targets()), timeout=5)
+        return True
+    except Exception:
+        return False
+
+
 async def _get_browser() -> uc.Browser:
     """Start the browser on first tool call (lazy init, protected by mutex).
 
@@ -48,6 +76,17 @@ async def _get_browser() -> uc.Browser:
     """
     global _browser
     async with _browser_lock:
+        # Recover from a browser that was closed/crashed between calls — its
+        # .stopped flag can lag, which would otherwise make every tool fail
+        # with a "no close frame" websocket error until the server restarts.
+        if _browser is not None and not _browser.stopped:
+            if not await _browser_alive(_browser):
+                try:
+                    _browser.stop()
+                except Exception:
+                    pass
+                _browser = None
+
         if _browser is None or _browser.stopped:
             headless = os.environ.get("NODRIVER_HEADLESS", "").lower() in ("1", "true", "yes")
             browser_path = os.environ.get("NODRIVER_BROWSER_PATH", None)
@@ -68,9 +107,20 @@ async def _get_browser() -> uc.Browser:
             if browser_path:
                 kwargs["browser_executable_path"] = browser_path
 
+            # Clean-automation defaults, each re-enable-able via an env var:
+            #   - suppress the Google Translate popup  (NODRIVER_ENABLE_TRANSLATE=true)
+            #   - block externally-installed extensions + their "action required"
+            #     prompts                              (NODRIVER_ENABLE_EXTENSIONS=true)
+            browser_args: list[str] = []
+            if _feature_disabled_by_default("NODRIVER_ENABLE_TRANSLATE"):
+                browser_args.append("--disable-features=Translate")
+            if _feature_disabled_by_default("NODRIVER_ENABLE_EXTENSIONS"):
+                browser_args.append("--disable-extensions")
             if proxy:
-                kwargs["browser_args"] = [f"--proxy-server={proxy}"]
+                browser_args.append(f"--proxy-server={proxy}")
                 logger.info("Proxy configured: %s", proxy)
+            if browser_args:
+                kwargs["browser_args"] = browser_args
 
             _browser = await uc.start(**kwargs)
 

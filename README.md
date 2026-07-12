@@ -100,6 +100,10 @@ nodriver-mcp install --scope project
 | `NODRIVER_USER_DATA_DIR` | Explicit persistent Chrome profile dir (overrides the default) | Ephemeral temp profile, auto-deleted per session |
 | `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
 | `NODRIVER_PROXY` | Proxy server address | None |
+| `NODRIVER_ENABLE_TRANSLATE` | Set `true` to re-enable Chrome's Google Translate popup | Disabled |
+| `NODRIVER_ENABLE_EXTENSIONS` | Set `true` to allow externally-installed Chrome extensions (and their prompts) | Disabled |
+
+By default the browser starts clean for automation: the **Google Translate popup is suppressed** and **externally-installed Chrome extensions are blocked** (so you don't get "an extension requires your attention" prompts). Re-enable either via the env vars above. The browser also **auto-recovers** if Chrome is closed or crashes between calls — tools relaunch it instead of failing.
 
 ## Profiles & running multiple instances at once
 

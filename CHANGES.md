@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.2 — clean-launch defaults + auto-recovery
+
+- **Google Translate popup suppressed by default** (`--disable-features=Translate`);
+  re-enable with `NODRIVER_ENABLE_TRANSLATE=true`.
+- **Externally-installed Chrome extensions blocked by default**
+  (`--disable-extensions`), so the "an extension requires your attention" prompt
+  no longer appears; re-enable with `NODRIVER_ENABLE_EXTENSIONS=true`.
+- **Browser auto-recovery**: if Chrome is closed/crashes between calls, a cheap
+  liveness probe detects the dead connection and relaunches the browser instead
+  of every tool failing with a "no close frame" websocket error until restart.
+
 ## 1.4.1 — fresh page URLs/titles in responses
 
 - `navigate_page`, `new_page` and `list_pages` now refresh CDP target info before
