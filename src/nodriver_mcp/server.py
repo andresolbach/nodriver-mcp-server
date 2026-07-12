@@ -835,12 +835,23 @@ async def _open_new_tab(
     return tab
 
 
+async def _refresh_targets(browser: uc.Browser) -> None:
+    """Refresh CDP target info (url/title) so it isn't stale right after a nav."""
+    try:
+        await browser.update_targets()
+    except Exception:
+        pass
+
+
 async def _format_pages() -> str:
     """Format the pages list for appending to navigation responses."""
     browser = await _get_browser()
+    await _refresh_targets(browser)
     lines = ["\nOpen pages:"]
     for i, tab in enumerate(browser.tabs):
-        lines.append(f"  [{i}] {tab.target.url} — {tab.target.title}")
+        url = tab.target.url or "about:blank"
+        title = tab.target.title or ""
+        lines.append(f"  [{i}] {url} — {title}")
     return "\n".join(lines)
 
 
@@ -1400,9 +1411,12 @@ async def list_network_requests(
 async def list_pages() -> str:
     """Get a list of pages open in the browser."""
     browser = await _get_browser()
+    await _refresh_targets(browser)
     lines = ["Open pages:"]
     for i, tab in enumerate(browser.tabs):
-        lines.append(f"  [{i}] {tab.target.url} — {tab.target.title}")
+        url = tab.target.url or "about:blank"
+        title = tab.target.title or ""
+        lines.append(f"  [{i}] {url} — {title}")
     return "\n".join(lines)
 
 
@@ -1487,7 +1501,7 @@ async def navigate_page(
         await _auto_enable_network_collection(tab)
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
-        return f"Navigated to {tab.target.url}{suffix}{pages}"
+        return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{pages}"
     except Exception as e:
         return f"Error: {e}"
     finally:
@@ -1550,7 +1564,7 @@ async def new_page(
 
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
-        return f"Opened new page: {tab.target.url}{suffix}{pages}"
+        return f"Opened new page: {tab.target.url or 'about:blank'}{suffix}{pages}"
     except Exception as e:
         return f"Error opening new page: {e}"
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — fresh page URLs/titles in responses
+
+- `navigate_page`, `new_page` and `list_pages` now refresh CDP target info before
+  formatting, so the reported page URL and title are current instead of
+  occasionally showing an empty URL / stale "New Tab" right after a navigation.
+
 ## 1.4.0 — ephemeral profiles by default + profile management
 
 - **Temp profile by default.** The browser now launches with a fresh ephemeral
