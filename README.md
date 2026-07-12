@@ -9,7 +9,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 47](https://img.shields.io/badge/tools-47-orange.svg)
+![Tools: 48](https://img.shields.io/badge/tools-48-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -18,13 +18,13 @@
 
 `chrome-devtools-mcp` and most Playwright/Puppeteer-based servers drive Chrome through CDP/WebDriver in a way that leaves detectable fingerprints (`navigator.webdriver`, CDP artifacts). Anti-bot systems (Cloudflare, hCaptcha, DataDome, etc.) flag these instantly.
 
-`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (47 tools), so your agent gets a familiar API with far better stealth.
+`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (48 tools), so your agent gets a familiar API with far better stealth.
 
 ## Features
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` is `undefined`, no CDP fingerprints.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **47 tools** covering navigation, input, snapshots, screenshots, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **48 tools** covering navigation, input, snapshots, screenshots, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 📄 **Accessibility-tree snapshots** (`take_snapshot`) — searchable, LLM-friendly page text that's far smaller and faster than screenshots.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - 💾 **Session save/restore** — persist logins across runs.
@@ -119,7 +119,7 @@ When you want to **reuse a login across sessions**, create a named persistent pr
 
 Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
 
-## Tools (47)
+## Tools (48)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
@@ -128,7 +128,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | Category | Tools |
 |----------|-------|
 | **Input automation (10)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
-| **Navigation (7)** | `navigate_page` · `new_page` · `close_page` · `list_pages` · `select_page` · `wait_for` · `scroll_page` |
+| **Navigation (8)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `scroll_page` |
 | **Snapshots & debugging (7)** | `take_screenshot` · `take_snapshot` · `evaluate_script` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
 | **Network monitoring (2)** | `list_network_requests` · `get_network_request` |
 | **Device emulation (4)** | `emulate` · `emulate_device` · `reset_emulation` · `resize_page` |
@@ -148,7 +148,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
 | Install method | npx | uv tool install |
 | Language | TypeScript / Node.js | Python |
-| Tool coverage | 29 tools | 47 tools |
+| Tool coverage | 29 tools | 48 tools |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
 

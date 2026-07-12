@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3 — close_browser tool
+
+- New **`close_browser`** tool to quit Chrome entirely (unlike `close_page`,
+  which keeps the last tab). The browser relaunches automatically on the next
+  tool call with the currently selected profile. Tool count: 47 → 48.
+
 ## 1.4.2 — clean-launch defaults + auto-recovery
 
 - **Google Translate popup suppressed by default** (`--disable-features=Translate`);

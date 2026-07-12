@@ -910,13 +910,12 @@ def _safe_profile_name(name: str) -> str:
     return "".join(c for c in (name or "").strip() if c.isalnum() or c in "-_")
 
 
-async def _restart_browser_with(profile_dir: str | None, profile_name: str | None) -> None:
-    """Select a profile and drop the current browser so the next tool call
-    relaunches Chrome with it. Any open pages are closed."""
-    global _browser, _selected_profile_dir, _selected_profile_name, _selected_target_id
-    _selected_profile_dir = profile_dir
-    _selected_profile_name = profile_name
-    if _browser is not None and not _browser.stopped:
+async def _stop_browser() -> bool:
+    """Stop the running browser (if any) and reset per-browser state, keeping the
+    selected profile. Returns True if a browser was actually running."""
+    global _browser, _selected_target_id
+    was_running = _browser is not None and not _browser.stopped
+    if _browser is not None:
         try:
             _browser.stop()
         except Exception:
@@ -926,6 +925,16 @@ async def _restart_browser_with(profile_dir: str | None, profile_name: str | Non
     _network_collection_enabled_tabs.clear()
     _console_collection_enabled_tabs.clear()
     _named_browser_contexts.clear()
+    return was_running
+
+
+async def _restart_browser_with(profile_dir: str | None, profile_name: str | None) -> None:
+    """Select a profile and drop the current browser so the next tool call
+    relaunches Chrome with it. Any open pages are closed."""
+    global _selected_profile_dir, _selected_profile_name
+    _selected_profile_dir = profile_dir
+    _selected_profile_name = profile_name
+    await _stop_browser()
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1030,21 @@ async def close_page(page_id: int = -1) -> str:
     await tab.close()
     pages = await _format_pages()
     return f"Page closed.{pages}"
+
+
+@mcp.tool()
+async def close_browser() -> str:
+    """Close the browser entirely (quit Chrome).
+
+    Unlike close_page (which keeps the last tab open), this shuts down the whole
+    browser. It relaunches automatically on the next tool call, using the
+    currently selected profile.
+    """
+    running = await _stop_browser()
+    return (
+        "Browser closed. It will relaunch on the next action."
+        if running else "No browser was running."
+    )
 
 
 @mcp.tool()
