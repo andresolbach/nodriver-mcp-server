@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.0 — content/PDF export, selector waits, cookie clearing, runtime flags
+
+Five new tools (count 48 → 53):
+
+- **`set_browser_flags`** — toggle the Google Translate popup and external Chrome
+  extensions **at runtime** (overrides the env vars; restarts the browser to apply).
+- **`get_page_content`** — raw page text (`innerText`) or full HTML, for scraping/reading.
+- **`wait_for_selector`** — wait for a CSS selector to appear (optionally visible),
+  complementing the text-based `wait_for`.
+- **`save_pdf`** — export the current page as a PDF (Chrome print-to-PDF).
+- **`clear_cookies`** — clear all browser cookies.
+
 ## 1.4.3 — close_browser tool
 
 - New **`close_browser`** tool to quit Chrome entirely (unlike `close_page`,

@@ -36,11 +36,17 @@ _browser_lock = asyncio.Lock()
 _selected_profile_dir: str | None = None
 _selected_profile_name: str | None = None
 _PROFILES_DIR = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "profiles")
+# Runtime overrides for the clean-launch flags (None -> use the env-var default).
+_enable_translate: bool | None = None
+_enable_extensions: bool | None = None
 
 
-def _feature_disabled_by_default(env_name: str) -> bool:
-    """A default-on cleanup is disabled unless its env toggle is truthy."""
-    return os.environ.get(env_name, "").lower() not in ("1", "true", "yes")
+def _feature_enabled(override: bool | None, env_name: str) -> bool:
+    """Whether a Chrome feature (Translate / extensions) is enabled: a runtime
+    override wins, else the env var, else disabled (clean-automation default)."""
+    if override is not None:
+        return override
+    return os.environ.get(env_name, "").lower() in ("1", "true", "yes")
 
 
 async def _browser_alive(b: uc.Browser) -> bool:
@@ -112,9 +118,9 @@ async def _get_browser() -> uc.Browser:
             #   - block externally-installed extensions + their "action required"
             #     prompts                              (NODRIVER_ENABLE_EXTENSIONS=true)
             browser_args: list[str] = []
-            if _feature_disabled_by_default("NODRIVER_ENABLE_TRANSLATE"):
+            if not _feature_enabled(_enable_translate, "NODRIVER_ENABLE_TRANSLATE"):
                 browser_args.append("--disable-features=Translate")
-            if _feature_disabled_by_default("NODRIVER_ENABLE_EXTENSIONS"):
+            if not _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS"):
                 browser_args.append("--disable-extensions")
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
@@ -2425,6 +2431,137 @@ async def list_sessions() -> str:
             lines.append(f"  {f} (unable to read)")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Content extraction, waiting, export, cookies, runtime flags
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_page_content(format: str = "text", max_chars: int = 100000, file_path: str = "") -> str:
+    """Get the raw page content — visible text or full HTML.
+
+    Args:
+        format: "text" for document.body.innerText, "html" for the full outerHTML. Default "text".
+        max_chars: Truncate the returned output to this many characters (default 100000). 0 = no limit.
+        file_path: Optional path to save the content to instead of returning it.
+    """
+    tab = await _active_tab()
+    if format == "html":
+        content = await tab.evaluate("document.documentElement.outerHTML")
+    else:
+        content = await tab.evaluate("document.body ? document.body.innerText : ''")
+    content = content or ""
+    if file_path:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Saved {len(content)} chars of {format} to {file_path}."
+    if max_chars and len(content) > max_chars:
+        return content[:max_chars] + f"\n... (truncated, {len(content)} chars total)"
+    return content
+
+
+@mcp.tool()
+async def wait_for_selector(selector: str, timeout: int = 30000, visible: bool = False) -> str:
+    """Wait for an element matching a CSS selector to appear on the page.
+
+    Args:
+        selector: CSS selector to wait for (e.g. "#login", ".results .item").
+        timeout: Maximum wait time in milliseconds. Default 30000.
+        visible: If true, also require the element to have a non-zero size.
+    """
+    tab = await _active_tab()
+    sel = json.dumps(selector)
+    if visible:
+        expr = ("(() => { const el = document.querySelector(%s); if (!el) return false; "
+                "const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()" % sel)
+    else:
+        expr = "!!document.querySelector(%s)" % sel
+    timeout_s = timeout / 1000
+    start = time.time()
+    while time.time() - start < timeout_s:
+        try:
+            if await tab.evaluate(expr):
+                return f"Element '{selector}' found."
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+    return f"Timeout: '{selector}' did not appear within {timeout}ms."
+
+
+@mcp.tool()
+async def save_pdf(file_path: str, landscape: bool = False, print_background: bool = True) -> str:
+    """Save the current page as a PDF (Chrome print-to-PDF).
+
+    Args:
+        file_path: Path to write the .pdf file.
+        landscape: Landscape orientation. Default false.
+        print_background: Include background graphics/colors. Default true.
+    """
+    tab = await _active_tab()
+    import nodriver.cdp.page as cdp_page
+    result = await tab.send(cdp_page.print_to_pdf(
+        landscape=landscape,
+        print_background=print_background,
+        transfer_mode="ReturnAsBase64",
+    ))
+    data = result[0] if isinstance(result, tuple) else result
+    with open(file_path, "wb") as f:
+        f.write(base64.b64decode(data))
+    return f"PDF saved to {file_path}."
+
+
+@mcp.tool()
+async def clear_cookies() -> str:
+    """Clear all browser cookies for the current browser session."""
+    tab = await _active_tab()
+    import nodriver.cdp.network as cdp_net
+    await tab.send(cdp_net.clear_browser_cookies())
+    return "All cookies cleared."
+
+
+@mcp.tool()
+async def set_browser_flags(
+    translate: bool | None = None,
+    extensions: bool | None = None,
+    restart: bool = True,
+) -> str:
+    """Enable/disable the Google Translate popup and externally-installed Chrome
+    extensions at runtime (overrides the NODRIVER_ENABLE_* env vars). These are
+    Chrome launch flags, so the browser is restarted to apply them.
+
+    Args:
+        translate: true = allow the Google Translate popup; false = suppress it. Omit to leave unchanged.
+        extensions: true = allow external Chrome extensions; false = block them. Omit to leave unchanged.
+        restart: restart the browser now so the change applies (default true).
+    """
+    global _enable_translate, _enable_extensions
+    changed = []
+    if translate is not None:
+        _enable_translate = translate
+        changed.append(f"translate={'on' if translate else 'off'}")
+    if extensions is not None:
+        _enable_extensions = extensions
+        changed.append(f"extensions={'on' if extensions else 'off'}")
+
+    eff_t = _feature_enabled(_enable_translate, "NODRIVER_ENABLE_TRANSLATE")
+    eff_e = _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS")
+    status = (f"Google Translate popup: {'enabled' if eff_t else 'disabled'} | "
+              f"External extensions: {'enabled' if eff_e else 'disabled'}")
+
+    if not changed:
+        return f"Current flags — {status}\n(Pass translate= / extensions= to change.)"
+
+    msg = "Updated: " + ", ".join(changed) + f"\n{status}"
+    if restart:
+        was = await _stop_browser()
+        msg += "\nBrowser " + (
+            "stopped; relaunches with the new flags on the next action."
+            if was else "will start with these flags on the next action."
+        )
+    else:
+        msg += "\nUse close_browser (or restart) for the change to take effect."
+    return msg
 
 
 # ---------------------------------------------------------------------------
