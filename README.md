@@ -4,6 +4,8 @@
 
 # nodriver-mcp-server
 
+<!-- mcp-name: io.github.andresolbach/nodriver-mcp-server -->
+
 **An undetected, anti-bot-resistant browser automation MCP server** — a drop-in, stealth alternative to [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) for AI agents like **Claude**, **Claude Code**, **Cursor**, **Windsurf**, and any [Model Context Protocol](https://modelcontextprotocol.io) client. Powered by [nodriver](https://github.com/ultrafunkamsterdam/nodriver) so your agent can browse, scrape, and automate real Chrome **without tripping Cloudflare, hCaptcha, or WebDriver fingerprint detection**.
 
 [![PyPI](https://img.shields.io/pypi/v/nodriver-mcp.svg)](https://pypi.org/project/nodriver-mcp/)

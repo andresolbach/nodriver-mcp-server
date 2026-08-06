@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.1 — MCP registry listing
+
+- Added the `mcp-name:` ownership marker the MCP Registry looks for in the
+  published package description, plus a `server.json` on the current
+  (2025-12-11) schema and a GitHub Actions workflow that publishes the registry
+  entry from a version tag over OIDC — no stored registry token.
+- No functional changes to the server; 1.7.0 and 1.7.1 behave identically.
+
+Tool count: 57 → 57.
+
 ## 1.7.0 — schemas an agent can actually read, PyPI release, tool reference
 
 No new tools this time. Instead, the 57 that exist now describe themselves
