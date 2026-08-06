@@ -6,10 +6,12 @@
 
 **An undetected, anti-bot-resistant browser automation MCP server** — a drop-in, stealth alternative to [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) for AI agents like **Claude**, **Claude Code**, **Cursor**, **Windsurf**, and any [Model Context Protocol](https://modelcontextprotocol.io) client. Powered by [nodriver](https://github.com/ultrafunkamsterdam/nodriver) so your agent can browse, scrape, and automate real Chrome **without tripping Cloudflare, hCaptcha, or WebDriver fingerprint detection**.
 
+[![PyPI](https://img.shields.io/pypi/v/nodriver-mcp.svg)](https://pypi.org/project/nodriver-mcp/)
+[![CI](https://github.com/andresolbach/nodriver-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/andresolbach/nodriver-mcp-server/actions/workflows/ci.yml)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 56](https://img.shields.io/badge/tools-56-orange.svg)
+![Tools: 57](https://img.shields.io/badge/tools-57-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -18,13 +20,14 @@
 
 `chrome-devtools-mcp` and most Playwright/Puppeteer-based servers drive Chrome through CDP/WebDriver in a way that leaves detectable fingerprints (`navigator.webdriver`, CDP artifacts). Anti-bot systems (Cloudflare, hCaptcha, DataDome, etc.) flag these instantly.
 
-`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (56 tools), so your agent gets a familiar API with far better stealth.
+`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (57 tools), so your agent gets a familiar API with far better stealth.
 
 ## Features
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` is `undefined`, no CDP fingerprints.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **56 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **57 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧠 **Schemas written for the agent, not just the compiler** — every parameter carries a description, fixed-value options are real enums, and each tool declares read-only/destructive hints. See [why this matters](#built-for-the-agent-that-calls-it).
 - 📄 **Accessibility-tree snapshots** (`take_snapshot`) — searchable, LLM-friendly page text that's far smaller and faster than screenshots.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - 💾 **Session save/restore** — persist logins across runs.
@@ -33,10 +36,20 @@
 
 ## Installation
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended):
+```bash
+# Recommended: isolated install, won't touch your global Python environment
+uv tool install nodriver-mcp
+
+# or with pip
+pip install nodriver-mcp
+
+# or run it without installing anything
+uvx nodriver-mcp
+```
+
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) for the first and third form. To track the development branch instead of a release:
 
 ```bash
-# Install as an isolated tool (won't touch your global Python environment)
 uv tool install "nodriver-mcp @ git+https://github.com/andresolbach/nodriver-mcp-server.git@main"
 ```
 
@@ -91,6 +104,21 @@ nodriver-mcp install --scope project
 **Supported clients:** Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Copilot CLI, Kiro, VS Code, Cline, Roo Code, Amazon Q, Warp, Opencode, Trae.
 
 > The Claude Code VS Code extension shares Claude Code's config (`~/.claude.json`), so installing to `claude-code` covers both the CLI and the extension.
+
+### Manual config
+
+If you'd rather paste it yourself, this works in any MCP client (`claude_desktop_config.json`, `~/.claude.json`, `.cursor/mcp.json`, `.mcp.json`, …):
+
+```json
+{
+  "mcpServers": {
+    "nodriver": {
+      "command": "uvx",
+      "args": ["nodriver-mcp"]
+    }
+  }
+}
+```
 
 ## Environment Variables
 
@@ -154,6 +182,21 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | **Profiles & browser (7)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `delete_profile` · `set_browser_flags` · `manage_extensions` |
 | **Anti-detection helpers (2)** | `cf_verify` · `bypass_insecure_warning` |
 
+📖 **[Full tool reference →](docs/TOOLS.md)** — every tool with its exact parameters, types, defaults and enum values, generated straight from the live schemas.
+
+## Built for the agent that calls it
+
+An MCP tool is only as good as what the model can see of it. Most servers hand over a name, a sentence, and untyped parameters — leaving the agent to guess whether it's `type="url"` or `type="goto"`, and burning a failed call to find out.
+
+Here, the schema does that work:
+
+- **Every parameter has a description in the schema itself** — not buried in a prose blob the client may never show. All 57 tools, all parameters, no exceptions (there's a test for it).
+- **Fixed-value parameters are real enums.** `navigate_page(type=…)` advertises exactly `url`, `back`, `forward`, `reload`. A wrong value is rejected by validation before it ever reaches Chrome, instead of returning an error the agent has to interpret.
+- **Numeric and array bounds are declared** — `quality` is 0–100, `wait_for(text=…)` requires at least one entry.
+- **Structured parameters are typed.** `fill_form` publishes `{uid, value}` rather than an opaque `list[dict]`.
+- **Every tool declares behaviour hints** (`readOnlyHint`, `destructiveHint`, `idempotentHint`). Clients use these to group permissions — so a client can auto-approve `take_snapshot` while still prompting for `delete_profile`.
+- **Descriptions say when *not* to use a tool**, and point at the better one. `take_screenshot` tells the model to prefer `take_snapshot`; `click_at` points back to `click`.
+
 ## Comparison with chrome-devtools-mcp
 
 | Feature | chrome-devtools-mcp | nodriver-mcp-server |
@@ -162,9 +205,11 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | WebDriver fingerprint | ❌ Exposed | ✅ None |
 | `navigator.webdriver` | ❌ `true` | ✅ `undefined` |
 | Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
-| Install method | npx | uv tool install |
+| Install method | npx | uvx / pip |
 | Language | TypeScript / Node.js | Python |
-| Tool coverage | 29 tools | 56 tools |
+| Tool coverage | 29 tools | 57 tools |
+| Per-parameter schema docs | partial | ✅ all 57 tools |
+| Tool behaviour hints | ❌ | ✅ read-only / destructive |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
 

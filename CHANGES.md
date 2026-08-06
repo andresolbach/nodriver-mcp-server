@@ -1,5 +1,59 @@
 # Changelog
 
+## 1.7.0 — schemas an agent can actually read, PyPI release, tool reference
+
+No new tools this time. Instead, the 57 that exist now describe themselves
+properly to the model calling them — which is what decides whether a tool call
+succeeds on the first attempt.
+
+- **Every parameter now carries a description in the JSON Schema.** Previously
+  the `Args:` block lived only in the free-text description blob, so a client
+  reading the schema saw `{"title": "Uid", "type": "string"}` and nothing else.
+  All 57 tools, every parameter, enforced by a test.
+- **Fixed-value parameters are real enums.** `navigate_page(type=…)`,
+  `handle_dialog(action=…)`, `scroll_page(direction=…)`,
+  `take_screenshot(format=…)`, `get_page_content(format=…)`,
+  `manage_extensions(action=…)`, `emulate(color_scheme=…, network_conditions=…)`,
+  `block_resources(types=…)` and both log-filter parameters. A wrong value is
+  now rejected by validation instead of reaching Chrome and coming back as prose.
+- **Numeric and array bounds are declared** — quality 0-100, non-negative
+  timeouts and indices, `wait_for(text=…)` needs at least one entry.
+- **`fill_form` takes a typed `{uid, value}` model** instead of `list[dict]`, so
+  the keys are published rather than guessed.
+- **Every tool declares MCP behaviour hints** (`readOnlyHint`,
+  `destructiveHint`, `idempotentHint`, `openWorldHint`) and a human-readable
+  title. Clients can auto-approve the 15 read-only tools while still prompting
+  for the 8 destructive ones.
+- **Descriptions say when not to use a tool**, and name the better one —
+  `take_screenshot` points at `take_snapshot`, `click_at` points back at `click`,
+  `type_text` at `fill`.
+- **Docstring indentation no longer ships to the model.** Descriptions are run
+  through `inspect.cleandoc`, which removes four leading spaces per line from
+  every tool description in every request.
+- **Server instructions rewritten** into a usable briefing: the snapshot→uid→act
+  loop, what invalidates a uid, which tool to reach for when, and how to keep a
+  login.
+
+- **Fixed: `list_network_requests(resource_types=…)` could never match anything.**
+  The collected type was `str(ResourceType.XHR)` — which is the string
+  `"ResourceType.XHR"`, not `"XHR"` — so every filter silently returned zero
+  results. Now stored as the bare CDP value, and a test pins the advertised enum
+  to `nodriver`'s real `ResourceType`.
+- **Fixed: the console type filter documented a value that does not exist.**
+  CDP emits `warning`; the docs said `warn`, which matched nothing.
+
+- **Published to PyPI** — `uvx nodriver-mcp`, `uv tool install nodriver-mcp` or
+  `pip install nodriver-mcp` instead of a git URL.
+- **New [`docs/TOOLS.md`](docs/TOOLS.md)**, generated from the live schemas by
+  `scripts/generate_tool_docs.py`, so the reference cannot drift from the code.
+- **Tests and CI.** Contract tests over the emitted schemas, plus tests that fail
+  the build when the README's tool count, the badge, the tool table, the
+  changelog or `server.json` disagree with what the server actually registers —
+  the drift that left the README advertising 56 tools while 57 shipped.
+- **`server.json`** for the official MCP registry.
+
+Tool count: 57 → 57.
+
 ## 1.6.0 — no more stray blank tab, extension management, merged feature flags
 
 - **`new_page` reuses the empty startup tab.** Chrome always comes up with one

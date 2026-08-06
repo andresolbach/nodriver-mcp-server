@@ -8,14 +8,17 @@ exposing CDP/WebDriver fingerprints that get detected by anti-bot systems.
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import nodriver as uc
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("nodriver-mcp")
@@ -214,16 +217,154 @@ async def _get_browser() -> uc.Browser:
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
     "nodriver-mcp",
-    instructions=(
-        "Undetected Chrome browser automation via nodriver. "
-        "Drop-in replacement for chrome-devtools-mcp that avoids CDP fingerprint detection. "
-        "IMPORTANT: Always use take_snapshot instead of take_screenshot to read page content. "
-        "take_snapshot returns searchable HTML text and is much faster and smaller. "
-        "Only use take_screenshot when you specifically need a visual image for layout checks or visual regression. "
-        "NOTE: The browser is launched lazily on the first tool call. "
-        "The first invocation may take a few extra seconds for Chrome to start — this is normal, just wait for it."
+    instructions=inspect.cleandoc(
+        """
+        Undetected Chrome browser automation via nodriver — a drop-in replacement for
+        chrome-devtools-mcp that does not expose CDP/WebDriver fingerprints, so it keeps
+        working on sites behind Cloudflare, DataDome and similar anti-bot systems.
+
+        Reading a page
+          * take_snapshot is the default way to see a page. It returns the accessibility
+            tree as compact text and assigns every element a `uid`. Those uids are what
+            click / fill / hover / drag / upload_file take.
+          * Use take_screenshot ONLY when you need pixels (layout checks, visual
+            regression). It cannot be searched and costs far more than a snapshot.
+          * For bulk text or scraping, get_page_content (innerText/HTML) and
+            query_selector (CSS) are cheaper than a snapshot and need no uids.
+
+        The uid lifecycle
+          uids come from the most recent take_snapshot and are invalidated whenever the
+          page changes. "unknown uid" always means: take a fresh snapshot, then retry.
+
+        Typical flow
+          new_page(url) -> take_snapshot() -> fill(uid, ...) -> click(uid) ->
+          wait_for(["expected text"]) -> take_snapshot()
+
+        Waiting
+          Prefer wait_for (text) or wait_for_selector (CSS) over blind retries; both poll
+          until a timeout instead of failing immediately.
+
+        Staying logged in
+          The browser starts on a throwaway profile that is deleted on exit. To keep a
+          login, create_profile(name) + use_profile(name), or save_session/load_session.
+
+        Note: Chrome is launched lazily on the very first tool call, so that one call can
+        take a few seconds longer than the rest. That is expected.
+        """
     ),
 )
+
+
+def tool(
+    *,
+    title: str,
+    read_only: bool = False,
+    destructive: bool = False,
+    idempotent: bool = False,
+    open_world: bool = False,
+):
+    """Register an MCP tool, with the metadata clients actually consume.
+
+    Two things a bare ``@mcp.tool()`` leaves on the table:
+
+    * the docstring ships verbatim, so every description carries this file's
+      indentation into every request. ``inspect.cleandoc`` strips it.
+    * no behaviour hints. Clients use them to group permissions and to
+      auto-approve read-only tools instead of prompting for each snapshot.
+
+    ``title`` is set both on the tool and in its annotations, since clients are
+    split on which one they read.
+    """
+
+    def decorator(fn):
+        return mcp.tool(
+            title=title,
+            description=inspect.cleandoc(fn.__doc__ or ""),
+            annotations=ToolAnnotations(
+                title=title,
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                openWorldHint=open_world,
+            ),
+        )(fn)
+
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Reusable parameter types
+# ---------------------------------------------------------------------------
+# Declared once so a concept reads identically on every tool that takes it. In
+# particular the uid contract (snapshot -> uid -> act, stale uids need a new
+# snapshot) is restated on every tool that consumes one, because that is the
+# single thing models most often get wrong.
+
+Uid = Annotated[
+    str,
+    Field(description=(
+        'Element uid from the most recent take_snapshot, e.g. "4_12". uids are '
+        'invalidated whenever the page changes — if you get "unknown uid", take a '
+        "fresh snapshot and retry with the new uid."
+    )),
+]
+
+IncludeSnapshot = Annotated[
+    bool,
+    Field(description=(
+        "Append a fresh page snapshot to the response. Worth it when this action "
+        "changes the page and take_snapshot would be your next call anyway — it "
+        "saves a round trip, at the cost of a much larger response."
+    )),
+]
+
+DevicePreset = Annotated[
+    str,
+    Field(description=(
+        "Device to emulate — sets user agent, UA client hints, viewport, device "
+        'pixel ratio and touch together. Presets: "pixel_7" (aliases: pixel7, '
+        'android, android_phone), "pixel_7_landscape" (pixel7_landscape, '
+        'android_landscape), "ipad_air" (ipadair, ipad, tablet). Case, spaces and '
+        "-/_ are normalised. Empty string leaves emulation unchanged."
+    )),
+]
+
+ColorScheme = Annotated[
+    Literal["", "dark", "light", "auto"],
+    Field(description=(
+        'Emulate the prefers-color-scheme media feature. "auto" clears a previous '
+        "override; empty string leaves it unchanged."
+    )),
+]
+
+NetworkConditions = Annotated[
+    Literal["", "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G"],
+    Field(description=(
+        'Throttle the network to a preset profile. "Offline" cuts the connection '
+        "entirely. Empty string leaves throttling unchanged."
+    )),
+]
+
+CpuThrottlingRate = Annotated[
+    float,
+    Field(ge=0, description=(
+        "Slow the CPU by this factor to emulate a low-end device (4 = 4x slower; "
+        "1-20 is the useful range). 0 or 1 means no throttling."
+    )),
+]
+
+Geolocation = Annotated[
+    str | None,
+    Field(description=(
+        'Override geolocation, as "latitude,longitude" (e.g. "37.7749,-122.4194"). '
+        "Omit to leave unchanged; pass an empty string to clear a previous override."
+    )),
+]
+
+TimeoutMs = Annotated[
+    int,
+    Field(ge=0, description="Maximum wait in milliseconds. 0 uses the built-in default."),
+]
 
 
 async def _active_tab() -> uc.Tab:
@@ -375,13 +516,17 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
     async def _on_request(event: cdp_net.RequestWillBeSent):
         global _request_counter
         try:
+            # ResourceType is an enum whose str() is "ResourceType.XHR", not
+            # "XHR" — storing that made the resource_types filter in
+            # list_network_requests unmatchable. Unwrap to the CDP value.
+            resource_type = getattr(event.type_, "value", event.type_) or "unknown"
             _network_requests.append({
                 "seq": _request_counter,
                 "id": str(event.request_id),
                 "url": event.request.url,
                 "method": event.request.method,
                 "timestamp": str(event.timestamp),
-                "type": str(event.type_) if event.type_ else "unknown",
+                "type": str(resource_type),
             })
             _request_counter += 1
             if len(_network_requests) > 1000:
@@ -1022,20 +1167,33 @@ async def _restart_browser_with(profile_dir: str | None, profile_name: str | Non
 # Tools (aligned with chrome-devtools-mcp interface)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool(title="Bypass insecure-connection warning", open_world=True)
 async def bypass_insecure_warning() -> str:
-    """Click through the browser's insecure connection warning page."""
+    """Click through Chrome's "Your connection is not private" interstitial.
+
+    Use this when a navigation lands on an SSL/certificate warning page (expired
+    or self-signed certificate, hostname mismatch) instead of the site itself —
+    the snapshot then shows a warning page rather than the expected content.
+    This performs the Advanced -> Proceed click for you.
+
+    Has no effect on any other kind of page.
+    """
     tab = await _active_tab()
     await tab.bypass_insecure_connection_warning()
     return "Bypassed insecure connection warning."
 
 
-@mcp.tool()
+@tool(title="Solve Cloudflare challenge", open_world=True)
 async def cf_verify() -> str:
-    """Attempt to solve a Cloudflare verification challenge.
+    """Attempt to solve a Cloudflare "Verify you are human" challenge.
 
-    Uses nodriver's built-in CF verification bypass.
-    Requires opencv-python to be installed.
+    Use when a page is stuck on a Cloudflare interstitial — a checkbox widget,
+    or "Checking your browser before accessing". Drives nodriver's built-in
+    verification bypass, which locates the checkbox visually and clicks it.
+
+    Requires opencv-python to be installed; without it this returns an error.
+    Many challenges also clear by themselves after a few seconds, so
+    wait_for(["some text from the real page"]) is worth trying first.
     """
     tab = await _active_tab()
     try:
@@ -1087,17 +1245,29 @@ async def _scripted_click(tab: uc.Tab, uid: str, dbl_click: bool) -> None:
     )
 
 
-@mcp.tool()
-async def click(uid: str, dbl_click: bool = False, include_snapshot: bool = False) -> str:
-    """Click on the provided element.
+@tool(title="Click element", open_world=True)
+async def click(
+    uid: Uid,
+    dbl_click: Annotated[
+        bool, Field(description="Send a double-click instead of a single click.")
+    ] = False,
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Click an element addressed by its snapshot uid.
 
-    Uses real CDP input events, so the page sees a trusted click. Falls back to
-    a scripted click (reported in the response) when those cannot be delivered.
+    This is the click you want in almost all cases — prefer it over click_at,
+    because a uid survives layout shifts and raw coordinates do not. The element
+    is scrolled into view automatically, so it need not be visible beforehand.
 
-    Args:
-        uid: The uid of an element on the page from the page content snapshot.
-        dbl_click: Set to true for double clicks. Default is false.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    Sends real CDP input events, so the page sees `isTrusted=true`, which is the
+    entire point of an undetected driver. Two situations force a scripted
+    fallback (`element.click()` plus synthetic events, `isTrusted=false`): a
+    touch-emulated target, where CDP mouse input can crash the renderer, and a
+    CDP click that times out or errors. The response says so explicitly whenever
+    that happens, so a detectable click is never silent. Every step is bounded
+    at 10s, so a wedged page cannot hang the call.
+
+    On "unknown uid", take a fresh take_snapshot and retry with the new uid.
     """
     tab = await _active_tab()
     if uid not in _uid_to_backend_node_id:
@@ -1166,17 +1336,33 @@ async def _scripted_click_at(tab: uc.Tab, x: int, y: int, dbl_click: bool) -> No
         raise RuntimeError(str(remote.value))
 
 
-@mcp.tool()
-async def click_at(x: int, y: int, dbl_click: bool = False, include_snapshot: bool = False) -> str:
-    """Click at specific coordinates on the page.
+@tool(title="Click at coordinates", open_world=True)
+async def click_at(
+    x: Annotated[
+        int,
+        Field(description="X coordinate in CSS pixels, relative to the viewport's top-left corner."),
+    ],
+    y: Annotated[
+        int,
+        Field(description="Y coordinate in CSS pixels, relative to the viewport's top-left corner."),
+    ],
+    dbl_click: Annotated[
+        bool, Field(description="Send a double-click instead of a single click.")
+    ] = False,
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Click a raw viewport coordinate instead of an element.
 
-    Uses real CDP input events, with the same scripted fallback as `click`.
+    Use `click` with a uid whenever the target shows up in a snapshot — it is
+    robust against layout shifts, this is not. Coordinates are for surfaces with
+    no addressable element: canvases, maps, video players, image hotspots.
 
-    Args:
-        x: The x coordinate.
-        y: The y coordinate.
-        dbl_click: Set to true for double clicks.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    The point must lie inside the current viewport; scroll_page or
+    scroll_to_selector first if it does not. Coordinates are in CSS pixels and
+    ignore the device pixel ratio, so they match what emulate/resize_page report.
+
+    Same input path as `click`: real CDP events, the same reported scripted
+    fallback, the same 10s bound per step.
     """
     tab = await _active_tab()
 
@@ -1220,12 +1406,24 @@ async def click_at(x: int, y: int, dbl_click: bool = False, include_snapshot: bo
     return result
 
 
-@mcp.tool()
-async def close_page(page_id: int = -1) -> str:
-    """Closes the page by its index. The last open page cannot be closed.
+@tool(title="Close page", destructive=True)
+async def close_page(
+    page_id: Annotated[
+        int,
+        Field(description=(
+            "Index of the page to close, as listed by list_pages. -1 (the default) "
+            "closes the currently selected page."
+        )),
+    ] = -1,
+) -> str:
+    """Close a single browser tab.
 
-    Args:
-        page_id: The ID of the page to close. Default -1 closes current active page.
+    The last remaining tab cannot be closed — use close_browser to shut Chrome
+    down entirely. Closing the selected page clears the selection, so subsequent
+    tools fall back to the most recently opened tab.
+
+    Returns the remaining open pages, because indices shift when a tab closes:
+    re-read them from this response rather than reusing older ones.
     """
     global _selected_target_id
     browser = await _get_browser()
@@ -1244,13 +1442,18 @@ async def close_page(page_id: int = -1) -> str:
     return f"Page closed.{pages}"
 
 
-@mcp.tool()
+@tool(title="Close browser", destructive=True)
 async def close_browser() -> str:
-    """Close the browser entirely (quit Chrome).
+    """Quit Chrome entirely, closing every tab.
 
-    Unlike close_page (which keeps the last tab open), this shuts down the whole
-    browser. It relaunches automatically on the next tool call, using the
-    currently selected profile.
+    Unlike close_page (which always keeps one tab alive), this tears down the
+    whole browser. Chrome relaunches automatically on the next tool call with
+    the currently selected profile, so this is also how you apply pending launch
+    flags without switching profiles.
+
+    On an ephemeral temp profile (the default) this discards cookies, logins and
+    localStorage — save_session first if you need them back. Persistent profiles
+    created with create_profile keep everything.
     """
     running = await _stop_browser()
     return (
@@ -1259,14 +1462,26 @@ async def close_browser() -> str:
     )
 
 
-@mcp.tool()
-async def drag(from_uid: str, to_uid: str, include_snapshot: bool = False) -> str:
-    """Drag an element onto another element.
+@tool(title="Drag and drop", open_world=True)
+async def drag(
+    from_uid: Annotated[
+        str,
+        Field(description="uid of the element to pick up, from the most recent take_snapshot."),
+    ],
+    to_uid: Annotated[
+        str,
+        Field(description="uid of the element to drop onto, from the most recent take_snapshot."),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Drag one element onto another (press, move, release).
 
-    Args:
-        from_uid: The uid of the element to drag.
-        to_uid: The uid of the element to drop into.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    Both uids must come from the same take_snapshot. Works for native HTML5
+    drag-and-drop and for mouse-driven sortable lists.
+
+    Some JS drag libraries require a stream of intermediate mousemove events
+    that this does not emit; if a drag silently does nothing, drive it manually
+    with click_at and press_key instead.
     """
     tab = await _active_tab()
     try:
@@ -1280,24 +1495,46 @@ async def drag(from_uid: str, to_uid: str, include_snapshot: bool = False) -> st
         return f"Error dragging: {e}"
 
 
-@mcp.tool()
+@tool(title="Emulate page conditions", idempotent=True)
 async def emulate(
-    network_conditions: str = "",
-    cpu_throttling_rate: float = 0,
-    geolocation: str | None = None,
-    user_agent: str | None = None,
-    color_scheme: str = "",
-    viewport: str = "",
+    network_conditions: NetworkConditions = "",
+    cpu_throttling_rate: CpuThrottlingRate = 0,
+    geolocation: Geolocation = None,
+    user_agent: Annotated[
+        str | None,
+        Field(description=(
+            "Override the User-Agent header and navigator.userAgent. Omit to leave "
+            "unchanged; pass an empty string to restore Chrome's real one. This does "
+            "NOT touch UA client hints (Sec-CH-UA-*), which then contradict the "
+            "spoofed UA and give the automation away — use emulate_device for mobile, "
+            "it sets both consistently."
+        )),
+    ] = None,
+    color_scheme: ColorScheme = "",
+    viewport: Annotated[
+        str,
+        Field(description=(
+            'Viewport override as "WIDTHxHEIGHTxDPR[,mobile][,touch][,landscape]", '
+            'e.g. "375x812x3,mobile,touch" or "1920x1080x1". The trailing flags are '
+            "optional: `mobile` turns on mobile viewport behaviour, `touch` enables "
+            "touch emulation, `landscape` sets the screen orientation. Empty string "
+            "leaves the viewport unchanged."
+        )),
+    ] = "",
 ) -> str:
-    """Emulates various features on the selected page.
+    """Emulate network, CPU, geolocation, user agent, color scheme or viewport.
 
-    Args:
-        network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G". Omit to disable.
-        cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
-        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged, or set to "" to clear.
-        user_agent: User agent string. Omit to leave unchanged, or set to "" to clear.
-        color_scheme: "dark", "light", or "auto". Empty to skip.
-        viewport: Viewport as "widthxheightxdpr[,mobile][,touch][,landscape]" (e.g. "375x812x3,mobile,touch"). Empty to skip.
+    Applies to the selected page and persists across navigations until
+    reset_emulation. Every parameter is independent — pass only what you want to
+    change, leave the rest at their defaults.
+
+    To emulate a real phone or tablet, use emulate_device instead: it sets user
+    agent, client hints, viewport, DPR and touch as one coherent set, which
+    hand-assembled overrides here get wrong in ways anti-bot systems detect.
+
+    Turning `touch` on in the viewport also changes how `click` behaves — CDP
+    mouse input can crash a touch-emulated renderer, so clicks fall back to the
+    scripted path (`isTrusted=false`) for as long as touch is enabled.
     """
     tab = await _active_tab()
     results = await _apply_emulation(
@@ -1313,30 +1550,45 @@ async def emulate(
     return "Emulation applied: " + ", ".join(results) if results else "No emulation changes applied."
 
 
-@mcp.tool()
+@tool(title="Reset emulation", idempotent=True)
 async def reset_emulation() -> str:
-    """Reset emulation overrides on the selected page back to browser defaults."""
+    """Clear every emulation override on the selected page.
+
+    Resets in one call: network throttling, CPU throttling, geolocation, user
+    agent and client hints, color scheme, viewport, device pixel ratio, page
+    scale and touch emulation — back to the real browser defaults.
+
+    Use after emulate or emulate_device to make the page behave like ordinary
+    desktop Chrome again. Turning touch emulation off here also restores trusted
+    CDP clicks.
+    """
     tab = await _active_tab()
     results = await _reset_emulation(tab)
     return "Emulation reset: " + ", ".join(results)
 
 
-@mcp.tool()
+@tool(title="Emulate device preset", idempotent=True)
 async def emulate_device(
-    device: str,
-    color_scheme: str = "",
-    network_conditions: str = "",
-    cpu_throttling_rate: float = 0,
-    geolocation: str | None = None,
+    device: DevicePreset,
+    color_scheme: ColorScheme = "",
+    network_conditions: NetworkConditions = "",
+    cpu_throttling_rate: CpuThrottlingRate = 0,
+    geolocation: Geolocation = None,
 ) -> str:
-    """Apply a named mobile/tablet device preset to the current page.
+    """Emulate a phone or tablet with one internally consistent set of signals.
 
-    Args:
-        device: Device preset name or alias. Supported presets: pixel_7, pixel_7_landscape, ipad_air.
-        color_scheme: "dark", "light", or "auto". Empty to skip.
-        network_conditions: Throttle network. Options: "Offline", "Slow 3G", "Fast 3G", "Slow 4G", "Fast 4G".
-        cpu_throttling_rate: CPU slowdown factor (1-20). Omit or set to 1 to disable.
-        geolocation: Geolocation as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged, or set to "" to clear.
+    Preferred over assembling `emulate` parameters by hand for mobile work: user
+    agent, UA client hints (Sec-CH-UA-*), viewport, device pixel ratio, touch
+    support and Accept-Language are set together so they cannot contradict each
+    other — a mismatch between them is a classic automation tell.
+
+    Presets are pixel_7, pixel_7_landscape and ipad_air (aliases are listed in
+    the `device` parameter). ipad_air deliberately reports desktop-class Safari
+    with touch and sends no client hints, which is what a real iPad does.
+
+    Applies to the selected page and survives navigation. To have mobile signals
+    present on a page's very first request, pass `device` to new_page or
+    navigate_page instead of calling this afterwards. Undo with reset_emulation.
     """
     if _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
@@ -1354,14 +1606,40 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
-@mcp.tool()
-async def evaluate_script(function: str, args: list[str] | None = None) -> str:
-    """Evaluate a JavaScript function inside the currently selected page.
+@tool(title="Evaluate JavaScript", open_world=True)
+async def evaluate_script(
+    function: Annotated[
+        str,
+        Field(description=(
+            'A JavaScript function expression, e.g. "() => document.title" or '
+            '"(el) => el.innerText". It is invoked immediately and its return value '
+            "is JSON-serialised back to you. Async functions are awaited, so "
+            "\"async () => (await fetch('/api/x')).json()\" works. Return a value — "
+            "console.log output is not captured."
+        )),
+    ],
+    args: Annotated[
+        list[str] | None,
+        Field(description=(
+            "Element uids from the most recent take_snapshot, resolved to live DOM "
+            "nodes and passed as the function's arguments. The first uid is also "
+            "bound as `this`. Omit for page-level scripts."
+        )),
+    ] = None,
+) -> str:
+    """Run JavaScript inside the page and get the result back as JSON.
 
-    Args:
-        function: A JavaScript function declaration to be executed.
-            Example: "() => { return document.title }" or "(el) => { return el.innerText; }"
-        args: An optional list of element uids from the snapshot to pass as arguments to the function.
+    The escape hatch for anything the other tools do not cover: reading computed
+    styles, calling a page's own JS API, or extracting structured data in a
+    single round trip instead of a dozen snapshot-and-click cycles.
+
+    Without `args` the function runs at page level in the main world. With
+    `args`, the given uids become real element references, which is how you
+    operate on one specific element from a snapshot.
+
+    Return values must be JSON-serialisable — DOM nodes, functions and circular
+    structures are not, so map them to plain values inside the function. Errors
+    are returned as a string beginning with "Error:" rather than raised.
     """
     tab = await _active_tab()
     try:
@@ -1399,14 +1677,28 @@ async def evaluate_script(function: str, args: list[str] | None = None) -> str:
         return f"Error: {e}"
 
 
-@mcp.tool()
-async def fill(uid: str, value: str, include_snapshot: bool = False) -> str:
-    """Type text into an input, text area or select an option from a <select> element.
+@tool(title="Fill input", open_world=True)
+async def fill(
+    uid: Uid,
+    value: Annotated[
+        str,
+        Field(description=(
+            "The text to enter. For a <select> element this must match the option's "
+            "value attribute, not its visible label."
+        )),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Set the value of an input, textarea or select element.
 
-    Args:
-        uid: The uid of an element on the page from the page content snapshot.
-        value: The value to fill in.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    Clears the field first, then types the value character by character so that
+    `input` events fire and React/Vue-style controlled components actually
+    register the change (assigning .value directly does not). For <select>, the
+    option is selected by value and a `change` event is dispatched.
+
+    Use type_text instead when you want to append to a focused field rather than
+    replace its contents. For several fields at once, fill_form does it in one
+    round trip.
     """
     tab = await _active_tab()
     try:
@@ -1418,19 +1710,47 @@ async def fill(uid: str, value: str, include_snapshot: bool = False) -> str:
         return f"Error filling uid={uid}: {e}"
 
 
-@mcp.tool()
-async def fill_form(elements: list[dict], include_snapshot: bool = False) -> str:
-    """Fill out multiple form elements at once.
+class FormField(BaseModel):
+    """A single field for fill_form to populate."""
 
-    Args:
-        elements: Elements from snapshot to fill out. Each has "uid" and "value" keys.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    uid: Annotated[
+        str,
+        Field(description="Element uid from the most recent take_snapshot, e.g. \"4_12\"."),
+    ]
+    value: Annotated[
+        str,
+        Field(description=(
+            "The text to enter. For a <select> element, the option's value "
+            "attribute rather than its visible label."
+        )),
+    ]
+
+
+@tool(title="Fill form", open_world=True)
+async def fill_form(
+    elements: Annotated[
+        list[FormField],
+        Field(description=(
+            'The fields to fill, in order — each entry is {"uid": "...", "value": "..."}.'
+        )),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Fill several form fields in a single call.
+
+    Behaves like `fill` per field, but costs one round trip instead of one per
+    field. Fields are processed in the order given, which matters on pages that
+    reveal or enable later fields in response to earlier ones.
+
+    A field that fails does not abort the rest: the response reports success or
+    the specific error per uid, so a partially filled form is always visible
+    rather than silent.
     """
     tab = await _active_tab()
     results = []
     for elem_spec in elements:
-        uid = elem_spec.get("uid", "")
-        value = elem_spec.get("value", "")
+        uid = elem_spec.uid
+        value = elem_spec.value
         try:
             await _fill_element(tab, uid, value)
             results.append(f"  uid={uid}: filled")
@@ -1441,12 +1761,21 @@ async def fill_form(elements: list[dict], include_snapshot: bool = False) -> str
     return result
 
 
-@mcp.tool()
-async def get_console_message(msgid: int) -> str:
-    """Gets a console message by its ID.
+@tool(title="Get console message", read_only=True)
+async def get_console_message(
+    msgid: Annotated[
+        int,
+        Field(ge=0, description="Message id, as shown in square brackets by list_console_messages."),
+    ],
+) -> str:
+    """Read one console message in full, by id.
 
-    Args:
-        msgid: The message ID (0-based index) from list_console_messages.
+    list_console_messages truncates every entry to 200 characters; use this to
+    get a complete stack trace or error payload.
+
+    Requires enable_console_collection to have been called for this page. The
+    server leaves the CDP Runtime domain disabled by default because enabling it
+    is itself something sites can detect.
     """
     tab = await _active_tab()
     if id(tab) not in _console_collection_enabled_tabs:
@@ -1458,12 +1787,24 @@ async def get_console_message(msgid: int) -> str:
     return f"[{msg['type']}] {msg['text']} (timestamp: {msg['timestamp']})"
 
 
-@mcp.tool()
-async def get_cookies(url: str = "") -> str:
-    """Get all cookies, optionally filtered by URL.
+@tool(title="Get cookies", read_only=True)
+async def get_cookies(
+    url: Annotated[
+        str,
+        Field(description=(
+            "Only return cookies that would be sent to this URL (matching domain, path "
+            "and secure flag). Empty string returns every cookie in the browser."
+        )),
+    ] = "",
+) -> str:
+    """List browser cookies with their domain, path and secure flag.
 
-    Args:
-        url: If provided, only return cookies for this URL.
+    Reads the whole browser cookie jar, not just the current page, unless you
+    pass `url`. Values are returned in full, so treat the output as sensitive —
+    it contains live session tokens.
+
+    To carry these across a browser restart use save_session, or switch to a
+    persistent profile with use_profile.
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
@@ -1477,9 +1818,16 @@ async def get_cookies(url: str = "") -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool(title="Get localStorage", read_only=True)
 async def get_local_storage() -> str:
-    """Get all localStorage items from the current page."""
+    """Read all localStorage entries for the current page's origin.
+
+    Values are truncated to 200 characters each; for one entry in full use
+    evaluate_script with `() => localStorage.getItem("key")`.
+
+    localStorage is scoped per origin, so this returns nothing on about:blank —
+    navigate to the site first. sessionStorage is not included.
+    """
     tab = await _active_tab()
     data = await tab.get_local_storage()
     lines = ["localStorage items:"]
@@ -1488,14 +1836,41 @@ async def get_local_storage() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def get_network_request(reqid: int | None = None, request_file_path: str = "", response_file_path: str = "") -> str:
-    """Gets a network request by an optional reqid.
+@tool(title="Get network request", read_only=True)
+async def get_network_request(
+    reqid: Annotated[
+        int | None,
+        Field(description=(
+            "Request id, as shown in square brackets by list_network_requests. "
+            "Omit to get the most recent request."
+        )),
+    ] = None,
+    request_file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the request body (POST data) to this local file path instead of "
+            "including it in the response."
+        )),
+    ] = "",
+    response_file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the response body to this local file path instead of including it. "
+            "Use this for binary responses (images, PDFs, archives) — they are "
+            "base64-decoded on the way out."
+        )),
+    ] = "",
+) -> str:
+    """Inspect one network request: URL, method, resource type and both bodies.
 
-    Args:
-        reqid: The index of the network request from list_network_requests. If omitted, returns the latest request.
-        request_file_path: Optional path to save the request body to.
-        response_file_path: Optional path to save the response body to.
+    Often the fastest way to get structured data out of a site: find the page's
+    own API call with list_network_requests, then read the JSON it already
+    received here, instead of scraping the rendered DOM.
+
+    Inline bodies are truncated at 5000 characters, so pass a file path for
+    anything larger. Response bodies are only available while Chrome still holds
+    them in its buffer — for a long-finished request the entry may still be
+    listed while its body is already gone.
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
@@ -1548,16 +1923,32 @@ async def get_network_request(reqid: int | None = None, request_file_path: str =
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def handle_dialog(action: str = "accept", prompt_text: str = "") -> str:
-    """If a browser dialog was opened, use this command to handle it.
+@tool(title="Handle JavaScript dialog")
+async def handle_dialog(
+    action: Annotated[
+        Literal["accept", "dismiss"],
+        Field(description=(
+            'Accept (OK) or dismiss (Cancel) the dialog. Either closes an alert(); '
+            "for confirm() the choice is what the page's JavaScript receives."
+        )),
+    ] = "accept",
+    prompt_text: Annotated[
+        str,
+        Field(description=(
+            "Text to enter into a prompt() dialog before accepting it. Ignored for "
+            "alert() and confirm() dialogs."
+        )),
+    ] = "",
+) -> str:
+    """Answer an open JavaScript dialog — alert, confirm or prompt.
 
-    Args:
-        action: Whether to "accept" or "dismiss" the dialog.
-        prompt_text: Optional text to enter into a prompt dialog.
+    A dialog blocks the page and every subsequent tool call until it is handled,
+    so call this as soon as one appears. Returns an error if no dialog is open.
+
+    beforeunload dialogs triggered by navigating away are handled automatically
+    via navigate_page's `handle_before_unload` parameter; this tool is for
+    dialogs the page opens by itself.
     """
-    if action not in {"accept", "dismiss"}:
-        return f"Error: Unknown action '{action}'. Use 'accept' or 'dismiss'."
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
     try:
@@ -1570,13 +1961,16 @@ async def handle_dialog(action: str = "accept", prompt_text: str = "") -> str:
     return f"Dialog {action}ed."
 
 
-@mcp.tool()
-async def hover(uid: str, include_snapshot: bool = False) -> str:
-    """Hover over the provided element.
+@tool(title="Hover element", open_world=True)
+async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
+    """Move the mouse over an element without clicking it.
 
-    Args:
-        uid: The uid of an element on the page from the page content snapshot.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    This is how you open hover-triggered menus, tooltips and dropdowns before
+    reading what they reveal — pass include_snapshot=true to get the revealed
+    content back in the same call.
+
+    Only moves the pointer; it does not scroll. If the element sits outside the
+    viewport, call scroll_to_selector first.
     """
     tab = await _active_tab()
     try:
@@ -1589,20 +1983,46 @@ async def hover(uid: str, include_snapshot: bool = False) -> str:
         return f"Error hovering uid={uid}: {e}"
 
 
-@mcp.tool()
+@tool(title="List console messages", read_only=True)
 async def list_console_messages(
-    page_size: int | None = None,
-    page_idx: int = 0,
-    types: list[str] | None = None,
-    include_preserved_messages: bool = False,
+    page_size: Annotated[
+        int | None,
+        Field(ge=1, description="Maximum number of messages to return. Omit to return all."),
+    ] = None,
+    page_idx: Annotated[
+        int, Field(ge=0, description="0-based page number, used together with page_size.")
+    ] = 0,
+    types: Annotated[
+        list[
+            Literal[
+                "log", "debug", "info", "error", "warning", "dir", "dirxml", "table",
+                "trace", "clear", "startGroup", "startGroupCollapsed", "endGroup",
+                "assert", "profile", "profileEnd", "count", "timeEnd",
+            ]
+        ]
+        | None,
+        Field(description=(
+            'Only return these console types, e.g. ["error", "warning"]. Note the '
+            'value is "warning", not "warn". Omit for all types.'
+        )),
+    ] = None,
+    include_preserved_messages: Annotated[
+        bool,
+        Field(description=(
+            "Also include messages from before the last navigation — the server keeps "
+            "the previous 3 navigations. Default false: current page only."
+        )),
+    ] = False,
 ) -> str:
-    """List all console messages for the currently selected page since the last navigation.
+    """List console output collected for the selected page.
 
-    Args:
-        page_size: Maximum number of messages to return. When omitted, returns all.
-        page_idx: Page number (0-based) for pagination. Default is 0.
-        types: Filter to specific message types (e.g. ["error", "warn"]). Omit for all.
-        include_preserved_messages: Set to true to return the preserved messages over the last 3 navigations. Default is false.
+    Requires enable_console_collection first. Console capture is opt-in because
+    it needs the CDP Runtime domain, which some sites use to detect an attached
+    debugger; without it this returns a reminder instead of messages.
+
+    Each line is prefixed with its id and truncated to 200 characters — pass the
+    id to get_console_message for the full text. Only the most recent 1000
+    messages are retained.
     """
     tab = await _active_tab()
     if id(tab) not in _console_collection_enabled_tabs:
@@ -1631,9 +2051,21 @@ async def list_console_messages(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool(title="Enable console collection", idempotent=True)
 async def enable_console_collection() -> str:
-    """Enable console event collection on the current page."""
+    """Start capturing console output on the current page.
+
+    Call this before list_console_messages or get_console_message — neither
+    returns anything until collection is on. Network capture, by contrast, is
+    always on and needs no equivalent call.
+
+    This is opt-in rather than automatic because it enables the CDP Runtime
+    domain, which some anti-bot scripts probe for to detect an attached
+    debugger. Leave it off while stealth matters, and use
+    disable_console_collection when you are done debugging.
+
+    Applies per page: a new tab needs its own call.
+    """
     tab = await _active_tab()
     changed = await _enable_console_collection(tab)
     if changed:
@@ -1641,9 +2073,16 @@ async def enable_console_collection() -> str:
     return "Console collection was already enabled on the current page."
 
 
-@mcp.tool()
+@tool(title="Disable console collection", idempotent=True)
 async def disable_console_collection() -> str:
-    """Disable console event collection on the current page."""
+    """Stop capturing console output on the current page.
+
+    Turns the CDP Runtime domain back off, which restores the quieter,
+    harder-to-detect default — worth doing once you are finished debugging and
+    the page still has anti-bot checks ahead of it.
+
+    Messages already collected stay readable; only new ones stop arriving.
+    """
     tab = await _active_tab()
     changed = await _disable_console_collection(tab)
     if changed:
@@ -1651,22 +2090,57 @@ async def disable_console_collection() -> str:
     return "Console collection was already disabled on the current page."
 
 
-@mcp.tool()
+@tool(title="List network requests", read_only=True)
 async def list_network_requests(
-    page_size: int | None = None,
-    page_idx: int = 0,
-    resource_types: list[str] | None = None,
-    url_filter: str = "",
-    include_preserved_requests: bool = False,
+    page_size: Annotated[
+        int | None,
+        Field(ge=1, description="Maximum number of requests to return. Omit to return all."),
+    ] = None,
+    page_idx: Annotated[
+        int, Field(ge=0, description="0-based page number, used together with page_size.")
+    ] = 0,
+    resource_types: Annotated[
+        list[
+            Literal[
+                "Document", "Stylesheet", "Image", "Media", "Font", "Script",
+                "TextTrack", "XHR", "Fetch", "Prefetch", "EventSource", "WebSocket",
+                "Manifest", "SignedExchange", "Ping", "CSPViolationReport",
+                "Preflight", "FedCM", "Other",
+            ]
+        ]
+        | None,
+        Field(description=(
+            'Only return these resource types. ["XHR", "Fetch"] is the useful filter '
+            "for finding a page's own API calls. Matching is case-insensitive. Omit "
+            "for all types."
+        )),
+    ] = None,
+    url_filter: Annotated[
+        str,
+        Field(description=(
+            "Only return requests whose URL contains this substring (plain text, not "
+            'a regex), e.g. "/api/" or "graphql".'
+        )),
+    ] = "",
+    include_preserved_requests: Annotated[
+        bool,
+        Field(description=(
+            "Also include requests from before the last navigation — the server keeps "
+            "the previous 3 navigations. Default false: current page only."
+        )),
+    ] = False,
 ) -> str:
-    """List all requests for the currently selected page since the last navigation.
+    """List the network requests the selected page has made.
 
-    Args:
-        page_size: Maximum number of requests to return. When omitted, returns all.
-        page_idx: Page number (0-based) for pagination. Default is 0.
-        resource_types: Filter by resource types (e.g. ["xhr", "fetch"]). Omit for all.
-        url_filter: Only return requests whose URL contains this string.
-        include_preserved_requests: Set to true to return the preserved requests over the last 3 navigations. Default is false.
+    Collection is automatic — unlike console capture, nothing needs enabling.
+
+    The main use is finding the JSON API a page calls: filter with
+    resource_types=["XHR", "Fetch"], then pass the id from the square brackets
+    to get_network_request to read the actual response body. That is usually far
+    cheaper and more reliable than scraping the rendered DOM.
+
+    Only the most recent 1000 requests are retained, and each URL is truncated
+    to 150 characters in this listing.
     """
     if include_preserved_requests:
         all_reqs = []
@@ -1693,9 +2167,17 @@ async def list_network_requests(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool(title="List open pages", read_only=True)
 async def list_pages() -> str:
-    """Get a list of pages open in the browser."""
+    """List every open browser tab with its index, URL and title.
+
+    The index shown here is the `page_id` taken by select_page and close_page.
+    Indices are positional and shift whenever a tab opens or closes, so re-read
+    them here rather than reusing an index from an earlier call.
+
+    Tools act on the page chosen with select_page, or on the most recently
+    opened tab if none was selected.
+    """
     browser = await _get_browser()
     await _refresh_targets(browser)
     lines = ["Open pages:"]
@@ -1706,36 +2188,63 @@ async def list_pages() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool(title="Navigate page", open_world=True)
 async def navigate_page(
-    type: str = "url",
-    url: str = "",
-    ignore_cache: bool = False,
-    handle_before_unload: str = "accept",
-    init_script: str = "",
-    timeout: int = 0,
-    device: str = "",
+    type: Annotated[
+        Literal["url", "back", "forward", "reload"],
+        Field(description=(
+            'The kind of navigation: "url" loads `url`, "back" and "forward" move '
+            'through session history, "reload" reloads the current page.'
+        )),
+    ] = "url",
+    url: Annotated[
+        str,
+        Field(description=(
+            'Target URL — required when type="url", ignored otherwise. Include the '
+            'scheme: "https://example.com", not "example.com".'
+        )),
+    ] = "",
+    ignore_cache: Annotated[
+        bool,
+        Field(description='Bypass the HTTP cache (a hard reload). Only applies to type="reload".'),
+    ] = False,
+    handle_before_unload: Annotated[
+        Literal["accept", "dismiss"],
+        Field(description=(
+            'How to answer a beforeunload confirmation ("Leave site?") raised by the '
+            'page being left. "accept" leaves, "dismiss" stays — in which case the '
+            "navigation does not happen."
+        )),
+    ] = "accept",
+    init_script: Annotated[
+        str,
+        Field(description=(
+            "JavaScript executed in every new document before any of the page's own "
+            "scripts, for this navigation. Use it to stub out APIs or plant values a "
+            "page reads at startup. Plain statements, not a function expression."
+        )),
+    ] = "",
+    timeout: TimeoutMs = 0,
+    device: DevicePreset = "",
 ) -> str:
-    """Go to a URL, or back, forward, or reload.
+    """Navigate the selected page — load a URL, or go back, forward or reload.
 
-    Args:
-        type: One of "url", "back", "forward", "reload".
-        url: Target URL (only for type=url).
-        ignore_cache: Whether to ignore cache on reload.
-        handle_before_unload: Whether to auto accept or decline beforeunload dialogs. Default is "accept".
-        init_script: A JavaScript script to be executed on each new document before any other scripts for the next navigation.
-        timeout: Maximum wait time in milliseconds. 0 for default timeout.
-        device: Device preset name or alias to apply before navigation. Empty to leave unchanged.
+    Navigating rotates the collected logs: the previous page's console and
+    network entries move into the preserved history (the last 3 navigations are
+    kept), still reachable via `include_preserved_*` on the list tools.
+
+    Passing `device` applies the emulation before the request is sent, so the
+    server sees mobile signals on the very first byte — calling emulate_device
+    afterwards is too late for that first request.
+
+    Returns the resulting URL together with all open pages. This reuses the
+    current tab; use new_page to open an additional one.
     """
     tab = await _active_tab()
 
-    if handle_before_unload not in {"accept", "dismiss"}:
-        return f"Error: Unknown handle_before_unload '{handle_before_unload}'."
     if device and _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
         return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
-    if type not in {"url", "back", "forward", "reload"}:
-        return f"Error: Unknown type '{type}'."
     if type == "url" and not url:
         return "Error: URL is required for type=url."
 
@@ -1794,24 +2303,49 @@ async def navigate_page(
         tab.remove_handler(cdp_page.JavascriptDialogOpening, _on_javascript_dialog)
 
 
-@mcp.tool()
+@tool(title="Open new page", open_world=True)
 async def new_page(
-    url: str = "about:blank",
-    background: bool = False,
-    isolated_context: str = "",
-    timeout: int = 0,
-    device: str = "",
+    url: Annotated[
+        str,
+        Field(description=(
+            'URL to load in the new tab, including the scheme. Defaults to '
+            '"about:blank" for an empty tab.'
+        )),
+    ] = "about:blank",
+    background: Annotated[
+        bool,
+        Field(description=(
+            "Open the tab without focusing it, leaving the current page selected. "
+            "Default false, which focuses the new page and makes it the target of "
+            "all following tool calls."
+        )),
+    ] = False,
+    isolated_context: Annotated[
+        str,
+        Field(description=(
+            "Open the page in a named isolated browser context — its own cookie jar "
+            "and storage, comparable to a separate incognito window. Pages given the "
+            "same name share that context; different names are fully isolated from "
+            "each other. Use it to hold several logins to one site at once. Empty "
+            "string uses the normal shared context."
+        )),
+    ] = "",
+    timeout: TimeoutMs = 0,
+    device: DevicePreset = "",
 ) -> str:
-    """Open a new tab and load a URL.
+    """Open a new browser tab and load a URL.
 
-    Args:
-        url: URL to load in a new page.
-        background: Whether to open without bringing to front. Default is false.
-        isolated_context: If specified, the page is created in an isolated browser context with the given name.
-            Pages in the same browser context share cookies and storage.
-            Pages in different browser contexts are fully isolated.
-        timeout: Maximum wait time in milliseconds. 0 for default.
-        device: Device preset name or alias to apply before the first real navigation request. Empty to leave unchanged.
+    Chrome always starts with one tab, so the first call here reuses that empty
+    startup tab rather than leaving a stray blank page behind for the rest of
+    the session. A blank tab sitting among others is left alone, and an isolated
+    context always gets a target of its own.
+
+    Unless `background` is set, the new page becomes the selected page for every
+    subsequent tool call.
+
+    Passing `device` applies emulation before the first real request, so mobile
+    signals are present from the very first byte — which calling emulate_device
+    afterwards cannot achieve.
     """
     global _selected_target_id
     if device and _resolve_device_preset(device) is None:
@@ -1875,14 +2409,43 @@ async def new_page(
         return f"Error opening new page: {e}"
 
 
-@mcp.tool()
-async def performance_start_trace(reload: bool = True, auto_stop: bool = True, file_path: str = "") -> str:
-    """Start a performance trace on the selected webpage.
+@tool(title="Start performance trace")
+async def performance_start_trace(
+    reload: Annotated[
+        bool,
+        Field(description=(
+            "Reload the page after starting the trace so the recording covers page "
+            "load. Default true, which is what you want for load performance; set "
+            "false to profile the page as it currently stands."
+        )),
+    ] = True,
+    auto_stop: Annotated[
+        bool,
+        Field(description=(
+            "Record for about 5 seconds, then stop and return the result in this same "
+            "call. Default true. Set false to control the window yourself and end it "
+            "with performance_stop_trace."
+        )),
+    ] = True,
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the raw trace JSON to this local path. Omit to get only the "
+            "collected event count back."
+        )),
+    ] = "",
+) -> str:
+    """Record a Chrome performance trace of page load or interaction.
 
-    Args:
-        reload: Whether to reload the page after starting the trace. Default true.
-        auto_stop: Whether to auto-stop after recording. Default true.
-        file_path: Optional path to save the raw trace data.
+    Captures the same DevTools timeline categories the Performance panel uses:
+    rendering, scripting, loading, screenshots and the V8 CPU profile.
+
+    With the defaults (reload + auto_stop) this is one self-contained call that
+    reloads, records for ~5s and returns. Only one trace can run at a time.
+
+    Pass file_path to keep the data — without it you get just an event count,
+    which confirms the trace ran but says nothing about what it measured. The
+    output is raw trace JSON: load it via DevTools -> Performance -> Load profile.
     """
     global _tracing_active
     tab = await _active_tab()
@@ -1913,12 +2476,22 @@ async def performance_start_trace(reload: bool = True, auto_stop: bool = True, f
     return "Trace started. Use performance_stop_trace to stop."
 
 
-@mcp.tool()
-async def performance_stop_trace(file_path: str = "") -> str:
-    """Stop the active performance trace recording on the selected webpage.
+@tool(title="Stop performance trace")
+async def performance_stop_trace(
+    file_path: Annotated[
+        str,
+        Field(description=(
+            'Write the raw trace JSON to this local path (e.g. "trace.json"), loadable '
+            "in DevTools -> Performance. Omit to get only the event count."
+        )),
+    ] = "",
+) -> str:
+    """Stop the running performance trace and collect its data.
 
-    Args:
-        file_path: Optional path to save the raw trace data (e.g. trace.json).
+    Only needed when performance_start_trace was called with auto_stop=false —
+    otherwise the trace has already ended and this returns an error.
+
+    Waits up to 30 seconds for Chrome to flush its buffered events.
     """
     global _tracing_active
     tab = await _active_tab()
@@ -1961,14 +2534,31 @@ async def performance_stop_trace(file_path: str = "") -> str:
     return result
 
 
-@mcp.tool()
-async def press_key(key: str, include_snapshot: bool = False) -> str:
-    """Press a key or key combination.
+@tool(title="Press key", open_world=True)
+async def press_key(
+    key: Annotated[
+        str,
+        Field(description=(
+            'A key or chord, e.g. "Enter", "Tab", "Escape", "ArrowDown", "a", '
+            '"Control+A" or "Control+Shift+R". Modifiers are Control, Shift, Alt and '
+            "Meta, joined with +. Named keys: Enter, Tab, Backspace, Delete, Escape, "
+            "ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Home, End, PageUp, PageDown, "
+            "Space. Any single character works as itself."
+        )),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Send a key press or keyboard shortcut to the page.
 
-    Args:
-        key: A key or combination (e.g. "Enter", "Control+A", "Control+Shift+R").
-            Modifiers: Control, Shift, Alt, Meta.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    Goes to whatever currently holds focus, so click or fill the target element
+    first — with nothing focused the key lands on the document body.
+
+    Modifiers are held around the main key with the proper modifier bitmask, so
+    real chords such as Control+A or Control+Shift+R register as shortcuts
+    instead of arriving as unrelated key presses.
+
+    For entering text use fill (replaces the field) or type_text (appends to it);
+    this tool is for single keys and shortcuts.
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
@@ -2020,26 +2610,44 @@ async def press_key(key: str, include_snapshot: bool = False) -> str:
     return result
 
 
-@mcp.tool()
-async def resize_page(width: int, height: int) -> str:
-    """Resizes the selected page's window so that the page has specified dimension.
+@tool(title="Resize page", idempotent=True)
+async def resize_page(
+    width: Annotated[int, Field(gt=0, description="Target page width in CSS pixels.")],
+    height: Annotated[int, Field(gt=0, description="Target page height in CSS pixels.")],
+) -> str:
+    """Resize the browser window so the page gets the given dimensions.
 
-    Args:
-        width: Page width in pixels.
-        height: Page height in pixels.
+    Moves the actual OS window, which is what you want for responsive-layout
+    checks that should also come out right in a screenshot.
+
+    To emulate a viewport size without touching the window — including device
+    pixel ratio, the mobile flag and touch — use emulate's `viewport` parameter
+    or emulate_device. Those are what a site's media queries and fingerprinting
+    read as a genuine device change.
     """
     tab = await _active_tab()
     await tab.set_window_size(width=width, height=height)
     return f"Resized to {width}x{height}."
 
 
-@mcp.tool()
-async def scroll_page(direction: str = "down", amount: int = 50) -> str:
-    """Scroll the page up or down.
+@tool(title="Scroll page", open_world=True)
+async def scroll_page(
+    direction: Annotated[Literal["up", "down"], Field(description="Direction to scroll.")] = "down",
+    amount: Annotated[
+        int,
+        Field(gt=0, description=(
+            "How far to scroll, as a percentage of the viewport height — 25 is a "
+            "quarter screen, 100 a full screen."
+        )),
+    ] = 50,
+) -> str:
+    """Scroll the page up or down by a percentage of the viewport.
 
-    Args:
-        direction: "up" or "down".
-        amount: Percentage of page to scroll (25 = quarter page).
+    The way to trigger lazy-loaded content and infinite scroll; take a fresh
+    take_snapshot afterwards to see what was added.
+
+    To bring one known element into view, scroll_to_selector is more precise.
+    `click` already scrolls to its target, so no scrolling is needed before it.
     """
     tab = await _active_tab()
     if direction == "down":
@@ -2049,13 +2657,29 @@ async def scroll_page(direction: str = "down", amount: int = 50) -> str:
     return f"Scrolled {direction} {amount}%."
 
 
-@mcp.tool()
-async def select_page(page_id: int, bring_to_front: bool = True) -> str:
-    """Select a page as a context for future tool calls.
+@tool(title="Select page", idempotent=True)
+async def select_page(
+    page_id: Annotated[
+        int, Field(ge=0, description="Index of the page to select, as listed by list_pages.")
+    ],
+    bring_to_front: Annotated[
+        bool,
+        Field(description=(
+            "Also focus the tab in the real browser window. Default true. Many pages "
+            "pause animations, timers and media while backgrounded, so leave this on "
+            "unless you specifically want the page to stay hidden."
+        )),
+    ] = True,
+) -> str:
+    """Choose which open tab every subsequent tool call acts on.
 
-    Args:
-        page_id: The ID of the page to select (from list_pages).
-        bring_to_front: Whether to focus the page and bring it to the top. Default true.
+    Without a selection, tools act on the most recently opened tab. Selecting
+    makes that choice explicit and sticky — needed when a click opened a tab you
+    now want to drive, or when working across several sites at once.
+
+    Indices come from list_pages and shift as tabs open and close, so the
+    response lists them again. If the selected tab is later closed, the
+    selection is dropped and the default applies again.
     """
     global _selected_target_id
     browser = await _get_browser()
@@ -2070,16 +2694,37 @@ async def select_page(page_id: int, bring_to_front: bool = True) -> str:
     return f"Selected page [{page_id}]: {tab.target.url}{pages}"
 
 
-@mcp.tool()
-async def set_cookie(name: str, value: str, domain: str, path: str = "/", secure: bool = False) -> str:
-    """Set a browser cookie.
+@tool(title="Set cookie", idempotent=True)
+async def set_cookie(
+    name: Annotated[str, Field(description="Cookie name.")],
+    value: Annotated[str, Field(description="Cookie value.")],
+    domain: Annotated[
+        str,
+        Field(description=(
+            'Domain the cookie belongs to, e.g. "example.com". A leading dot '
+            '(".example.com") makes it apply to subdomains as well.'
+        )),
+    ],
+    path: Annotated[
+        str,
+        Field(description='URL path the cookie is scoped to. "/" covers the whole site.'),
+    ] = "/",
+    secure: Annotated[
+        bool,
+        Field(description=(
+            "Send the cookie over HTTPS only. Browsers require this for any cookie "
+            "with SameSite=None."
+        )),
+    ] = False,
+) -> str:
+    """Set a single browser cookie.
 
-    Args:
-        name: Cookie name.
-        value: Cookie value.
-        domain: Cookie domain.
-        path: Cookie path.
-        secure: Whether the cookie is secure-only.
+    Useful for injecting a known session token, consent flag or A/B bucket
+    without walking through a login flow.
+
+    This creates a session cookie: no expiry, gone when the browser closes. To
+    restore a full cookie set including expiry and SameSite, use load_session.
+    Cookies are browser-wide, not per tab.
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
@@ -2089,24 +2734,49 @@ async def set_cookie(name: str, value: str, domain: str, path: str = "/", secure
     return f"Cookie '{name}' set." if success else f"Failed to set cookie '{name}'."
 
 
-@mcp.tool()
-async def set_local_storage(items: dict[str, str]) -> str:
-    """Set localStorage items on the current page.
+@tool(title="Set localStorage", idempotent=True)
+async def set_local_storage(
+    items: Annotated[
+        dict[str, str],
+        Field(description=(
+            'Key-value pairs to write, e.g. {"token": "abc", "locale": "de"}. Values '
+            "must be strings — JSON-encode anything structured yourself."
+        )),
+    ],
+) -> str:
+    """Write entries into the current page's localStorage.
 
-    Args:
-        items: Dict of key-value pairs to set in localStorage.
+    Merges into what is already there rather than clearing it. Handy for setting
+    feature flags, consent state or auth tokens before the page's own scripts
+    read them.
+
+    localStorage is scoped per origin, so navigate to the site first — writing
+    on about:blank goes nowhere. Most pages read these values only at startup,
+    so reload after setting them.
     """
     tab = await _active_tab()
     await tab.set_local_storage(items)
     return f"Set {len(items)} localStorage items."
 
 
-@mcp.tool()
-async def take_memory_snapshot(file_path: str) -> str:
-    """Capture a heap snapshot for memory leak debugging.
+@tool(title="Take heap snapshot")
+async def take_memory_snapshot(
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Local path to write the .heapsnapshot file to. Open it in DevTools -> "
+            "Memory -> Load profile."
+        )),
+    ],
+) -> str:
+    """Capture a V8 heap snapshot of the page, for memory-leak debugging.
 
-    Args:
-        file_path: Path to save the .heapsnapshot file.
+    Writes the raw .heapsnapshot file for Chrome DevTools -> Memory -> Load. The
+    usual workflow is two snapshots taken around a suspect interaction, then
+    comparing retained objects between them.
+
+    On a heavy page a snapshot can be hundreds of megabytes and take several
+    seconds; the response reports the resulting file size.
     """
     tab = await _active_tab()
     import nodriver.cdp.heap_profiler as cdp_heap
@@ -2128,26 +2798,55 @@ async def take_memory_snapshot(file_path: str) -> str:
     return f"Heap snapshot saved to {file_path} ({size_mb} MB)."
 
 
-@mcp.tool()
+@tool(title="Take screenshot", read_only=True)
 async def take_screenshot(
-    full_page: bool = False,
-    format: str = "png",
-    quality: int = 0,
-    uid: str = "",
-    file_path: str = "",
+    full_page: Annotated[
+        bool,
+        Field(description=(
+            "Capture the whole scrollable page rather than just the visible viewport. "
+            "Cannot be combined with `uid`."
+        )),
+    ] = False,
+    format: Annotated[
+        Literal["png", "jpeg", "webp"],
+        Field(description=(
+            'Image format. "png" is lossless and the default; "jpeg" or "webp" with a '
+            "quality setting are far smaller, which matters for full-page captures."
+        )),
+    ] = "png",
+    quality: Annotated[
+        int,
+        Field(ge=0, le=100, description=(
+            "Compression quality from 1 to 100, for jpeg and webp only. Ignored for "
+            "png. 0 leaves Chrome's default."
+        )),
+    ] = 0,
+    uid: Annotated[
+        str,
+        Field(description=(
+            "Capture just this element, using a uid from the most recent take_snapshot. "
+            "Cannot be combined with full_page. Empty string captures the page."
+        )),
+    ] = "",
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the image to this local path. Omit to get a base64 data URL inline "
+            "in the response — that is expensive, so prefer a file for full-page or "
+            "high-DPR captures."
+        )),
+    ] = "",
 ) -> str:
-    """Take a screenshot of the page or element.
+    """Capture the page, the viewport or a single element as an image.
 
-    WARNING: Do NOT use this tool to read page content. Use take_snapshot instead
-    which returns searchable HTML text. Only use take_screenshot when you
-    specifically need a visual image (layout checks, visual regression, etc.).
+    Do NOT use this to read a page. take_snapshot gives you the same content as
+    searchable text, is dramatically smaller, and yields the uids every
+    interaction tool needs. Use a screenshot only when you genuinely need
+    pixels: layout and styling checks, visual regression, or text that exists
+    only inside an image.
 
-    Args:
-        full_page: If True, capture the entire page (not just viewport). Incompatible with uid.
-        format: Image format — "png", "jpeg", or "webp". Default is "png".
-        quality: Compression quality for JPEG/WebP (0-100). Ignored for PNG.
-        uid: The uid of an element from snapshot to screenshot. If omitted, takes full page screenshot.
-        file_path: Optional path to save the screenshot. If omitted, returns base64 data.
+    Element capture needs a uid from the current snapshot. Without file_path the
+    image is returned inline as a base64 data URL.
     """
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
@@ -2190,17 +2889,41 @@ async def take_screenshot(
         return f"data:image/{format};base64,{result}"
 
 
-@mcp.tool()
-async def take_snapshot(verbose: bool = False, file_path: str = "") -> str:
-    """Take a text snapshot of the currently selected page based on the a11y tree.
-    The snapshot lists page elements along with a unique identifier (uid).
-    Always use the latest snapshot. Prefer taking a snapshot over taking a
-    screenshot. The snapshot indicates searchable, structured text that is
-    much smaller than an image or raw HTML.
+@tool(title="Take page snapshot", read_only=True)
+async def take_snapshot(
+    verbose: Annotated[
+        bool,
+        Field(description=(
+            "Return the complete accessibility tree, including nodes normally filtered "
+            "out as noise and containers that are otherwise collapsed. Much larger — "
+            "use it only when an element you need is missing from the default output."
+        )),
+    ] = False,
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the snapshot to this local path instead of returning it — useful "
+            "for very large pages you intend to search rather than read in full."
+        )),
+    ] = "",
+) -> str:
+    """Read the page as compact text, with a uid for every element.
 
-    Args:
-        verbose: Whether to include all possible information available in the full a11y tree. Default is false.
-        file_path: Optional path to save the snapshot to instead of attaching it to the response.
+    This is the primary way to see a page, and the source of the uids that
+    click, fill, hover, drag and upload_file all take. Prefer it over
+    take_screenshot for anything but a genuine visual check: it is searchable,
+    far smaller, and it is what makes interaction possible at all.
+
+    The output is the accessibility tree — roles, names, values and states,
+    indented by nesting — with Chrome-internal and purely presentational nodes
+    filtered out unless `verbose` is set.
+
+    uids stay stable across snapshots for elements that did not change, but any
+    page change can invalidate them. Whenever a tool reports "unknown uid", take
+    a fresh snapshot and use the new uid. Output is capped at 200 000 characters.
+
+    For plain page text without uids, get_page_content is cheaper; to find
+    elements by CSS selector, use query_selector.
     """
     global _snapshot_id
     tab = await _active_tab()
@@ -2368,13 +3091,26 @@ async def take_snapshot(verbose: bool = False, file_path: str = "") -> str:
     return snapshot_text
 
 
-@mcp.tool()
-async def type_text(text: str, submit_key: str = "") -> str:
-    """Type text using keyboard input into a previously focused input.
+@tool(title="Type text", open_world=True)
+async def type_text(
+    text: Annotated[str, Field(description="The text to type, one character at a time.")],
+    submit_key: Annotated[
+        str,
+        Field(description=(
+            'Key to press once typing finishes, e.g. "Enter" to submit a search box or '
+            '"Tab" to move to the next field. Empty string presses nothing.'
+        )),
+    ] = "",
+) -> str:
+    """Type text into whatever element currently has focus.
 
-    Args:
-        text: The text to type.
-        submit_key: Optional key to press after typing (e.g. "Enter", "Tab", "Escape").
+    Appends at the caret instead of replacing, and needs something focused
+    already — click the field first, or use fill, which takes a uid, clears the
+    field and needs no separate focus step.
+
+    Prefer fill for ordinary form filling. Use type_text when you must add to
+    existing content, or for widgets that only react to raw key events such as
+    contenteditable, rich-text and canvas editors.
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
@@ -2401,14 +3137,31 @@ async def type_text(text: str, submit_key: str = "") -> str:
     return result
 
 
-@mcp.tool()
-async def upload_file(uid: str, file_path: str, include_snapshot: bool = False) -> str:
-    """Upload a file through a provided element.
+@tool(title="Upload file", open_world=True)
+async def upload_file(
+    uid: Annotated[
+        str,
+        Field(description=(
+            'uid of the <input type="file"> element, from the most recent '
+            "take_snapshot. It must be the file input itself, not the styled button or "
+            "drop zone layered over it."
+        )),
+    ],
+    file_path: Annotated[
+        str,
+        Field(description="Absolute path to a local file on the machine running this server."),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Attach a local file to a file input on the page.
 
-    Args:
-        uid: The uid of the file input element from the page content snapshot.
-        file_path: The local path of the file to upload.
-        include_snapshot: Whether to include a snapshot in the response. Default is false.
+    Sets the input's files directly over CDP, so no OS file-picker dialog ever
+    opens — clicking an upload button normally would open one, and that blocks
+    every further tool call until a human dismisses it.
+
+    Many sites hide the real <input type="file"> behind a styled button or drop
+    zone. It is still in the snapshot; if you cannot spot it, locate it with
+    query_selector("input[type=file]").
     """
     tab = await _active_tab()
     import nodriver.cdp.dom as cdp_dom
@@ -2427,13 +3180,32 @@ async def upload_file(uid: str, file_path: str, include_snapshot: bool = False) 
     return result
 
 
-@mcp.tool()
-async def wait_for(text: list[str], timeout: int = 30000) -> str:
-    """Wait for the specified text to appear on the selected page.
+@tool(title="Wait for text", read_only=True, open_world=True)
+async def wait_for(
+    text: Annotated[
+        list[str],
+        Field(min_length=1, description=(
+            "Texts to wait for — the wait ends as soon as any one of them appears. "
+            'Passing both outcomes, e.g. ["Welcome back", "Login failed"], lets one '
+            "call tell you which happened. Matching is a case-sensitive substring "
+            "test against the page's visible text."
+        )),
+    ],
+    timeout: Annotated[
+        int, Field(gt=0, description="Maximum wait in milliseconds before giving up.")
+    ] = 30000,
+) -> str:
+    """Wait until one of several texts appears on the page, then snapshot it.
 
-    Args:
-        text: Non-empty list of texts. Resolves when any value appears on the page.
-        timeout: Maximum wait time in milliseconds. Default is 30000.
+    The right way to wait after an action that starts loading — far more
+    reliable than guessing a delay, and it returns the moment the text shows up
+    instead of always burning the whole timeout.
+
+    On success the page snapshot is included in the response, so no separate
+    take_snapshot call is needed.
+
+    Polls the visible text twice a second. To wait for an element rather than
+    for wording, use wait_for_selector.
     """
     tab = await _active_tab()
     timeout_s = timeout / 1000
@@ -2468,15 +3240,28 @@ def _ensure_sessions_dir() -> str:
     return _SESSIONS_DIR
 
 
-@mcp.tool()
-async def save_session(name: str) -> str:
-    """Save the current browser session (cookies, localStorage, open URLs) to a file.
+@tool(title="Save session")
+async def save_session(
+    name: Annotated[
+        str,
+        Field(description=(
+            'A human-readable name for this session, e.g. "github-logged-in". It '
+            "forms the filename, with a timestamp appended so repeated saves never "
+            "overwrite one another."
+        )),
+    ],
+) -> str:
+    """Save cookies, localStorage and open page URLs to a reusable file.
 
-    The session is stored as a JSON file under ~/.nodriver-mcp/sessions/.
-    Use load_session to restore it later.
+    This is how you keep a login obtained interactively, so a later run can skip
+    the login flow entirely — restore it with load_session.
 
-    Args:
-        name: A human-readable name for this session (e.g. "xiaohongshu-logged-in").
+    Stored as JSON under ~/.nodriver-mcp/sessions/. That file holds live session
+    tokens in plain text, so treat it as a credential.
+
+    Only the current page's origin contributes localStorage. For a login meant
+    to survive without an explicit restore step, a persistent profile
+    (create_profile + use_profile) is the sturdier option.
     """
     tab = await _active_tab()
     browser = await _get_browser()
@@ -2537,13 +3322,32 @@ async def save_session(name: str) -> str:
     )
 
 
-@mcp.tool()
-async def load_session(filename: str, restore_pages: bool = False) -> str:
-    """Load a previously saved session, restoring cookies and localStorage.
+@tool(title="Load session")
+async def load_session(
+    filename: Annotated[
+        str,
+        Field(description=(
+            "Session filename as shown by list_sessions, or an absolute path to a "
+            "session JSON file."
+        )),
+    ],
+    restore_pages: Annotated[
+        bool,
+        Field(description=(
+            "Also re-open the tabs that were open when the session was saved. Default "
+            "false, which restores only cookies and localStorage."
+        )),
+    ] = False,
+) -> str:
+    """Restore cookies and localStorage from a saved session file.
 
-    Args:
-        filename: The session filename (from list_sessions) or full path.
-        restore_pages: Whether to also re-open the saved page URLs. Default is false.
+    Use it at the start of a run to arrive already logged in. The page is first
+    navigated to the saved origin so localStorage lands where it belongs, then
+    reloaded so the restored cookies take effect.
+
+    Cookies that no longer apply are skipped rather than failing the whole
+    restore, and the response reports how many were actually restored. Expired
+    tokens still leave you logged out, so check the page afterwards.
     """
     # Resolve file path
     if os.path.isabs(filename):
@@ -2626,11 +3430,15 @@ async def load_session(filename: str, restore_pages: bool = False) -> str:
     )
 
 
-@mcp.tool()
+@tool(title="List sessions", read_only=True)
 async def list_sessions() -> str:
-    """List all saved browser sessions.
+    """List saved session files with their name, save time and contents.
 
-    Returns the available session files with their names and save times.
+    Shows the filename to hand to load_session, along with how many cookies and
+    localStorage entries each one holds, newest first.
+
+    Sessions live in ~/.nodriver-mcp/sessions/ and are never cleaned up
+    automatically, so old logins accumulate there over time.
     """
     _ensure_sessions_dir()
     files = sorted(
@@ -2663,14 +3471,43 @@ async def list_sessions() -> str:
 # Content extraction, waiting, export, cookies, runtime flags
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def get_page_content(format: str = "text", max_chars: int = 100000, file_path: str = "") -> str:
-    """Get the raw page content — visible text or full HTML.
+@tool(title="Get page content", read_only=True)
+async def get_page_content(
+    format: Annotated[
+        Literal["text", "html"],
+        Field(description=(
+            '"text" returns document.body.innerText — visible text without markup, '
+            'which is what you want for reading. "html" returns the full outerHTML '
+            "including scripts and attributes, needed when you care about markup, "
+            "data- attributes or hidden field values."
+        )),
+    ] = "text",
+    max_chars: Annotated[
+        int,
+        Field(ge=0, description=(
+            "Truncate the output at this many characters. 0 means no limit, which is "
+            'risky on large pages — especially with format="html".'
+        )),
+    ] = 100000,
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the content to this local path instead of returning it — the way "
+            "to capture a large page without flooding the conversation."
+        )),
+    ] = "",
+) -> str:
+    """Get the page's visible text, or its full HTML.
 
-    Args:
-        format: "text" for document.body.innerText, "html" for the full outerHTML. Default "text".
-        max_chars: Truncate the returned output to this many characters (default 100000). 0 = no limit.
-        file_path: Optional path to save the content to instead of returning it.
+    The cheapest way to read a page when you only need content and not the uids
+    take_snapshot provides: no accessibility tree is built, and the text form
+    carries no markup overhead.
+
+    Returns the DOM as it stands right now, so on pages that render
+    asynchronously call wait_for or wait_for_selector first.
+
+    Use take_snapshot when you intend to interact with elements, and
+    query_selector when you want specific elements rather than the whole page.
     """
     tab = await _active_tab()
     if format == "html":
@@ -2687,13 +3524,29 @@ async def get_page_content(format: str = "text", max_chars: int = 100000, file_p
     return content
 
 
-@mcp.tool()
-async def query_selector(selector: str, limit: int = 20) -> str:
-    """Find elements matching a CSS selector and list their tag, text and key attributes.
+@tool(title="Query CSS selector", read_only=True)
+async def query_selector(
+    selector: Annotated[
+        str,
+        Field(description=(
+            'A CSS selector, e.g. "a.result", "#nav li", "input[type=file]". Standard '
+            "querySelectorAll syntax — no jQuery extensions such as :contains()."
+        )),
+    ],
+    limit: Annotated[
+        int, Field(gt=0, description="Maximum number of matching elements to return.")
+    ] = 20,
+) -> str:
+    """Find elements by CSS selector; list their tag, text, href, id and class.
 
-    Args:
-        selector: CSS selector (e.g. "a.result", "#nav li").
-        limit: Maximum number of elements to return (default 20).
+    The efficient way to pull a repeated structure off a page — search results,
+    product tiles, table rows — without paying for a full snapshot.
+
+    Returns a compact listing only. It yields no uids, so it cannot drive clicks:
+    take a snapshot when you need to interact, or operate on the elements
+    directly via evaluate_script.
+
+    Element text is truncated to 200 characters.
     """
     tab = await _active_tab()
     sel = json.dumps(selector)
@@ -2727,12 +3580,21 @@ async def query_selector(selector: str, limit: int = 20) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def scroll_to_selector(selector: str) -> str:
-    """Scroll the element matching a CSS selector into view (centered).
+@tool(title="Scroll to element", open_world=True)
+async def scroll_to_selector(
+    selector: Annotated[
+        str,
+        Field(description="CSS selector of the element to scroll to; the first match wins."),
+    ],
+) -> str:
+    """Scroll the first element matching a CSS selector into view, centered.
 
-    Args:
-        selector: CSS selector of the element to scroll to.
+    More precise than scroll_page when you already know what you are looking
+    for, and the usual preparation for click_at, which needs its target inside
+    the viewport.
+
+    `click` scrolls to its own target, so this is unnecessary before it. Reports
+    whether anything matched instead of failing silently.
     """
     tab = await _active_tab()
     sel = json.dumps(selector)
@@ -2755,14 +3617,28 @@ _RESOURCE_EXTS: dict[str, list[str]] = {
 }
 
 
-@mcp.tool()
-async def block_resources(types: list[str] | None = None) -> str:
-    """Block resource types to speed up scraping / save bandwidth (applies to the
-    current page session).
+@tool(title="Block resource types", idempotent=True)
+async def block_resources(
+    types: Annotated[
+        list[Literal["image", "font", "stylesheet", "media"]] | None,
+        Field(description=(
+            'Resource types to block. ["image", "font", "media"] is the usual choice '
+            "for scraping — it keeps stylesheets, so layout-dependent behaviour still "
+            "works. Pass an empty list or omit to unblock everything."
+        )),
+    ] = None,
+) -> str:
+    """Block images, fonts, stylesheets or media to speed up page loads.
 
-    Args:
-        types: Types to block — any of "image", "font", "stylesheet", "media".
-            Pass an empty list (or omit) to unblock everything.
+    Removes most of the bytes on a media-heavy page, which makes scraping
+    several times faster and far cheaper over a metered or proxied connection.
+
+    Blocking stylesheets breaks layout, so anything that depends on element
+    geometry becomes unreliable — click_at, element screenshots, and the
+    `visible` check in wait_for_selector. Text extraction is unaffected.
+
+    Applies to the current page session and stays in effect across navigations
+    until called again with no types.
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
@@ -2785,14 +3661,32 @@ async def block_resources(types: list[str] | None = None) -> str:
     return base
 
 
-@mcp.tool()
-async def wait_for_selector(selector: str, timeout: int = 30000, visible: bool = False) -> str:
-    """Wait for an element matching a CSS selector to appear on the page.
+@tool(title="Wait for element", read_only=True, open_world=True)
+async def wait_for_selector(
+    selector: Annotated[
+        str,
+        Field(description='CSS selector to wait for, e.g. "#login" or ".results .item".'),
+    ],
+    timeout: Annotated[
+        int, Field(gt=0, description="Maximum wait in milliseconds before giving up.")
+    ] = 30000,
+    visible: Annotated[
+        bool,
+        Field(description=(
+            "Also require the element to have a non-zero size. Use this with "
+            "frameworks that insert an element into the DOM before rendering it — "
+            "presence alone would otherwise resolve too early."
+        )),
+    ] = False,
+) -> str:
+    """Wait until an element matching a CSS selector appears on the page.
 
-    Args:
-        selector: CSS selector to wait for (e.g. "#login", ".results .item").
-        timeout: Maximum wait time in milliseconds. Default 30000.
-        visible: If true, also require the element to have a non-zero size.
+    The structural counterpart to wait_for: use it when you know the markup but
+    not the wording, or when the wording is localised.
+
+    Polls about three times a second and returns as soon as the element shows
+    up. Unlike wait_for it does not return a snapshot, so follow with
+    take_snapshot when you intend to interact.
     """
     tab = await _active_tab()
     sel = json.dumps(selector)
@@ -2813,14 +3707,27 @@ async def wait_for_selector(selector: str, timeout: int = 30000, visible: bool =
     return f"Timeout: '{selector}' did not appear within {timeout}ms."
 
 
-@mcp.tool()
-async def save_pdf(file_path: str, landscape: bool = False, print_background: bool = True) -> str:
-    """Save the current page as a PDF (Chrome print-to-PDF).
+@tool(title="Save page as PDF")
+async def save_pdf(
+    file_path: Annotated[str, Field(description="Local path to write the .pdf file to.")],
+    landscape: Annotated[
+        bool, Field(description="Use landscape orientation instead of portrait.")
+    ] = False,
+    print_background: Annotated[
+        bool,
+        Field(description=(
+            "Include background colours and images. Default true, which resembles the "
+            "page as seen on screen; false gives the leaner print view."
+        )),
+    ] = True,
+) -> str:
+    """Export the current page to a PDF using Chrome's print-to-PDF.
 
-    Args:
-        file_path: Path to write the .pdf file.
-        landscape: Landscape orientation. Default false.
-        print_background: Include background graphics/colors. Default true.
+    Renders the entire document rather than just the viewport, and applies the
+    page's print stylesheet — so the result can differ from the screen layout.
+
+    A good way to archive a rendered page as one file. For a pixel-accurate copy
+    of what is on screen, use take_screenshot with full_page instead.
     """
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
@@ -2835,33 +3742,68 @@ async def save_pdf(file_path: str, landscape: bool = False, print_background: bo
     return f"PDF saved to {file_path}."
 
 
-@mcp.tool()
+@tool(title="Clear cookies", destructive=True, idempotent=True)
 async def clear_cookies() -> str:
-    """Clear all browser cookies for the current browser session."""
+    """Delete every cookie in the browser.
+
+    Browser-wide, not per site and not per tab — this logs you out of everything
+    at once, with no undo. Restore a previous state with load_session if you
+    have one saved.
+
+    Useful for testing a first-time-visitor flow or resetting a consent banner
+    decision. localStorage is left untouched, so sites that keep state there may
+    still recognise you.
+    """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
     await tab.send(cdp_net.clear_browser_cookies())
     return "All cookies cleared."
 
 
-@mcp.tool()
+@tool(title="Set browser launch flags", destructive=True)
 async def set_browser_flags(
-    translate: bool | None = None,
-    extensions: bool | None = None,
-    extra_args: list[str] | None = None,
-    restart: bool = True,
+    translate: Annotated[
+        bool | None,
+        Field(description=(
+            "True allows Chrome's Google Translate popup, false suppresses it. Omit to "
+            "leave unchanged. Suppressed by default, because the popup covers page "
+            "content and swallows clicks."
+        )),
+    ] = None,
+    extensions: Annotated[
+        bool | None,
+        Field(description=(
+            "True allows externally-installed Chrome extensions, false blocks them. "
+            'Omit to leave unchanged. Blocked by default, so no "an extension requires '
+            'your attention" prompt appears. manage_extensions offers the same switch '
+            "plus listing and loading."
+        )),
+    ] = None,
+    extra_args: Annotated[
+        list[str] | None,
+        Field(description=(
+            "Replace the set of extra Chrome launch flags with this list, e.g. "
+            '["--lang=de-DE", "--window-size=1280,800"]. A leading "--" is added if '
+            "missing. Pass [] to clear them, omit to leave unchanged. This replaces "
+            "the list rather than appending to it."
+        )),
+    ] = None,
+    restart: Annotated[
+        bool,
+        Field(description=(
+            "Restart Chrome now so the flags take effect, closing all open pages. "
+            "Default true; false defers them to the next browser start."
+        )),
+    ] = True,
 ) -> str:
-    """Change the Chrome launch flags at runtime (overrides the NODRIVER_ENABLE_*
-    env vars). Because these are launch flags, the browser is restarted to apply
-    them. Call with no arguments to just view the current flags.
+    """Change Chrome's launch flags at runtime, and show the current ones.
 
-    Args:
-        translate: true = allow the Google Translate popup; false = suppress it. Omit to leave unchanged.
-        extensions: true = allow external Chrome extensions; false = block them. Omit to leave unchanged.
-        extra_args: Replace the set of arbitrary extra Chrome flags with this list
-            (e.g. ["--lang=de-DE", "--window-size=1280,800"]). Pass [] to clear them.
-            Omit to leave unchanged. A leading "--" is added if missing.
-        restart: restart the browser now so the changes apply (default true).
+    Call with no arguments at all to just read the effective configuration —
+    that form changes nothing.
+
+    These are launch-time flags, so applying them restarts Chrome and closes
+    every open page; on an ephemeral profile that also drops its cookies. Values
+    set here override the NODRIVER_ENABLE_* environment variables.
     """
     global _enable_translate, _enable_extensions, _extra_browser_args
     changed = []
@@ -3006,32 +3948,43 @@ def _scan_profile_extensions(profile_dir: str) -> list[dict]:
     return found
 
 
-@mcp.tool()
-async def manage_extensions(action: str = "list", path: str = "") -> str:
-    """List, enable/disable, or load Chrome extensions.
+@tool(title="Manage Chrome extensions", destructive=True)
+async def manage_extensions(
+    action: Annotated[
+        Literal["list", "on", "off", "load", "unload"],
+        Field(description=(
+            '"list" shows the extensions installed in the active profile plus the '
+            "current state, and changes nothing. \"on\" and \"off\" flip the master "
+            'switch. "load" registers an unpacked extension from `path` and implies '
+            '"on". "unload" stops loading `path`, or every unpacked extension when '
+            '`path` is empty. Every action except "list" restarts the browser.'
+        )),
+    ] = "list",
+    path: Annotated[
+        str,
+        Field(description=(
+            "Folder containing the extension's manifest.json, for \"load\" and "
+            '"unload". Ignored by the other actions.'
+        )),
+    ] = "",
+) -> str:
+    """List, enable, disable or load Chrome extensions.
 
-    Two things are at play:
-      * the master switch — Chrome runs with --disable-extensions by default, so
-        extensions installed in the profile stay dark until it is turned on;
-      * unpacked extensions loaded from a folder on disk.
+    Two separate mechanisms are in play. The master switch: Chrome runs with
+    --disable-extensions by default, so extensions installed in the profile stay
+    dark until it is turned on. And unpacked extensions loaded from a folder on
+    disk. The master switch governs both — with it off, unpacked extensions stay
+    registered but do not load.
 
-    The master switch covers both: with it off, unpacked extensions stay
-    registered but are not loaded either. Every action restarts the browser,
-    since these are launch-time settings.
+    "load" only works on Chromium or Chrome for Testing. Official Google Chrome
+    builds have ignored --load-extension since v137 (still true on Chrome 151,
+    even with --enable-unsafe-extension-debugging), and this tool says so rather
+    than pretending it worked. On official Chrome the working path is: install
+    the extension once from the Web Store into a persistent profile, then switch
+    it on with "on".
 
-    Args:
-        action: One of
-            "list"    — installed extensions in the active profile + current state (default),
-            "on"      — enable extensions (profile-installed and unpacked), restart,
-            "off"     — disable all extensions, restart,
-            "load"    — load an unpacked extension from `path` (implies "on"), restart,
-            "unload"  — stop loading `path`, or all unpacked extensions if empty, restart.
-        path: Folder holding the extension's manifest.json (for "load" / "unload").
-
-    "load" only works on Chromium / Chrome for Testing. Official Chrome builds
-    have ignored --load-extension since v137; the tool says so when it applies.
-    On official Chrome, install the extension once from the Web Store into a
-    persistent profile and switch it on with "on" — that does work.
+    Extensions only persist in a persistent profile — on the default ephemeral
+    one nothing can stay installed.
     """
     global _enable_extensions, _loaded_extensions
     act = (action or "list").strip().lower()
@@ -3131,13 +4084,18 @@ async def manage_extensions(action: str = "list", path: str = "") -> str:
 # Chrome profile (user-data-dir) management
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@tool(title="List profiles", read_only=True)
 async def list_profiles() -> str:
-    """List saved persistent Chrome profiles and show which profile is active.
+    """List persistent Chrome profiles and show which one is active.
 
-    By default the browser uses a fresh ephemeral temp profile per session
-    (auto-deleted), so multiple nodriver instances never collide on one profile.
-    Persistent profiles let you reuse logins/cookies across sessions.
+    By default the browser runs on a fresh ephemeral temp profile that is
+    deleted when the session ends. That default is what lets several nodriver
+    instances — Claude Desktop, Claude Code, the VS Code extension — run at the
+    same time without fighting over one profile directory.
+
+    Persistent profiles keep cookies, logins and installed extensions across
+    sessions. Create one with create_profile, switch with use_profile, and
+    return to ephemeral with use_temp_profile.
     """
     os.makedirs(_PROFILES_DIR, exist_ok=True)
     names = sorted(
@@ -3165,13 +4123,36 @@ async def list_profiles() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
-async def create_profile(name: str, activate: bool = False) -> str:
-    """Create a new named persistent Chrome profile (a reusable user-data dir).
+@tool(title="Create profile", idempotent=True)
+async def create_profile(
+    name: Annotated[
+        str,
+        Field(description=(
+            'Profile name, e.g. "google-login". Only letters, digits, "-" and "_" are '
+            "kept; any other character is stripped out."
+        )),
+    ],
+    activate: Annotated[
+        bool,
+        Field(description=(
+            "Switch to the new profile straight away. That restarts the browser and "
+            "closes all open pages. Default false, which only creates the directory."
+        )),
+    ] = False,
+) -> str:
+    """Create a named persistent Chrome profile — a reusable user-data dir.
 
-    Args:
-        name: Profile name (letters, digits, '-' or '_'), e.g. "google-login".
-        activate: If true, switch the browser to this profile now (restarts the browser).
+    A persistent profile keeps cookies, logins and Web Store extensions between
+    runs, so a site you log into once stays logged in. It is the sturdier
+    alternative to save_session / load_session.
+
+    Creating one is harmless by itself: nothing changes until you activate it,
+    here or via use_profile. An existing profile of the same name is left
+    untouched rather than overwritten. Profiles live under
+    ~/.nodriver-mcp/profiles/<name>.
+
+    Only one browser instance can use a given profile at a time, so give
+    concurrent setups different names.
     """
     safe = _safe_profile_name(name)
     if not safe:
@@ -3188,24 +4169,39 @@ async def create_profile(name: str, activate: bool = False) -> str:
     return msg
 
 
-@mcp.tool()
+@tool(title="Use temporary profile", destructive=True, idempotent=True)
 async def use_temp_profile() -> str:
-    """Switch to a fresh ephemeral temp profile (auto-created and deleted per
-    session). This is the default, and lets many nodriver instances run at once
-    without colliding. Restarts the browser (open pages are closed).
+    """Switch back to a fresh ephemeral profile, created and deleted per session.
+
+    This is the default. It leaves nothing behind on disk and lets many nodriver
+    instances run concurrently without colliding on a profile directory.
+
+    Restarts the browser and closes all open pages. The profile you are leaving
+    is not deleted — a persistent one keeps its cookies for the next
+    use_profile. Anything held in the outgoing temp profile is gone.
     """
     await _restart_browser_with(None, None)
     return "Switched to an ephemeral temp profile (auto-deleted after the session)."
 
 
-@mcp.tool()
-async def use_profile(name: str) -> str:
-    """Switch the browser to a persistent profile by name. Restarts the browser
-    (any open pages are closed). Pass "" or "temp" to return to an ephemeral
-    temp profile.
+@tool(title="Use persistent profile", destructive=True, idempotent=True)
+async def use_profile(
+    name: Annotated[
+        str,
+        Field(description=(
+            "Name of an existing persistent profile, as shown by list_profiles. Pass "
+            '"", "temp", "ephemeral" or "none" to switch back to an ephemeral profile.'
+        )),
+    ],
+) -> str:
+    """Switch the browser to a named persistent profile.
 
-    Args:
-        name: The persistent profile name (see list_profiles), or "" / "temp".
+    Use it to pick up the cookies, logins and extensions stored in an earlier
+    session, so a run starts out already authenticated.
+
+    Restarts the browser and closes every open page. The profile has to exist
+    already — create it first with create_profile. Only one browser may use a
+    profile at a time; a second instance pointed at the same one fails to start.
     """
     if not name or name.strip().lower() in ("temp", "ephemeral", "none"):
         return await use_temp_profile()
@@ -3220,12 +4216,20 @@ async def use_profile(name: str) -> str:
     return f"Switched to persistent profile '{safe}' ({path}). It starts on the next action."
 
 
-@mcp.tool()
-async def delete_profile(name: str) -> str:
-    """Delete a persistent Chrome profile directory (cannot delete the active one).
+@tool(title="Delete profile", destructive=True)
+async def delete_profile(
+    name: Annotated[
+        str,
+        Field(description="Name of the persistent profile to delete, as shown by list_profiles."),
+    ],
+) -> str:
+    """Permanently delete a persistent Chrome profile directory.
 
-    Args:
-        name: The persistent profile name to delete.
+    Irreversible: the profile's cookies, logins, history and installed
+    extensions are removed from disk, with no undo.
+
+    The active profile cannot be deleted — switch away with use_temp_profile
+    first.
     """
     safe = _safe_profile_name(name)
     if not safe:
