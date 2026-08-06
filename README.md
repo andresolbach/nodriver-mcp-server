@@ -55,6 +55,8 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/) for the f
 uv tool install "nodriver-mcp @ git+https://github.com/andresolbach/nodriver-mcp-server.git@main"
 ```
 
+Also listed in the [official MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.andresolbach/nodriver-mcp-server`, so clients and marketplaces that read the registry can find and install it directly.
+
 > Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.3`, which contains the Chrome 146+ CDP fixes (`sameParty` removed from `Cookie`, `privateNetworkRequestPolicy` → `localNetworkAccessRequestPolicy`) — **verified working against Chrome 150**. `pip install` also works, but `uv tool install` keeps it isolated.
 
 You'll also need a local installation of **Google Chrome** (auto-detected).
