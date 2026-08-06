@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.andresolbach/nodriver-mcp-server",
   "title": "nodriver — undetected browser automation",
-  "description": "Undetected Chrome browser automation — a stealth, anti-bot-resistant alternative to chrome-devtools-mcp. 57 tools for navigation, input, accessibility-tree snapshots, network and console inspection, device emulation, sessions and profiles.",
+  "description": "Undetected, anti-bot-resistant Chrome automation. 57 tools. Stealth chrome-devtools-mcp alternative.",
   "repository": {
     "url": "https://github.com/andresolbach/nodriver-mcp-server",
     "source": "github"

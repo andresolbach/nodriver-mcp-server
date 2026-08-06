@@ -15,17 +15,25 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install mcp-publisher
         run: |
           curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
 
+      # On a tag the tag wins, so the entry can never disagree with the release.
+      # On a manual dispatch there is no tag to read, so server.json stands as
+      # committed rather than being rewritten with a branch name.
       - name: Pin server.json to the tagged version
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
-          mv server.tmp server.json
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+            mv server.tmp server.json
+            echo "pinned to $VERSION"
+          else
+            echo "not a tag ref — using server.json as committed"
+          fi
           cat server.json
 
       - name: Authenticate to MCP Registry
