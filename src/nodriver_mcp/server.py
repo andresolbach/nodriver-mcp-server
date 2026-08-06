@@ -41,6 +41,35 @@ _enable_translate: bool | None = None
 _enable_extensions: bool | None = None
 # Arbitrary extra Chrome launch flags set at runtime via set_browser_flags.
 _extra_browser_args: list[str] = []
+# Unpacked extension directories to load at launch (manage_extensions).
+_loaded_extensions: list[str] = []
+
+# URLs that count as "this tab is empty, reuse it instead of opening another".
+_BLANK_URLS = frozenset({
+    "", "about:blank", "chrome://newtab", "chrome://new-tab-page",
+    "chrome://newtab/", "chrome://new-tab-page/",
+})
+
+
+def _is_blank_url(url: str | None) -> bool:
+    """Whether a tab holds nothing worth keeping (startup tab / empty tab)."""
+    return (url or "").strip() in _BLANK_URLS
+
+
+# Targets that currently run with touch emulation on. Dispatching mouse events
+# through the CDP Input domain can take such a renderer down (the websocket
+# dies with "Connection closed" and the tab is gone), so click() uses the
+# scripted fallback there instead. Kept in sync by _apply_emulation /
+# _reset_emulation.
+_touch_emulated_targets: set[str] = set()
+
+# Upper bound for a single click step, so a wedged page can never hang the call.
+_CLICK_TIMEOUT_S = 10.0
+
+
+def _target_key(tab: uc.Tab) -> str:
+    """Stable identity of a tab's CDP target ("" if it has none yet)."""
+    return str(tab.target.target_id) if tab.target else ""
 
 
 def _feature_enabled(override: bool | None, env_name: str) -> bool:
@@ -115,23 +144,59 @@ async def _get_browser() -> uc.Browser:
             if browser_path:
                 kwargs["browser_executable_path"] = browser_path
 
+            extensions_on = _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS")
+            # The master switch gates unpacked extensions too: manage_extensions
+            # ("off") has to turn everything off, not just what the profile
+            # installed. The paths stay registered so "on" brings them back.
+            unpacked = (
+                [p for p in _loaded_extensions if os.path.isdir(p)] if extensions_on else []
+            )
+
+            # Chrome keeps only the LAST --disable-features on the command line,
+            # and nodriver always passes one of its own. Build a single merged
+            # switch (ours lands last and wins) so neither side silently drops
+            # the other's entries.
+            #
             # Clean-automation defaults, each re-enable-able via an env var:
             #   - suppress the Google Translate popup  (NODRIVER_ENABLE_TRANSLATE=true)
             #   - block externally-installed extensions + their "action required"
             #     prompts                              (NODRIVER_ENABLE_EXTENSIONS=true)
-            browser_args: list[str] = []
+            disabled_features = ["IsolateOrigins", "site-per-process"]
             if not _feature_enabled(_enable_translate, "NODRIVER_ENABLE_TRANSLATE"):
-                browser_args.append("--disable-features=Translate")
-            if not _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS"):
+                disabled_features.append("Translate")
+            if unpacked:
+                # Chrome 137+ ignores --load-extension unless this kill switch
+                # is itself switched off.
+                disabled_features.append("DisableLoadExtensionCommandLineSwitch")
+
+            browser_args: list[str] = [f"--disable-features={','.join(disabled_features)}"]
+            if not extensions_on:
                 browser_args.append("--disable-extensions")
             browser_args.extend(_extra_browser_args)
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
                 logger.info("Proxy configured: %s", proxy)
-            if browser_args:
-                kwargs["browser_args"] = browser_args
+            # Start on about:blank rather than the New Tab page: the NTP fires
+            # its own Google requests, which pollute list_network_requests and
+            # cost a page load nobody asked for.
+            browser_args.append("about:blank")
+            kwargs["browser_args"] = browser_args
 
-            _browser = await uc.start(**kwargs)
+            if unpacked:
+                # Extensions have to go through a Config object — uc.start()
+                # has no keyword for them.
+                cfg = uc.Config(
+                    user_data_dir=kwargs.get("user_data_dir"),
+                    headless=headless,
+                    browser_executable_path=kwargs.get("browser_executable_path"),
+                    browser_args=browser_args,
+                )
+                for path in unpacked:
+                    cfg.add_extension(path)
+                _browser = await uc.start(config=cfg)
+                logger.info("Loaded %d unpacked extension(s)", len(unpacked))
+            else:
+                _browser = await uc.start(**kwargs)
 
             logger.info(
                 "Browser started (headless=%s, profile=%s)",
@@ -782,6 +847,12 @@ async def _apply_emulation(
             enabled=touch,
             configuration="mobile" if mobile else "desktop",
         ))
+        key = _target_key(tab)
+        if key:
+            if touch:
+                _touch_emulated_targets.add(key)
+            else:
+                _touch_emulated_targets.discard(key)
         results.append(f"viewport={viewport}")
         results.append(f"touch={'on' if touch else 'off'}")
 
@@ -845,6 +916,7 @@ async def _reset_emulation(tab: uc.Tab) -> list[str]:
 
     await tab.send(cdp_emu.set_touch_emulation_enabled(enabled=False))
     await tab.send(cdp_emu.set_emit_touch_events_for_mouse(enabled=False))
+    _touch_emulated_targets.discard(_target_key(tab))
     results.append("touch=reset")
 
     return results
@@ -973,9 +1045,54 @@ async def cf_verify() -> str:
         return f"Error: {e}"
 
 
+async def _cdp_click(tab: uc.Tab, uid: str, dbl_click: bool) -> None:
+    """Click through the CDP Input domain — the page sees isTrusted=true."""
+    cx, cy = await _get_box_model(tab, uid)
+    if dbl_click:
+        await _double_click(tab, cx, cy)
+    else:
+        await tab.mouse_click(cx, cy)
+    await tab
+
+
+async def _scripted_click(tab: uc.Tab, uid: str, dbl_click: bool) -> None:
+    """Click by dispatching an event sequence on the element itself.
+
+    Fallback only. It triggers the same handlers (React included) and cannot
+    take the renderer down, but the events carry ``isTrusted=false``, which is
+    exactly what bot detection looks at — hence never the default.
+    """
+    remote_obj = await _resolve_uid(tab, uid)
+    dbl_extra = (
+        "this.dispatchEvent(new MouseEvent('dblclick', opts));" if dbl_click else ""
+    )
+    declaration = (
+        "function() {"
+        " this.scrollIntoView({block: 'center', inline: 'center'});"
+        " const opts = {bubbles: true, cancelable: true, composed: true, view: window};"
+        " this.dispatchEvent(new PointerEvent('pointerdown', opts));"
+        " this.dispatchEvent(new MouseEvent('mousedown', opts));"
+        " this.dispatchEvent(new PointerEvent('pointerup', opts));"
+        " this.dispatchEvent(new MouseEvent('mouseup', opts));"
+        " this.click();"
+        f" {dbl_extra}"
+        " return true; }"
+    )
+    await _call_function_on(
+        tab,
+        function_declaration=declaration,
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+        user_gesture=True,
+    )
+
+
 @mcp.tool()
 async def click(uid: str, dbl_click: bool = False, include_snapshot: bool = False) -> str:
     """Click on the provided element.
+
+    Uses real CDP input events, so the page sees a trusted click. Falls back to
+    a scripted click (reported in the response) when those cannot be delivered.
 
     Args:
         uid: The uid of an element on the page from the page content snapshot.
@@ -983,23 +1100,77 @@ async def click(uid: str, dbl_click: bool = False, include_snapshot: bool = Fals
         include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
-    try:
-        cx, cy = await _get_box_model(tab, uid)
-        if dbl_click:
-            await _double_click(tab, cx, cy)
-        else:
-            await tab.mouse_click(cx, cy)
-        await tab
-        result = f"Clicked uid={uid}"
-        result += await _maybe_snapshot(include_snapshot)
-        return result
-    except Exception as e:
-        return f"Error clicking uid={uid}: {e}"
+    if uid not in _uid_to_backend_node_id:
+        return f"Error clicking uid={uid}: unknown uid. Take a new snapshot first."
+
+    # CDP input is the default: those events arrive as isTrusted, which is the
+    # whole point of an undetected driver. Two cases need the scripted
+    # fallback instead — a touch-emulated target, where Input.dispatchMouseEvent
+    # can take the renderer down, and a page that leaves the CDP call hanging
+    # or erroring. Every step is bounded so a wedged page cannot hang the call.
+    fallback_reason = ""
+    if _target_key(tab) in _touch_emulated_targets:
+        fallback_reason = "touch-emulated target"
+    else:
+        try:
+            await asyncio.wait_for(_cdp_click(tab, uid, dbl_click), timeout=_CLICK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
+        except Exception as e:
+            fallback_reason = f"CDP input failed: {e}"
+
+    if fallback_reason:
+        try:
+            await asyncio.wait_for(
+                _scripted_click(tab, uid, dbl_click), timeout=_CLICK_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            return (
+                f"Error clicking uid={uid}: {fallback_reason}, and the scripted click "
+                f"timed out too after {_CLICK_TIMEOUT_S:g}s (page busy or connection wedged)"
+            )
+        except Exception as e:
+            return f"Error clicking uid={uid}: {fallback_reason}; scripted click also failed: {e}"
+
+    result = f"Clicked uid={uid}"
+    if fallback_reason:
+        result += f" (scripted click, page sees isTrusted=false — {fallback_reason})"
+    result += await _maybe_snapshot(include_snapshot)
+    return result
+
+
+async def _scripted_click_at(tab: uc.Tab, x: int, y: int, dbl_click: bool) -> None:
+    """Scripted click on whatever sits at (x, y). Same caveats as _scripted_click."""
+    import nodriver.cdp.runtime as cdp_runtime
+
+    dbl_extra = "el.dispatchEvent(new MouseEvent('dblclick', opts));" if dbl_click else ""
+    expression = (
+        "(function() {"
+        f" const el = document.elementFromPoint({int(x)}, {int(y)});"
+        " if (!el) return 'no element at point';"
+        f" const opts = {{bubbles: true, cancelable: true, composed: true, view: window,"
+        f" clientX: {int(x)}, clientY: {int(y)}}};"
+        " el.dispatchEvent(new PointerEvent('pointerdown', opts));"
+        " el.dispatchEvent(new MouseEvent('mousedown', opts));"
+        " el.dispatchEvent(new PointerEvent('pointerup', opts));"
+        " el.dispatchEvent(new MouseEvent('mouseup', opts));"
+        " el.click();"
+        f" {dbl_extra}"
+        " return ''; })()"
+    )
+    result = await tab.send(cdp_runtime.evaluate(expression=expression, return_by_value=True))
+    remote, exc = result if isinstance(result, tuple) else (result, None)
+    if exc is not None:
+        raise RuntimeError(_format_exception_details(exc))
+    if remote is not None and getattr(remote, "value", ""):
+        raise RuntimeError(str(remote.value))
 
 
 @mcp.tool()
 async def click_at(x: int, y: int, dbl_click: bool = False, include_snapshot: bool = False) -> str:
     """Click at specific coordinates on the page.
+
+    Uses real CDP input events, with the same scripted fallback as `click`.
 
     Args:
         x: The x coordinate.
@@ -1008,11 +1179,43 @@ async def click_at(x: int, y: int, dbl_click: bool = False, include_snapshot: bo
         include_snapshot: Whether to include a snapshot in the response. Default is false.
     """
     tab = await _active_tab()
-    if dbl_click:
-        await _double_click(tab, x, y)
+
+    async def _cdp() -> None:
+        if dbl_click:
+            await _double_click(tab, x, y)
+        else:
+            await tab.mouse_click(x, y)
+
+    fallback_reason = ""
+    if _target_key(tab) in _touch_emulated_targets:
+        fallback_reason = "touch-emulated target"
     else:
-        await tab.mouse_click(x, y)
+        try:
+            await asyncio.wait_for(_cdp(), timeout=_CLICK_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
+        except Exception as e:
+            fallback_reason = f"CDP input failed: {e}"
+
+    if fallback_reason:
+        try:
+            await asyncio.wait_for(
+                _scripted_click_at(tab, x, y, dbl_click), timeout=_CLICK_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            return (
+                f"Error clicking at ({x}, {y}): {fallback_reason}, and the scripted click "
+                f"timed out too after {_CLICK_TIMEOUT_S:g}s (page busy or connection wedged)"
+            )
+        except Exception as e:
+            return (
+                f"Error clicking at ({x}, {y}): {fallback_reason}; "
+                f"scripted click also failed: {e}"
+            )
+
     result = f"Clicked at ({x}, {y})"
+    if fallback_reason:
+        result += f" (scripted click, page sees isTrusted=false — {fallback_reason})"
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -1619,14 +1822,33 @@ async def new_page(
     previous_tab = await _active_tab()
     initial_url = "about:blank" if device and url != "about:blank" else url
 
+    # Chrome always comes up with one tab. Opening a second one on top of that
+    # empty startup tab leaves a stray blank page behind for the rest of the
+    # session, so reuse it instead. Only when it is the sole tab and genuinely
+    # empty — never silently navigate away from a page that has content.
+    # An isolated context needs its own target, so it is excluded.
+    reuse_tab = None
+    if not isolated_context and len(browser.tabs) == 1:
+        only_tab = browser.tabs[0]
+        if only_tab.target and _is_blank_url(only_tab.target.url):
+            reuse_tab = only_tab
+
     try:
-        tab = await _open_new_tab(
-            browser,
-            url=initial_url,
-            background=background,
-            isolated_context=isolated_context,
-            timeout=timeout,
-        )
+        if reuse_tab is not None:
+            tab = reuse_tab
+            if not _is_blank_url(initial_url):
+                await _await_with_timeout(
+                    tab.get(initial_url), timeout, f"Navigate to {initial_url}"
+                )
+                await _await_with_timeout(tab, timeout, "Wait for page")
+        else:
+            tab = await _open_new_tab(
+                browser,
+                url=initial_url,
+                background=background,
+                isolated_context=isolated_context,
+                timeout=timeout,
+            )
 
         # Auto-enable network collection on new tab.
         await _auto_enable_network_collection(tab)
@@ -1647,7 +1869,8 @@ async def new_page(
 
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
-        return f"Opened new page: {tab.target.url or 'about:blank'}{suffix}{pages}"
+        verb = "Reused the empty startup tab for" if reuse_tab is not None else "Opened new page:"
+        return f"{verb} {tab.target.url or 'about:blank'}{suffix}{pages}"
     except Exception as e:
         return f"Error opening new page: {e}"
 
@@ -2688,6 +2911,220 @@ async def set_browser_flags(
     else:
         msg += "\nUse close_browser (or restart) for the change to take effect."
     return msg
+
+
+# ---------------------------------------------------------------------------
+# Chrome extensions
+# ---------------------------------------------------------------------------
+
+def _active_profile_dir() -> str | None:
+    """The user-data-dir currently in use, or None for an ephemeral profile."""
+    return _selected_profile_dir or os.environ.get("NODRIVER_USER_DATA_DIR") or None
+
+
+def _is_branded_chrome() -> bool:
+    """Whether the browser is an official Google Chrome build.
+
+    Verified on Chrome 151: branded builds ignore --load-extension outright —
+    the switch is on the command line, --enable-unsafe-extension-debugging is
+    set and DisableLoadExtensionCommandLineSwitch is off, yet the extension is
+    never registered. Chromium and Chrome for Testing still honour it.
+    """
+    path = os.environ.get("NODRIVER_BROWSER_PATH") or ""
+    if not path:
+        try:
+            from nodriver.core.config import find_chrome_executable
+
+            path = str(find_chrome_executable() or "")
+        except Exception:
+            return False
+    low = path.replace("\\", "/").lower()
+    if "for testing" in low or "for-testing" in low or "chromium" in low:
+        return False
+    return "google/chrome" in low or low.endswith("/google chrome")
+
+
+_UNPACKED_UNSUPPORTED = (
+    "Note: this is an official Google Chrome build, which ignores "
+    "--load-extension since v137 — the extension will NOT actually load. "
+    "Working alternatives: install the extension from the Chrome Web Store "
+    "into a persistent profile (survives restarts, then just use "
+    'manage_extensions("on")), or point NODRIVER_BROWSER_PATH at Chromium / '
+    "Chrome for Testing, which still support unpacked extensions."
+)
+
+
+def _extension_display_name(version_dir: str, manifest: dict) -> str:
+    """Resolve a manifest name, following __MSG_key__ into _locales/."""
+    name = manifest.get("name", "")
+    if not name.startswith("__MSG_"):
+        return name or "(unnamed)"
+    key = name[len("__MSG_"):].rstrip("_")
+    locales = [manifest.get("default_locale", ""), "en", "en_US"]
+    for loc in [x for x in locales if x]:
+        messages = os.path.join(version_dir, "_locales", loc, "messages.json")
+        if not os.path.isfile(messages):
+            continue
+        try:
+            with open(messages, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        entry = data.get(key) or next(
+            (v for k, v in data.items() if k.lower() == key.lower()), None
+        )
+        if isinstance(entry, dict) and entry.get("message"):
+            return entry["message"]
+    return name
+
+
+def _scan_profile_extensions(profile_dir: str) -> list[dict]:
+    """Extensions installed in a profile, newest version of each."""
+    found: list[dict] = []
+    root = os.path.join(profile_dir, "Default", "Extensions")
+    if not os.path.isdir(root):
+        return found
+    for ext_id in sorted(os.listdir(root)):
+        id_dir = os.path.join(root, ext_id)
+        if not os.path.isdir(id_dir):
+            continue
+        versions = sorted(d for d in os.listdir(id_dir) if os.path.isdir(os.path.join(id_dir, d)))
+        if not versions:
+            continue
+        version_dir = os.path.join(id_dir, versions[-1])
+        manifest_path = os.path.join(version_dir, "manifest.json")
+        try:
+            with open(manifest_path, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except Exception:
+            continue
+        found.append({
+            "id": ext_id,
+            "name": _extension_display_name(version_dir, manifest),
+            "version": manifest.get("version", versions[-1]),
+        })
+    return found
+
+
+@mcp.tool()
+async def manage_extensions(action: str = "list", path: str = "") -> str:
+    """List, enable/disable, or load Chrome extensions.
+
+    Two things are at play:
+      * the master switch — Chrome runs with --disable-extensions by default, so
+        extensions installed in the profile stay dark until it is turned on;
+      * unpacked extensions loaded from a folder on disk.
+
+    The master switch covers both: with it off, unpacked extensions stay
+    registered but are not loaded either. Every action restarts the browser,
+    since these are launch-time settings.
+
+    Args:
+        action: One of
+            "list"    — installed extensions in the active profile + current state (default),
+            "on"      — enable extensions (profile-installed and unpacked), restart,
+            "off"     — disable all extensions, restart,
+            "load"    — load an unpacked extension from `path` (implies "on"), restart,
+            "unload"  — stop loading `path`, or all unpacked extensions if empty, restart.
+        path: Folder holding the extension's manifest.json (for "load" / "unload").
+
+    "load" only works on Chromium / Chrome for Testing. Official Chrome builds
+    have ignored --load-extension since v137; the tool says so when it applies.
+    On official Chrome, install the extension once from the Web Store into a
+    persistent profile and switch it on with "on" — that does work.
+    """
+    global _enable_extensions, _loaded_extensions
+    act = (action or "list").strip().lower()
+    profile_dir = _active_profile_dir()
+
+    if act == "list":
+        master_on = _feature_enabled(_enable_extensions, "NODRIVER_ENABLE_EXTENSIONS")
+        lines = [
+            f"Master switch: extensions are {'ENABLED' if master_on else 'DISABLED'} "
+            f"(--disable-extensions {'not set' if master_on else 'active'})",
+        ]
+        if profile_dir:
+            installed = _scan_profile_extensions(profile_dir)
+            lines.append(f"\nInstalled in profile ({len(installed)}) — {profile_dir}:")
+            if installed:
+                lines.extend(f"  {e['name']} v{e['version']}  [{e['id']}]" for e in installed)
+            else:
+                lines.append(
+                    "  (none — install one from the Chrome Web Store in this browser; it then persists)"
+                )
+        else:
+            lines.append(
+                "\nActive profile is ephemeral, so nothing can stay installed. "
+                "Switch to a persistent profile first (use_profile)."
+            )
+        lines.append(f"\nUnpacked extensions registered from disk ({len(_loaded_extensions)}):")
+        if _loaded_extensions:
+            if not master_on:
+                marker = '  <- not loaded, master switch is off (use "on")'
+            elif _is_branded_chrome():
+                marker = "  <- ignored by this Chrome build"
+            else:
+                marker = ""
+            lines.extend(f"  {p}{marker}" for p in _loaded_extensions)
+        else:
+            lines.append("  (none)")
+        return "\n".join(lines)
+
+    if act in ("on", "off"):
+        _enable_extensions = act == "on"
+        was = await _stop_browser()
+        extra = ""
+        if _loaded_extensions:
+            extra = (
+                f" The {len(_loaded_extensions)} registered unpacked extension(s) "
+                + ("load again." if _enable_extensions else "stay registered but are not loaded.")
+            )
+        return (
+            f"Extensions {'enabled' if _enable_extensions else 'disabled'}. Browser "
+            + ("stopped; relaunches with the change on the next action."
+               if was else "will start with this setting on the next action.")
+            + extra
+        )
+
+    if act == "load":
+        target = (path or "").strip().strip('"')
+        if not target:
+            return 'Error: "load" needs path= pointing at the extension folder.'
+        if not os.path.isdir(target):
+            return f"Error: not a directory: {target}"
+        if not os.path.isfile(os.path.join(target, "manifest.json")):
+            return f"Error: no manifest.json in {target} — point at the folder that contains it."
+        if target in _loaded_extensions:
+            return f"Already loaded: {target}"
+        _loaded_extensions.append(target)
+        _enable_extensions = True
+        was = await _stop_browser()
+        msg = (
+            f"Will load unpacked extension: {target}\n"
+            f"Loaded unpacked ({len(_loaded_extensions)} total), extensions enabled. Browser "
+            + ("stopped; relaunches with it on the next action."
+               if was else "will start with it on the next action.")
+        )
+        if _is_branded_chrome():
+            msg += f"\n\n{_UNPACKED_UNSUPPORTED}"
+        return msg
+
+    if act == "unload":
+        target = (path or "").strip().strip('"')
+        if target and target not in _loaded_extensions:
+            return f"Not currently loaded: {target}"
+        removed = [target] if target else list(_loaded_extensions)
+        if not removed:
+            return "No unpacked extensions are loaded."
+        _loaded_extensions = [p for p in _loaded_extensions if p not in removed]
+        was = await _stop_browser()
+        return (
+            f"Unloaded {len(removed)} unpacked extension(s). Browser "
+            + ("stopped; relaunches without them on the next action."
+               if was else "will start without them on the next action.")
+        )
+
+    return f'Error: unknown action "{action}". Use list / on / off / load / unload.'
 
 
 # ---------------------------------------------------------------------------

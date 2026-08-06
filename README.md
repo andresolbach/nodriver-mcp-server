@@ -105,6 +105,20 @@ nodriver-mcp install --scope project
 
 By default the browser starts clean for automation: the **Google Translate popup is suppressed** and **externally-installed Chrome extensions are blocked** (so you don't get "an extension requires your attention" prompts). Re-enable either via the env vars above **or at runtime with the `set_browser_flags` tool** — which can also set **any other Chrome launch flags** (e.g. `--lang=de-DE`, `--window-size=1280,800`) via its `extra_args` parameter. The browser also **auto-recovers** if Chrome is closed or crashes between calls — tools relaunch it instead of failing.
 
+Chrome also starts on `about:blank` rather than the New Tab page, so the NTP's own Google requests never show up in `list_network_requests`, and `new_page` **reuses that empty startup tab** instead of leaving a stray blank page behind.
+
+## Extensions
+
+`manage_extensions` handles extensions at runtime:
+
+- `manage_extensions("list")` — extensions installed in the active profile (name, version, id) plus the current state
+- `manage_extensions("on")` / `("off")` — the master switch (`--disable-extensions`); restarts Chrome. It covers unpacked extensions too, so `"off"` really means off
+- `manage_extensions("load", path)` / `("unload", path)` — unpacked extensions from a folder
+
+To use an extension permanently, switch to a persistent profile, install it once from the Chrome Web Store in that browser, and turn extensions on — it then loads on every launch.
+
+> **Unpacked extensions need Chromium or Chrome for Testing.** Official Chrome builds dropped `--load-extension` in v137, and as of Chrome 151 neither `--enable-unsafe-extension-debugging` nor disabling `DisableLoadExtensionCommandLineSwitch` brings it back — the flag is accepted and the extension is silently never registered. `manage_extensions` detects a branded build and says so instead of pretending it worked. Point `NODRIVER_BROWSER_PATH` at Chromium / Chrome for Testing if you need unpacked loading.
+
 ## Profiles & running multiple instances at once
 
 By default every server instance launches Chrome with a **fresh temporary profile** that nodriver creates and deletes automatically. That means you can run nodriver from **Claude Desktop, Claude Code and the VS Code extension at the same time** — each gets its own isolated Chrome, and they never fight over a shared profile. No configuration, no detection logic, nothing to clean up.
@@ -119,11 +133,13 @@ When you want to **reuse a login across sessions**, create a named persistent pr
 
 Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
 
-## Tools (56)
+## Tools (57)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
 For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_page(...)` so the first real request already carries mobile signals.
+
+`click` and `click_at` send **real CDP input events**, so the page sees `isTrusted=true`. A scripted click (`element.click()` plus synthetic events, `isTrusted=false`) is used only where real input cannot be delivered — on a touch-emulated target, or after the CDP click times out — and the response says when that happened, so a detectable click is never silent.
 
 | Category | Tools |
 |----------|-------|
@@ -135,7 +151,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | **Performance (3)** | `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot` |
 | **Cookies & storage (5)** | `get_cookies` · `set_cookie` · `clear_cookies` · `get_local_storage` · `set_local_storage` |
 | **Session management (3)** | `save_session` · `load_session` · `list_sessions` |
-| **Profiles & browser (6)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `delete_profile` · `set_browser_flags` |
+| **Profiles & browser (7)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `delete_profile` · `set_browser_flags` · `manage_extensions` |
 | **Anti-detection helpers (2)** | `cf_verify` · `bypass_insecure_warning` |
 
 ## Comparison with chrome-devtools-mcp

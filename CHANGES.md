@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.6.0 — no more stray blank tab, extension management, merged feature flags
+
+- **`new_page` reuses the empty startup tab.** Chrome always comes up with one
+  tab, so the first `new_page` used to leave a blank page sitting next to the
+  real one for the rest of the session. It is now reused when it is the only
+  tab and genuinely empty — a blank tab among others is still left alone, and
+  isolated contexts still get their own target.
+- **Chrome starts on `about:blank` instead of the New Tab page.** The NTP issues
+  its own Google requests, which showed up in `list_network_requests` and cost
+  a page load nobody asked for.
+- **`manage_extensions`** — list extensions installed in the active profile
+  (name, version, id), flip the master switch on/off, and load/unload unpacked
+  extensions from disk. Loading unpacked ones works on Chromium and Chrome for
+  Testing; on official Chrome builds (which have ignored `--load-extension`
+  since v137 — verified still ignored on Chrome 151, even with
+  `--enable-unsafe-extension-debugging`) the tool says so instead of silently
+  doing nothing.
+- **Fixed: duplicate `--disable-features` silently dropped entries.** Chrome
+  honours only the last occurrence of the switch, and nodriver passes one of
+  its own, so the server's `Translate` entry was overriding nodriver's
+  `IsolateOrigins,site-per-process` (and would have broken extension loading).
+  Both are now merged into a single switch.
+- **`click` / `click_at`: trusted CDP input again, scripted click only as a
+  fallback.** An earlier local fix had switched `click` to `element.click()`
+  plus synthetic events to dodge a renderer crash. That works, but those events
+  reach the page with `isTrusted=false` — precisely what bot detection reads,
+  in a server whose entire purpose is not being detectable. Real CDP input
+  events are the default again; the scripted path is used only where the CDP
+  one genuinely cannot be delivered: on a **touch-emulated target** (where
+  `Input.dispatchMouseEvent` can take the renderer down — now tracked per
+  target by `emulate`/`emulate_reset`) or after the CDP click times out or
+  errors. When the fallback runs, the response says so, so a degraded click is
+  never silent. Both tools are bounded at 10s per step, so a wedged page can no
+  longer hang the call, and `click_at` no longer behaves differently to `click`.
+- **Fixed: `manage_extensions("off")` did not turn unpacked extensions off.**
+  The master switch only gated profile-installed extensions, so anything loaded
+  via `"load"` kept loading after an explicit `"off"`. It now gates both; the
+  paths stay registered, and `"on"` brings them back.
+
+Tool count: 56 → 57.
+
 ## 1.5.1 — selector query/scroll, resource blocking, arbitrary Chrome flags
 
 - **`set_browser_flags` now sets arbitrary Chrome launch flags** via `extra_args`
