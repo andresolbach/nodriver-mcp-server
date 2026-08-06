@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.2 — fix the broken logo and links on PyPI
+
+The README doubles as the PyPI project description, where it is rendered
+standalone — so every relative reference in it pointed at `pypi.org` and broke.
+
+- **Fixed: the logo did not load on PyPI.** It used a relative `assets/logo.svg`.
+  PyPI proxies images through camo, which fetches the URL server-side and cannot
+  resolve a relative path. Now an absolute `raw.githubusercontent.com` URL, and
+  a PNG rather than an SVG — a 512px raster survives any image proxy, and at the
+  130px display size it is sharper than needed either way.
+- **Fixed: four relative links** (`requirements.txt`, `docs/TOOLS.md`,
+  `CHANGES.md`, `LICENSE`) were 404s on the package page. Now absolute.
+- Tests reject relative image sources and relative links in the README, plus
+  repo-hosted SVGs, so this cannot come back.
+
+No changes to the server itself; 1.7.0-1.7.2 behave identically.
+
+Tool count: 57 → 57.
+
 ## 1.7.1 — MCP registry listing
 
 - Added the `mcp-name:` ownership marker the MCP Registry looks for in the

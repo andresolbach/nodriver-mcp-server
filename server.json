@@ -7,14 +7,14 @@
     "url": "https://github.com/andresolbach/nodriver-mcp-server",
     "source": "github"
   },
-  "version": "1.7.1",
+  "version": "1.7.2",
   "websiteUrl": "https://pypi.org/project/nodriver-mcp/",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "nodriver-mcp",
-      "version": "1.7.1",
+      "version": "1.7.2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

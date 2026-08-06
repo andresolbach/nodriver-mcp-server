@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="nodriver-mcp-server — undetected browser automation MCP server" width="130" height="130">
+  <img src="https://raw.githubusercontent.com/andresolbach/nodriver-mcp-server/main/assets/logo.png" alt="nodriver-mcp-server — undetected browser automation MCP server" width="130" height="130">
 </p>
 
 # nodriver-mcp-server
@@ -81,7 +81,7 @@ Every tool in this server was tested **end-to-end against Google Chrome 150** wi
 | `pillow` | >= 12.1.1 | 12.1.1 |
 | `tomli-w` | >= 1.0.0 | 1.2.0 |
 
-The pip packages/versions are also listed in [`requirements.txt`](requirements.txt) (`pip install -r requirements.txt`), though `uv tool install` is recommended for a fully pinned, reproducible install.
+The pip packages/versions are also listed in [`requirements.txt`](https://github.com/andresolbach/nodriver-mcp-server/blob/main/requirements.txt) (`pip install -r requirements.txt`), though `uv tool install` is recommended for a fully pinned, reproducible install.
 
 ## One-command MCP client setup
 
@@ -186,7 +186,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | **Profiles & browser (7)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `delete_profile` · `set_browser_flags` · `manage_extensions` |
 | **Anti-detection helpers (2)** | `cf_verify` · `bypass_insecure_warning` |
 
-📖 **[Full tool reference →](docs/TOOLS.md)** — every tool with its exact parameters, types, defaults and enum values, generated straight from the live schemas.
+📖 **[Full tool reference →](https://github.com/andresolbach/nodriver-mcp-server/blob/main/docs/TOOLS.md)** — every tool with its exact parameters, types, defaults and enum values, generated straight from the live schemas.
 
 ## Built for the agent that calls it
 
@@ -251,7 +251,7 @@ Yes, all three. Tested on Windows 11 with Chrome 150 and Python 3.12.
 
 ## Changelog
 
-See [CHANGES.md](CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 150 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
+See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 150 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
 
 ## Credits
 
@@ -259,4 +259,4 @@ Based on [`nodriver-mcp`](https://github.com/Saber-CC/nodriver-mcp) by **Saber-C
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/andresolbach/nodriver-mcp-server/blob/main/LICENSE)

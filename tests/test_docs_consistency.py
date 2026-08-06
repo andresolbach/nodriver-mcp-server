@@ -64,6 +64,34 @@ def test_changelog_records_the_tool_count(tool_names):
     assert int(counts[0]) == len(tool_names)
 
 
+def test_readme_has_no_relative_image_sources():
+    """PyPI renders the README standalone and proxies images through camo.
+
+    A relative src resolves against pypi.org, so camo cannot fetch it and the
+    image silently breaks on the package page — which is exactly what happened
+    to the logo.
+    """
+    relative = re.findall(r'<img[^>]*src="(?!https?:)([^"]+)"', README)
+    assert relative == [], f"relative image sources break on PyPI: {relative}"
+
+
+def test_readme_has_no_relative_links():
+    """Same reason: a relative link is a 404 once the README is off GitHub."""
+    relative = re.findall(r"\[[^\]]*\]\((?!https?:|#)([^)]+)\)", README)
+    assert relative == [], f"relative links break on PyPI: {relative}"
+
+
+def test_readme_images_are_raster_or_shields():
+    """Images must come from a host that serves a real image content-type.
+
+    raw.githubusercontent.com is fine for PNG; shields.io SVGs are proxied
+    happily. A repo-hosted SVG is the risky case, so keep those out.
+    """
+    srcs = re.findall(r'<img[^>]*src="([^"]+)"', README)
+    bad = [s for s in srcs if s.endswith(".svg") and "shields.io" not in s]
+    assert bad == [], f"repo-hosted SVGs may not survive PyPI's image proxy: {bad}"
+
+
 def test_server_json_matches_pyproject():
     import json
 
