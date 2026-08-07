@@ -226,7 +226,7 @@ Network collection is enabled automatically on each tab. Console collection is o
 
 For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_page(...)` so the first real request already carries mobile signals.
 
-`click` and `click_at` send **real CDP input events**, so the page sees `isTrusted=true`. A scripted click (`element.click()` plus synthetic events, `isTrusted=false`) is used only where real input cannot be delivered — on a touch-emulated target, or after the CDP click times out — and the response says when that happened, so a detectable click is never silent.
+`click` sends **real CDP input events**, so the page sees `isTrusted=true`. Because those are delivered by coordinate, it scrolls the element into view and then hit-tests several points inside it, since a sticky header or cookie banner can own the centre pixel — on `docs.pypi.org` that affects 43 of 54 visible links. If no point reaches the element, `if_covered` decides: `"report"` (default) refuses and names the blocker, leaving the page untouched and the session undetectable; `"synthetic_click"` clicks the element directly, which works through anything but makes the page see `isTrusted=false`. Either way the response says which path was taken, so a detectable click is never silent.
 
 | Category | Tools |
 |----------|-------|

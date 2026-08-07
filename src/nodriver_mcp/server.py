@@ -1369,13 +1369,59 @@ async def cf_verify() -> str:
         return f"Error: {e}"
 
 
-async def _cdp_click(tab: uc.Tab, uid: str, dbl_click: bool) -> None:
+async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] | str:
+    """A viewport point that really lands on this element, or what is covering it.
+
+    A trusted click is delivered by coordinate, so the box centre is not good
+    enough. A sticky header, a cookie banner, or the element's own layout can
+    put something else on that exact pixel, and the click then goes to whatever
+    is there — while still looking like it worked. So ask the page which element
+    is actually hit, and try a few points before giving up.
+
+    Returns (x, y) on success, or a string describing the blocker.
+    """
+    obj = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() {"
+            " const r = this.getBoundingClientRect();"
+            " if (!r.width || !r.height) return JSON.stringify({"
+            "   covered: 'the element has zero size, so it is not rendered'});"
+            " const fs = [0.5, 0.25, 0.75, 0.12, 0.88];"
+            " let blocker = null;"
+            " for (const fy of fs) for (const fx of fs) {"
+            "   const x = r.left + r.width * fx, y = r.top + r.height * fy;"
+            "   if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;"
+            "   const el = document.elementFromPoint(x, y);"
+            "   if (el && (el === this || this.contains(el))) return JSON.stringify({x, y});"
+            "   if (el && !blocker) blocker = el;"
+            " }"
+            " if (!blocker) return JSON.stringify({"
+            "   covered: 'the element is outside the viewport after scrolling'});"
+            " const cls = (typeof blocker.className === 'string' && blocker.className)"
+            "   ? '.' + blocker.className.trim().split(/\\s+/).slice(0, 2).join('.') : '';"
+            " return JSON.stringify({covered: '<' + blocker.tagName.toLowerCase()"
+            "   + (blocker.id ? '#' + blocker.id : '') + cls + '>'});"
+            " }"
+        ),
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    try:
+        data = json.loads(obj.value) if obj and obj.value else {}
+    except (TypeError, ValueError):
+        return "the page did not report a hit point"
+    if "x" in data:
+        return float(data["x"]), float(data["y"])
+    return str(data.get("covered", "something else"))
+
+
+async def _cdp_click(tab: uc.Tab, remote_obj: Any, x: float, y: float, dbl_click: bool) -> None:
     """Click through the CDP Input domain — the page sees isTrusted=true."""
-    cx, cy = await _get_box_model(tab, uid)
     if dbl_click:
-        await _double_click(tab, cx, cy)
+        await _double_click(tab, x, y)
     else:
-        await tab.mouse_click(cx, cy)
+        await tab.mouse_click(x, y)
     await tab
 
 
@@ -1417,27 +1463,53 @@ async def click(
     dbl_click: Annotated[
         bool, Field(description="Send a double-click instead of a single click.")
     ] = False,
+    if_covered: Annotated[
+        Literal["report", "synthetic_click"],
+        Field(description=(
+            "What to do when something else sits on top of the element, so a real "
+            "mouse click at its position would hit that instead. "
+            '"report" (the default) does not click at all: it returns an error '
+            "naming what is in the way, leaving the page untouched and the session "
+            "indistinguishable from a person's. Dismiss the cookie banner, close "
+            "the modal or scroll, then click again. "
+            '"synthetic_click" dispatches the click on the element directly, which '
+            "works through anything — but the page sees `isTrusted=false`, which is "
+            "precisely the signal anti-bot systems look for. Choose it when the "
+            "overlay cannot be dismissed, or when stealth does not matter on this "
+            "site; not as a default."
+        )),
+    ] = "report",
     include_snapshot: IncludeSnapshot = False,
 ) -> str:
     """Click an element addressed by its snapshot uid.
 
     This is the click you want in almost all cases — prefer it over click_at,
     because a uid survives layout shifts and raw coordinates do not. The element
-    is scrolled into view automatically, so it need not be visible beforehand.
+    is scrolled into view first, so it need not be visible beforehand.
 
     Sends real CDP input events, so the page sees `isTrusted=true`, which is the
-    entire point of an undetected driver. Two situations force a scripted
-    fallback (`element.click()` plus synthetic events, `isTrusted=false`): a
-    touch-emulated target, where CDP mouse input can crash the renderer, and a
-    CDP click that times out or errors. The response says so explicitly whenever
-    that happens, so a detectable click is never silent. Every step is bounded
-    at 10s, so a wedged page cannot hang the call.
+    entire point of an undetected driver. Because those are delivered by
+    coordinate, the click is aimed at a point that actually hits the element:
+    several points inside it are hit-tested first, since a sticky header or a
+    banner can cover the centre. If none of them reach it, `if_covered` decides
+    what happens, and the response always says which path was taken.
+
+    Two other situations force the scripted fallback regardless: a touch-emulated
+    target, where CDP mouse input can crash the renderer, and a CDP click that
+    times out or errors. Every step is bounded at 10s, so a wedged page cannot
+    hang the call.
 
     On "unknown uid", take a fresh take_snapshot and retry with the new uid.
     """
+    import nodriver.cdp.dom as cdp_dom
+
     tab = await _active_tab()
     if uid not in _uid_to_backend_node_id:
         return f"Error clicking uid={uid}: unknown uid. Take a new snapshot first."
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+    except ValueError as e:
+        return f"Error clicking uid={uid}: {e}"
 
     # CDP input is the default: those events arrive as isTrusted, which is the
     # whole point of an undetected driver. Two cases need the scripted
@@ -1448,12 +1520,35 @@ async def click(
     if _target_key(tab) in _touch_emulated_targets:
         fallback_reason = "touch-emulated target"
     else:
+        # Scroll first: a coordinate click on an element that is off-screen
+        # lands wherever those coordinates happen to fall.
         try:
-            await asyncio.wait_for(_cdp_click(tab, uid, dbl_click), timeout=_CLICK_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
-        except Exception as e:
-            fallback_reason = f"CDP input failed: {e}"
+            await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
+            await tab
+        except Exception:
+            pass
+
+        point = await _clickable_point(tab, remote_obj)
+        if isinstance(point, str):
+            if if_covered == "report":
+                return (
+                    f"Error clicking uid={uid}: it is covered by {point}, so a real "
+                    "mouse click would go there instead. Nothing was clicked. Dismiss "
+                    "or scroll past whatever is in the way and try again, or pass "
+                    'if_covered="synthetic_click" to click it anyway — that works '
+                    "through the overlay but the page sees isTrusted=false."
+                )
+            fallback_reason = f"covered by {point}"
+        else:
+            try:
+                await asyncio.wait_for(
+                    _cdp_click(tab, remote_obj, point[0], point[1], dbl_click),
+                    timeout=_CLICK_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
+            except Exception as e:
+                fallback_reason = f"CDP input failed: {e}"
 
     if fallback_reason:
         try:

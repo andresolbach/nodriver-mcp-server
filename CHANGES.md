@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.9.0 — click stops claiming success when it hit something else
+
+Found by a user testing whether the thing actually works, on a plain
+documentation page. `click` reported `Clicked uid=1_333`; the page never
+navigated. Same failure family as the two fixed in 1.8.0, in the one tool that
+was still not checking anything.
+
+**Two defects, one symptom.**
+
+- **The CDP path never scrolled.** `scrollIntoView` only ever ran in the
+  scripted fallback, so the tool's own description ("scrolled into view
+  automatically") was true only when the fast path had already failed. An
+  element below the fold was clicked at whatever those coordinates happened to
+  land on. It now scrolls with `DOM.scrollIntoViewIfNeeded` first.
+- **Nothing checked that the click would reach the element.** A trusted click is
+  delivered by coordinate, and a sticky header, a cookie banner or the element's
+  own layout can own that pixel. Measured on `docs.pypi.org`: **43 of 54 visible
+  links** had a centre point that hit something other than the link.
+
+`click` now hit-tests several points inside the element and aims at one that
+actually reaches it, which resolves the ordinary sticky-header case outright.
+
+**When nothing reaches it, the caller decides** — via the new `if_covered`:
+
+- `"report"` (default) does not click at all. It returns an error naming what is
+  in the way and leaves the page untouched, so the session stays
+  indistinguishable from a person's. Dismiss the banner, close the modal or
+  scroll, then click again.
+- `"synthetic_click"` dispatches the click on the element directly. It works
+  through anything, but the page sees `isTrusted=false` — exactly the signal
+  anti-bot systems read. The response says so whenever it is used.
+
+The default deliberately refuses rather than quietly trading away the one
+property this server exists to provide.
+
+Tool count: 59 → 59.
+
 ## 1.8.0 — attach to your own browser, a snapshot two thirds smaller, two silent failures fixed
 
 ### Two tools reported success while doing nothing

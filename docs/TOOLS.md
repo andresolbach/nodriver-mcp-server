@@ -27,15 +27,19 @@ Click an element addressed by its snapshot uid.
 
 This is the click you want in almost all cases — prefer it over click_at,
 because a uid survives layout shifts and raw coordinates do not. The element
-is scrolled into view automatically, so it need not be visible beforehand.
+is scrolled into view first, so it need not be visible beforehand.
 
 Sends real CDP input events, so the page sees `isTrusted=true`, which is the
-entire point of an undetected driver. Two situations force a scripted
-fallback (`element.click()` plus synthetic events, `isTrusted=false`): a
-touch-emulated target, where CDP mouse input can crash the renderer, and a
-CDP click that times out or errors. The response says so explicitly whenever
-that happens, so a detectable click is never silent. Every step is bounded
-at 10s, so a wedged page cannot hang the call.
+entire point of an undetected driver. Because those are delivered by
+coordinate, the click is aimed at a point that actually hits the element:
+several points inside it are hit-tested first, since a sticky header or a
+banner can cover the centre. If none of them reach it, `if_covered` decides
+what happens, and the response always says which path was taken.
+
+Two other situations force the scripted fallback regardless: a touch-emulated
+target, where CDP mouse input can crash the renderer, and a CDP click that
+times out or errors. Every step is bounded at 10s, so a wedged page cannot
+hang the call.
 
 On "unknown uid", take a fresh take_snapshot and retry with the new uid.
 
@@ -43,6 +47,7 @@ On "unknown uid", take a fresh take_snapshot and retry with the new uid.
 |---|---|---|---|
 | `uid` | `string` | yes | Element uid from the most recent take_snapshot, e.g. "4_12". uids are invalidated whenever the page changes — if you get "unknown uid", take a fresh snapshot and retry with the new uid. |
 | `dbl_click` | `boolean` | — | Send a double-click instead of a single click. *(default: `false`)* |
+| `if_covered` | `report` \| `synthetic_click` | — | What to do when something else sits on top of the element, so a real mouse click at its position would hit that instead. "report" (the default) does not click at all: it returns an error naming what is in the way, leaving the page untouched and the session indistinguishable from a person's. Dismiss the cookie banner, close the modal or scroll, then click again. "synthetic_click" dispatches the click on the element directly, which works through anything — but the page sees `isTrusted=false`, which is precisely the signal anti-bot systems look for. Choose it when the overlay cannot be dismissed, or when stealth does not matter on this site; not as a default. *(default: `report`)* |
 | `include_snapshot` | `boolean` | — | Append a fresh page snapshot to the response. Worth it when this action changes the page and take_snapshot would be your next call anyway — it saves a round trip, at the cost of a much larger response. *(default: `false`)* |
 
 ### `click_at`
