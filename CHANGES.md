@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.3 — lead with the symptom, and a Glama manifest
+
+- **README now opens with the problem, not the pitch.** It described the
+  solution ("undetected", "anti-bot-resistant") — vocabulary nobody types into
+  a search box. It now names what people actually see: "Just a moment…",
+  "Verify you are human" loops, "Unusual Activity Detected", bare 403s from a
+  site that opens fine by hand, `navigator.webdriver === true`. It also names
+  the tools people migrate from, and states plainly what this does **not** do
+  (no captcha solving, not every site, not a fix for hammering a server).
+- **New FAQ entries** for the high-intent questions, including the one-line
+  answer to "I already use chrome-devtools-mcp and keep getting blocked — how
+  do I switch?" (replace the config entry; the tool names match, so prompts and
+  scripts keep working).
+- **Added `glama.json`**, which Glama uses for maintainer verification and
+  server metadata.
+
+No changes to the server itself; 1.7.0-1.7.3 behave identically.
+
+Tool count: 57 → 57.
+
 ## 1.7.2 — fix the broken logo and links on PyPI
 
 The README doubles as the PyPI project description, where it is rendered
