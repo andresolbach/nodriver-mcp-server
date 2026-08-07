@@ -4873,11 +4873,26 @@ async def delete_profile(
     if not os.path.isdir(path):
         return f"Error: profile '{safe}' does not exist."
     import shutil
-    try:
-        shutil.rmtree(path)
-    except Exception as e:
-        return f"Error deleting profile '{safe}': {e}"
-    return f"Deleted profile '{safe}'."
+
+    # Chrome releases a profile directory asynchronously, so deleting right
+    # after switching away from it hits files that are still open. That is a
+    # timing artefact, not a real refusal, so retry for a few seconds instead of
+    # handing back a raw OS error the caller cannot act on.
+    last: Exception | None = None
+    for attempt in range(6):
+        try:
+            shutil.rmtree(path)
+            return f"Deleted profile '{safe}'."
+        except FileNotFoundError:
+            return f"Deleted profile '{safe}'."
+        except OSError as e:
+            last = e
+            await asyncio.sleep(0.5 * (attempt + 1))
+    return (
+        f"Could not delete profile '{safe}': files inside it are still open "
+        f"({last}). A browser using it is most likely still shutting down — wait "
+        "a moment and try again, or run close_browser first."
+    )
 
 
 # ---------------------------------------------------------------------------

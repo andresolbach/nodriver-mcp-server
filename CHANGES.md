@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.3 — delete_profile lost a race with Chrome's shutdown
+
+Found by exercising all 59 tools end to end. Deleting a profile right after
+switching away from it failed with a raw `WinError 32`, because Chrome releases
+the profile directory asynchronously and its files were still open. One second
+later the same call succeeded.
+
+It now retries for a few seconds, and if the directory is genuinely still held
+it says so in terms the caller can act on — a browser is still shutting down —
+instead of passing back an OS error code.
+
+Tool count: 59 → 59.
+
 ## 1.9.2 — the registry blurb still said 57 tools
 
 `server.json` carries the one-line description that directories show, and it had
