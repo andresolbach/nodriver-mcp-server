@@ -101,3 +101,13 @@ def test_server_json_matches_pyproject():
     assert pypi, "server.json declares no PyPI package"
     assert pypi[0]["identifier"] == PYPROJECT["project"]["name"]
     assert pypi[0]["version"] == PYPROJECT["project"]["version"]
+
+
+def test_server_json_description_states_the_real_tool_count(tool_names):
+    """The registry blurb is what directories show; it drifted to 57 once."""
+    import json
+
+    desc = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))["description"]
+    stated = {int(n) for n in re.findall(r"(\d{2})\s+tools", desc)}
+    assert stated == {len(tool_names)}, f"server.json says {stated}, server has {len(tool_names)}"
+    assert len(desc) <= 100, f"the MCP registry rejects descriptions over 100 chars ({len(desc)})"

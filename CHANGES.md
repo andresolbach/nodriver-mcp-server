@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.2 — the registry blurb still said 57 tools
+
+`server.json` carries the one-line description that directories show, and it had
+been left at "57 tools" since 1.8.0. The consistency tests covered the README,
+the badge, the tool table and the changelog, but not that string. Now they do,
+including the registry's 100-character limit.
+
+Tool count: 59 → 59.
+
 ## 1.9.1 — readable message when a click is refused
 
 The 1.9.0 error read "covered by the element is outside the viewport after
