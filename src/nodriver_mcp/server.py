@@ -1386,7 +1386,7 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
             "function() {"
             " const r = this.getBoundingClientRect();"
             " if (!r.width || !r.height) return JSON.stringify({"
-            "   covered: 'the element has zero size, so it is not rendered'});"
+            "   reason: 'it has zero size, so it is not rendered'});"
             " const fs = [0.5, 0.25, 0.75, 0.12, 0.88];"
             " let blocker = null;"
             " for (const fy of fs) for (const fx of fs) {"
@@ -1397,10 +1397,10 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
             "   if (el && !blocker) blocker = el;"
             " }"
             " if (!blocker) return JSON.stringify({"
-            "   covered: 'the element is outside the viewport after scrolling'});"
+            "   reason: 'it is outside the viewport even after scrolling'});"
             " const cls = (typeof blocker.className === 'string' && blocker.className)"
             "   ? '.' + blocker.className.trim().split(/\\s+/).slice(0, 2).join('.') : '';"
-            " return JSON.stringify({covered: '<' + blocker.tagName.toLowerCase()"
+            " return JSON.stringify({reason: 'it is covered by <' + blocker.tagName.toLowerCase()"
             "   + (blocker.id ? '#' + blocker.id : '') + cls + '>'});"
             " }"
         ),
@@ -1413,7 +1413,7 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
         return "the page did not report a hit point"
     if "x" in data:
         return float(data["x"]), float(data["y"])
-    return str(data.get("covered", "something else"))
+    return str(data.get("reason", "something else is in the way"))
 
 
 async def _cdp_click(tab: uc.Tab, remote_obj: Any, x: float, y: float, dbl_click: bool) -> None:
@@ -1532,13 +1532,13 @@ async def click(
         if isinstance(point, str):
             if if_covered == "report":
                 return (
-                    f"Error clicking uid={uid}: it is covered by {point}, so a real "
-                    "mouse click would go there instead. Nothing was clicked. Dismiss "
+                    f"Error clicking uid={uid}: {point}, so a real mouse click would land "
+                    "somewhere else. Nothing was clicked. Dismiss "
                     "or scroll past whatever is in the way and try again, or pass "
                     'if_covered="synthetic_click" to click it anyway — that works '
                     "through the overlay but the page sees isTrusted=false."
                 )
-            fallback_reason = f"covered by {point}"
+            fallback_reason = point
         else:
             try:
                 await asyncio.wait_for(

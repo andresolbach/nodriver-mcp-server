@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.1 — readable message when a click is refused
+
+The 1.9.0 error read "covered by the element is outside the viewport after
+scrolling": the template prepended "covered by" to a phrase that was already a
+full sentence. Garbled text is worse than cosmetic here, because the agent reads
+it to decide what to do next. The page now returns one complete reason and the
+message uses it as is.
+
+Tool count: 59 → 59.
+
 ## 1.9.0 — click stops claiming success when it hit something else
 
 Found by a user testing whether the thing actually works, on a plain
