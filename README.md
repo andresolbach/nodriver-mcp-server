@@ -18,11 +18,26 @@
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
 
-## Why?
+## Is this the problem you have?
 
-`chrome-devtools-mcp` and most Playwright/Puppeteer-based servers drive Chrome through CDP/WebDriver in a way that leaves detectable fingerprints (`navigator.webdriver`, CDP artifacts). Anti-bot systems (Cloudflare, hCaptcha, DataDome, etc.) flag these instantly.
+If you drive a browser from an AI agent, you have probably run into one of these:
 
-`nodriver` is the successor of `undetected-chromedriver`. It talks **directly to the CDP protocol** — no ChromeDriver binary, no Selenium/WebDriver markers — so automated sessions look like a real user. This server exposes that power through the **same tool surface as `chrome-devtools-mcp`** (57 tools), so your agent gets a familiar API with far better stealth.
+- The page sits on **"Just a moment…"** or **"Checking your browser before accessing"** and never loads
+- A **"Verify you are human"** checkbox that reappears every single time you click it
+- **"Unusual Activity Detected"**, **"Access Denied"**, or a plain **HTTP 403** — from a site that opens perfectly in your normal browser
+- `navigator.webdriver` returns `true`, and the site quietly serves you different content because of it
+- The login works when you do it by hand, and fails the moment automation does the same steps
+- It all worked for weeks, then the site started returning an empty page or a captcha wall
+
+None of that is your script being wrong. It is anti-bot detection — Cloudflare, DataDome, PerimeterX, Akamai, hCaptcha — recognising the **automation stack itself**. It shows up with `chrome-devtools-mcp`, `playwright-mcp`, Puppeteer, Selenium and `browser-use` alike, because they all drive Chrome in ways that leave a detectable signature: a ChromeDriver binary, WebDriver markers, CDP artifacts.
+
+## Why this fixes it
+
+[`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` is `undefined` and a session looks like a person using Chrome.
+
+This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (57 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
+
+**What it will not do**, so you can judge before installing: it does not solve image or text captchas for you, it cannot defeat every protection on every site, and it will not rescue a scraper that hammers a server. If a site blocks you for *what you do* rather than *what you are*, no driver fixes that. `cf_verify` handles the common Cloudflare checkbox challenge; it is not a captcha-solving service.
 
 ## Features
 
@@ -233,6 +248,15 @@ Yes. It exposes the same tool surface but drives Chrome through nodriver (direct
 
 **Can it bypass Cloudflare?**
 It ships a `cf_verify` tool that solves the Cloudflare "verify you are human" challenge, and its undetected profile avoids most bot checks. (No tool can guarantee bypassing every protection.)
+
+**I already use `chrome-devtools-mcp` or `playwright-mcp` and keep getting blocked. How do I switch?**
+Replace the server entry in your MCP config with the one under [Manual config](#manual-config) — that is the whole migration. The tool names and arguments match `chrome-devtools-mcp`, so existing prompts, scripts and agent instructions keep working unchanged. You can also run both side by side and point the agent at whichever suits the site.
+
+**The site works in my normal browser but not under automation. Why?**
+Because anti-bot systems fingerprint the *driver*, not your behaviour: a ChromeDriver binary in the process tree, `navigator.webdriver === true`, CDP artifacts in the page. Your manual browser has none of those, so it is served the real page. nodriver drives Chrome without leaving them.
+
+**Does it help with captchas?**
+Only the Cloudflare "verify you are human" checkbox, via `cf_verify`. Image grids, text captchas and hCaptcha puzzles are not solved — this is a stealth driver, not a captcha service. In practice, staying undetected means far fewer captchas are shown in the first place.
 
 **Which clients are supported?**
 One command installs it into 15+ MCP clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Copilot CLI, Kiro, VS Code, Cline, Roo Code, Amazon Q, Warp, Opencode, Trae.
