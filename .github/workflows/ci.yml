@@ -70,6 +70,32 @@ jobs:
           google-chrome --headless=new --no-sandbox --dump-dom about:blank 2>&1 | head -5 || true
         shell: bash
 
+      - name: Diagnose nodriver itself
+        run: |
+          uv run --group dev python - <<'EOF'
+          import asyncio, traceback
+          import nodriver as uc
+
+          async def attempt(label, **kw):
+              print(f"=== {label}: {kw}")
+              try:
+                  b = await uc.start(**kw)
+                  print("   OK, connected")
+                  b.stop()
+              except Exception as e:
+                  print(f"   FAILED: {type(e).__name__}: {str(e)[:200]}")
+
+          async def main():
+              await attempt("headless only", headless=True)
+              await attempt("headless + no-sandbox", headless=True,
+                            browser_args=["--no-sandbox"])
+              await attempt("headless + no-sandbox + sandbox=False", headless=True,
+                            sandbox=False, browser_args=["--no-sandbox"])
+          asyncio.run(main())
+          EOF
+        shell: bash
+        continue-on-error: true
+
       - name: Run browser tests
         run: uv run --group dev pytest -m slow -q
         env:
