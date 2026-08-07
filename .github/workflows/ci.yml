@@ -55,6 +55,21 @@ jobs:
       # These launch a real Chrome, which the schema tests cannot substitute
       # for: the cookie-scope bug they cover left every schema correct. One OS
       # is enough — it is CDP behaviour under test, not the platform.
+      - name: Diagnose the browser situation
+        run: |
+          echo "--- whoami / userns ---"
+          id
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "(no unprivileged_userns_clone)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "(no apparmor knob)"
+          echo "--- what browsers exist ---"
+          for b in google-chrome google-chrome-stable chromium chromium-browser microsoft-edge; do
+            p=$(command -v $b 2>/dev/null) && echo "$b -> $p ($($b --version 2>&1 | head -1))"
+          done
+          ls -la /opt/google/chrome/chrome 2>/dev/null || echo "(no /opt/google/chrome)"
+          echo "--- can it start headless at all? ---"
+          google-chrome --headless=new --no-sandbox --dump-dom about:blank 2>&1 | head -5 || true
+        shell: bash
+
       - name: Run browser tests
         run: uv run --group dev pytest -m slow -q
         env:
