@@ -7,14 +7,14 @@
     "url": "https://github.com/andresolbach/nodriver-mcp-server",
     "source": "github"
   },
-  "version": "1.9.3",
+  "version": "1.9.4",
   "websiteUrl": "https://pypi.org/project/nodriver-mcp/",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "nodriver-mcp",
-      "version": "1.9.3",
+      "version": "1.9.4",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

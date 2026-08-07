@@ -2124,10 +2124,15 @@ async def get_cookies(
     """
     tab = await _active_tab()
     import nodriver.cdp.network as cdp_net
+    import nodriver.cdp.storage as cdp_storage
     if url:
         cookies = await tab.send(cdp_net.get_cookies(urls=[url]))
     else:
-        cookies = await tab.send(cdp_net.get_cookies())
+        # Network.getCookies returns only the cookies of the tab it is sent to,
+        # despite the name — with two tabs open it silently answers about
+        # whichever one happens to be selected. Storage.getCookies is the
+        # whole-jar call this tool documents.
+        cookies = await tab.send(cdp_storage.get_cookies())
     lines = [f"Cookies ({len(cookies)}):"]
     for c in cookies:
         lines.append(f"  {c.name}={c.value} (domain={c.domain}, path={c.path}, secure={c.secure})")
@@ -3714,10 +3719,12 @@ async def save_session(
     """
     tab = await _active_tab()
     browser = await _get_browser()
-    import nodriver.cdp.network as cdp_net
+    import nodriver.cdp.storage as cdp_storage
 
-    # 1. Collect all cookies
-    raw_cookies = await tab.send(cdp_net.get_cookies())
+    # 1. Collect all cookies. Storage.getCookies, not Network.getCookies: the
+    # latter only answers for the tab it is sent to, so a session saved with
+    # several logins open kept whichever site was selected and dropped the rest.
+    raw_cookies = await tab.send(cdp_storage.get_cookies())
     cookies = []
     for c in raw_cookies:
         cookies.append({

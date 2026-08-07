@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.9.4 — get_cookies and save_session only saw one tab's cookies
+
+`get_cookies` says it reads the whole browser cookie jar unless you pass `url`.
+It used `Network.getCookies`, which despite the name returns only the cookies of
+the tab it is sent to. Open a second tab and a cookie set on the first vanished
+from a call that claimed to list everything — reporting `Cookies (0):` moments
+after `set_cookie` returned success.
+
+`save_session` collected cookies the same way, under a comment reading "Collect
+all cookies". That is the costly half: a session saved with three logins open
+kept whichever site happened to be selected and silently dropped the other two,
+which only shows up later, when `load_session` restores an incomplete login.
+
+Both now use `Storage.getCookies`, which is the actual whole-jar call. Passing
+`url` to `get_cookies` still filters through `Network.getCookies`, unchanged.
+
+Found by an agent driving its own browser and reporting the mismatch between
+what `set_cookie` claimed and what `get_cookies` showed.
+
+Tool count: 59 → 59.
+
 ## 1.9.3 — delete_profile lost a race with Chrome's shutdown
 
 Found by exercising all 59 tools end to end. Deleting a profile right after
