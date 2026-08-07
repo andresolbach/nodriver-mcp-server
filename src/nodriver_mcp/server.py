@@ -1903,12 +1903,19 @@ async def fill(
     ],
     include_snapshot: IncludeSnapshot = False,
 ) -> str:
-    """Set the value of an input, textarea or select element.
+    """Set the value of an input, textarea, select or contenteditable element.
 
-    Clears the field first, then types the value character by character so that
-    `input` events fire and React/Vue-style controlled components actually
-    register the change (assigning .value directly does not). For <select>, the
-    option is selected by value and a `change` event is dispatched.
+    Selects whatever is already in the field and types over it, character by
+    character, so `input` events fire and React/Vue-style controlled components
+    register the change. It deliberately does not blank the field first: that
+    makes such components re-render, the focus follows the replaced node, and
+    the keystrokes end up nowhere. For <select>, the option is chosen by value
+    and a `change` event is dispatched.
+
+    The value is read back afterwards. If it did not land you get an error, not
+    a success you cannot trust — a field can be read-only, disabled, covered by
+    an overlay, or rewrite what you type, and silently reporting success would
+    send you looking for the problem several steps later.
 
     Use type_text instead when you want to append to a focused field rather than
     replace its contents. For several fields at once, fill_form does it in one
@@ -3427,9 +3434,9 @@ async def upload_file(
     uid: Annotated[
         str,
         Field(description=(
-            'uid of the <input type="file"> element, from the most recent '
-            "take_snapshot. It must be the file input itself, not the styled button or "
-            "drop zone layered over it."
+            'uid of the file input, or of the button, label or drop zone in front '
+            "of it — the real <input type=\"file\"> is resolved from there. Comes "
+            "from the most recent take_snapshot."
         )),
     ],
     file_path: Annotated[
@@ -3444,9 +3451,14 @@ async def upload_file(
     opens — clicking an upload button normally would open one, and that blocks
     every further tool call until a human dismisses it.
 
-    Many sites hide the real <input type="file"> behind a styled button or drop
-    zone. It is still in the snapshot; if you cannot spot it, locate it with
-    query_selector("input[type=file]").
+    Chrome renders a file input with an internal shadow button, and that is what
+    the accessibility tree exposes, so the uid you can see is usually not the
+    input itself. This resolves to the real input: the element, one inside it,
+    the input a label controls, or one just above in the tree.
+
+    The result is read back. If the page's own uploader consumed the file
+    straight away, the response says so, which is a successful upload rather
+    than an empty input.
     """
     tab = await _active_tab()
     import nodriver.cdp.dom as cdp_dom
