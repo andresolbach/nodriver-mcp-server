@@ -59,6 +59,9 @@ jobs:
         run: uv run --group dev pytest -m slow -q
         env:
           NODRIVER_HEADLESS: "true"
+          # ubuntu-latest is 24.04, which blocks unprivileged user namespaces,
+          # so Chrome's sandbox cannot start here.
+          NODRIVER_TEST_EXTRA_ARGS: "--no-sandbox"
 
   build:
     name: build distribution
