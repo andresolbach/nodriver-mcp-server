@@ -47,6 +47,36 @@ _extra_browser_args: list[str] = []
 # Unpacked extension directories to load at launch (manage_extensions).
 _loaded_extensions: list[str] = []
 
+# When set, attach to a Chrome that is already running on this host/port instead
+# of launching one. Selected at runtime via use_running_browser(), or up front
+# with NODRIVER_BROWSER_URL. Chrome locks its user-data-dir, so the profile
+# holding a user's real logins can only be driven by attaching to it.
+_connect_host: str | None = None
+_connect_port: int | None = None
+# Set once the user switches back to a self-launched browser, so that choice
+# also overrides NODRIVER_BROWSER_URL rather than being undone by it.
+_connect_disabled: bool = False
+
+
+def _connect_target() -> tuple[str, int] | None:
+    """Host and port of a running browser to attach to, or None to launch one."""
+    if _connect_host is not None and _connect_port is not None:
+        return _connect_host, _connect_port
+    if _connect_disabled:
+        return None
+    url = os.environ.get("NODRIVER_BROWSER_URL", "").strip()
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url if "//" in url else f"http://{url}")
+    if parsed.hostname and parsed.port:
+        return parsed.hostname, parsed.port
+    logger.warning(
+        "NODRIVER_BROWSER_URL=%r has no host:port; launching a browser instead", url
+    )
+    return None
+
 # URLs that count as "this tab is empty, reuse it instead of opening another".
 _BLANK_URLS = frozenset({
     "", "about:blank", "chrome://newtab", "chrome://new-tab-page",
@@ -116,18 +146,43 @@ async def _get_browser() -> uc.Browser:
     """
     global _browser
     async with _browser_lock:
-        # Recover from a browser that was closed/crashed between calls — its
-        # .stopped flag can lag, which would otherwise make every tool fail
-        # with a "no close frame" websocket error until the server restarts.
-        if _browser is not None and not _browser.stopped:
-            if not await _browser_alive(_browser):
+        target = _connect_target()
+        attached = target is not None
+        # nodriver derives .stopped from a process it spawned, so a browser we
+        # attached to always reports stopped. Taking that at face value would
+        # open a fresh connection on every single tool call, so liveness for an
+        # attached browser comes from an actual CDP probe instead.
+        have_browser = _browser is not None and (attached or not _browser.stopped)
+
+        # Recover from a browser that was closed or crashed between calls: the
+        # .stopped flag can lag, which would otherwise make every tool fail with
+        # a "no close frame" websocket error until the server restarts.
+        if have_browser and not await _browser_alive(_browser):
+            if not attached:
                 try:
                     _browser.stop()
                 except Exception:
                     pass
-                _browser = None
+            _browser = None
+            have_browser = False
 
-        if _browser is None or _browser.stopped:
+        if not have_browser:
+            if attached:
+                host, port = target
+                try:
+                    _browser = await uc.start(host=host, port=port)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Could not attach to a browser at {host}:{port} ({e}). "
+                        "Start Chrome yourself with "
+                        f"--remote-debugging-port={port} and a --user-data-dir, "
+                        "then try again. Chrome refuses the debugging port when an "
+                        "instance is already running on that profile."
+                    ) from e
+                logger.info("Attached to the browser already running at %s:%s", host, port)
+                await _auto_enable_network_collection(_browser.main_tab)
+                return _browser
+
             headless = os.environ.get("NODRIVER_HEADLESS", "").lower() in ("1", "true", "yes")
             browser_path = os.environ.get("NODRIVER_BROWSER_PATH", None)
             proxy = os.environ.get("NODRIVER_PROXY", None)
@@ -473,7 +528,10 @@ _SUPPRESS_PROPERTIES: set[str] = {
 # Roles to skip entirely (node AND all descendants) — Chrome internals
 _SKIP_ROLES: set[str] = {"InlineTextBox", "ListMarker"}
 
-# Roles to collapse (skip node, promote children) — container noise
+# Roles to collapse (skip node, promote children) — container noise.
+# The Layout* and table roles are pure scaffolding on sites that lay out with
+# tables: they carry no name and cost a line each, which on a link-dense page is
+# a sizeable share of the snapshot.
 _COLLAPSE_ROLES: set[str] = {
     "generic", "list", "listitem", "paragraph", "strong", "emphasis", "code",
     "group", "Section", "blockquote", "figure", "mark", "subscript",
@@ -481,7 +539,11 @@ _COLLAPSE_ROLES: set[str] = {
     "DescriptionListTerm", "DescriptionListDetail", "time", "Abbr", "Ruby",
     "RubyAnnotation", "term", "definition", "feed", "log", "marquee",
     "timer", "directory", "tooltip",
+    "LayoutTable", "LayoutTableRow", "LayoutTableCell", "LineBreak",
 }
+# Deliberately NOT collapsed: row, cell, columnheader, rowheader. Chrome already
+# distinguishes presentational tables (the Layout* roles above) from data ones,
+# and flattening a real table would leave values with no row to belong to.
 
 # Modifier keys for press_key combo support
 _MODIFIER_KEYS = {"Control", "Shift", "Alt", "Meta"}
@@ -686,20 +748,79 @@ async def _call_function_on(tab: uc.Tab, **kwargs: Any) -> Any:
     return remote
 
 
+_SELECT_CONTENTS = (
+    "function() {"
+    " this.scrollIntoView({block: 'center', inline: 'center'});"
+    " this.focus();"
+    " if (this.isContentEditable) {"
+    "   const r = document.createRange(); r.selectNodeContents(this);"
+    "   const s = getSelection(); s.removeAllRanges(); s.addRange(r);"
+    " } else if (this.setSelectionRange) {"
+    "   try { this.setSelectionRange(0, (this.value || '').length); } catch (e) {}"
+    " }"
+    " return true; }"
+)
+
+
+async def _read_field(tab: uc.Tab, remote_obj: Any) -> str:
+    """Current text of an input, textarea, select or contenteditable."""
+    obj = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() { return this.isContentEditable ? this.innerText : (this.value ?? ''); }"
+        ),
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    if obj is None or obj.value is None:
+        return ""
+    return str(obj.value)
+
+
 async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
-    """Fill a single input/textarea/select by uid. Raises on failure."""
+    """Fill one input, textarea, select or contenteditable by uid.
+
+    Clearing a field before typing (``value = ''`` plus an input event) makes a
+    framework-controlled input re-render, and the focus goes with the node that
+    was replaced. Every keystroke after that lands nowhere, leaving the field
+    empty while the call still looks like it worked. So the existing content is
+    selected and typed over instead, which is also what a person does.
+
+    The result is read back and compared. If the value did not actually land,
+    this raises rather than reporting a success the caller cannot verify.
+    """
     import nodriver.cdp.runtime as cdp_runtime
     import nodriver.cdp.input_ as cdp_input
 
     remote_obj = await _resolve_uid(tab, uid)
 
+    # A uid can land on a text node rather than an element. Everything below
+    # needs an element, and without this the first property access fails with a
+    # TypeError that says nothing about the real problem.
+    element = await _call_function_on(
+        tab,
+        function_declaration="function() { return this.nodeType === 3 ? this.parentElement : this; }",
+        object_id=remote_obj.object_id,
+    )
+    if element is not None and getattr(element, "object_id", None):
+        remote_obj = element
+
     tag_obj = await _call_function_on(
         tab,
-        function_declaration="function() { return this.tagName.toLowerCase(); }",
+        function_declaration=(
+            "function() { if (!this || !this.tagName) return ''; "
+            "return this.isContentEditable ? 'contenteditable' : this.tagName.toLowerCase(); }"
+        ),
         object_id=remote_obj.object_id,
         return_by_value=True,
     )
     tag = tag_obj.value if tag_obj else ""
+    if not tag:
+        raise RuntimeError(
+            f"uid={uid} is not an element that can be filled. Take a fresh "
+            "take_snapshot and use the uid of the input, textarea, select or "
+            "editable element itself."
+        )
 
     if tag == "select":
         await _call_function_on(
@@ -712,20 +833,49 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
             arguments=[cdp_runtime.CallArgument(value=value)],
             return_by_value=True,
         )
-    else:
-        await _call_function_on(
-            tab,
-            function_declaration=(
-                "function() { this.focus(); this.value = ''; "
-                "this.dispatchEvent(new Event('input', {bubbles: true})); }"
-            ),
-            object_id=remote_obj.object_id,
-            return_by_value=True,
-        )
-        for char in value:
-            await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
-            await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
+        await tab
+        if await _read_field(tab, remote_obj) != value:
+            raise RuntimeError(
+                f"no option with value {value!r} in this <select>. "
+                "Use the option's value attribute, not its visible label."
+            )
+        return
+
+    await _call_function_on(
+        tab,
+        function_declaration=_SELECT_CONTENTS,
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    for char in value:
+        await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
+        await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
     await tab
+
+    def _matches(got: str) -> bool:
+        return got.strip() == value.strip() if tag == "contenteditable" else got == value
+
+    if _matches(await _read_field(tab, remote_obj)):
+        return
+
+    # Synthesised key events were dropped. Insert the text as a single edit,
+    # which rich-text and some framework-managed fields accept instead.
+    await _call_function_on(
+        tab,
+        function_declaration=_SELECT_CONTENTS,
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    await tab.send(cdp_input.insert_text(value))
+    await tab
+
+    got = await _read_field(tab, remote_obj)
+    if not _matches(got):
+        raise RuntimeError(
+            f"the field did not accept the value; it now holds {got!r}. "
+            "It may be read-only or disabled, covered by an overlay, or it "
+            "rewrites what is typed (a masked or formatted input)."
+        )
 
 
 async def _double_click(tab: uc.Tab, x: float, y: float) -> None:
@@ -1138,10 +1288,18 @@ def _safe_profile_name(name: str) -> str:
 
 async def _stop_browser() -> bool:
     """Stop the running browser (if any) and reset per-browser state, keeping the
-    selected profile. Returns True if a browser was actually running."""
+    selected profile. Returns True if a browser was actually running.
+
+    A browser we attached to is only detached from, never stopped: it belongs to
+    the user, it holds their session, and closing it because a tool wanted a
+    restart would be indefensible.
+    """
     global _browser, _selected_target_id
-    was_running = _browser is not None and not _browser.stopped
-    if _browser is not None:
+    attached = _connect_target() is not None
+    # Same reason as in _get_browser: .stopped is meaningless for a browser we
+    # did not spawn, so an attached one counts as running whenever we hold it.
+    was_running = _browser is not None and (attached or not _browser.stopped)
+    if _browser is not None and not attached:
         try:
             _browser.stop()
         except Exception:
@@ -1156,11 +1314,19 @@ async def _stop_browser() -> bool:
 
 async def _restart_browser_with(profile_dir: str | None, profile_name: str | None) -> None:
     """Select a profile and drop the current browser so the next tool call
-    relaunches Chrome with it. Any open pages are closed."""
+    relaunches Chrome with it. Any open pages are closed.
+
+    Choosing a profile means launching our own browser, so this also leaves any
+    attached browser behind. The detach has to happen first, while we still know
+    the browser is not ours to close.
+    """
     global _selected_profile_dir, _selected_profile_name
+    global _connect_host, _connect_port, _connect_disabled
+    await _stop_browser()
+    _connect_host = _connect_port = None
+    _connect_disabled = True
     _selected_profile_dir = profile_dir
     _selected_profile_name = profile_name
-    await _stop_browser()
 
 
 # ---------------------------------------------------------------------------
@@ -1455,7 +1621,15 @@ async def close_browser() -> str:
     localStorage — save_session first if you need them back. Persistent profiles
     created with create_profile keep everything.
     """
+    attached = _connect_target() is not None
     running = await _stop_browser()
+    if attached:
+        return (
+            "Detached from the running browser, which is still open — it is not "
+            "ours to close. The next action reattaches to it; use use_temp_profile "
+            "to go back to a browser this server launches itself."
+            if running else "Was not attached to a browser."
+        )
     return (
         "Browser closed. It will relaunch on the next action."
         if running else "No browser was running."
@@ -1615,9 +1789,24 @@ async def evaluate_script(
             '"(el) => el.innerText". It is invoked immediately and its return value '
             "is JSON-serialised back to you. Async functions are awaited, so "
             "\"async () => (await fetch('/api/x')).json()\" works. Return a value — "
-            "console.log output is not captured."
+            "console.log output is not captured. Leave empty when using script_path."
         )),
-    ],
+    ] = "",
+    script_path: Annotated[
+        str,
+        Field(description=(
+            "Read the function from this local .js file instead of the `function` "
+            "parameter. Use it for anything long or quote-heavy, where escaping the "
+            "script into a JSON string is where the mistakes happen."
+        )),
+    ] = "",
+    file_path: Annotated[
+        str,
+        Field(description=(
+            "Write the JSON result to this local path instead of returning it — for "
+            "extractions too large to put in the conversation."
+        )),
+    ] = "",
     args: Annotated[
         list[str] | None,
         Field(description=(
@@ -1640,7 +1829,32 @@ async def evaluate_script(
     Return values must be JSON-serialisable — DOM nodes, functions and circular
     structures are not, so map them to plain values inside the function. Errors
     are returned as a string beginning with "Error:" rather than raised.
+
+    Pass script_path to run a function kept in a .js file, and file_path to write
+    the result to disk instead of into the conversation.
     """
+    if script_path:
+        if function.strip():
+            return "Error: pass either function or script_path, not both."
+        try:
+            with open(script_path, encoding="utf-8") as fh:
+                function = fh.read()
+        except OSError as e:
+            return f"Error reading {script_path}: {e}"
+    if not function.strip():
+        return "Error: nothing to run — provide function or script_path."
+
+    def _deliver(value: Any) -> str:
+        payload = json.dumps(value, default=str)
+        if file_path:
+            try:
+                with open(file_path, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+            except OSError as e:
+                return f"Error writing {file_path}: {e}"
+            return f"Result ({len(payload)} chars) written to {file_path}."
+        return f"```json\n{payload}\n```"
+
     tab = await _active_tab()
     try:
         if args:
@@ -1664,7 +1878,7 @@ async def evaluate_script(
                 return_by_value=True,
             )
             value = remote.value if remote else None
-            return f"```json\n{json.dumps(value, default=str)}\n```"
+            return _deliver(value)
         else:
             # Simple evaluation without element args
             # If user passed a function declaration, wrap it in a call
@@ -1672,7 +1886,7 @@ async def evaluate_script(
             if expr.startswith("(") or expr.startswith("function") or expr.startswith("async"):
                 expr = f"({expr})()"
             result = await tab.evaluate(expr, await_promise=True)
-            return f"```json\n{json.dumps(result, default=str)}\n```"
+            return _deliver(result)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2176,15 +2390,22 @@ async def list_pages() -> str:
     them here rather than reusing an index from an earlier call.
 
     Tools act on the page chosen with select_page, or on the most recently
-    opened tab if none was selected.
+    opened tab if none was selected; the selected one is marked here.
+
+    Each entry also carries the page's CDP targetId, which is the stable
+    identity of a tab: unlike the index it survives other tabs opening and
+    closing, and it is what CDP-level tooling and logs refer to.
     """
     browser = await _get_browser()
     await _refresh_targets(browser)
+    active = await _active_tab()
     lines = ["Open pages:"]
     for i, tab in enumerate(browser.tabs):
         url = tab.target.url or "about:blank"
         title = tab.target.title or ""
-        lines.append(f"  [{i}] {url} — {title}")
+        target_id = str(tab.target.target_id) if tab.target else "?"
+        mark = "  <- selected" if tab is active else ""
+        lines.append(f"  [{i}] {url} — {title} (targetId={target_id}){mark}")
     return "\n".join(lines)
 
 
@@ -2988,6 +3209,38 @@ async def take_snapshot(
     _uid_to_backend_node_id.clear()
     _uid_to_backend_node_id.update(new_uid_to_backend)
 
+    def _text_leaf(node_id: str) -> str | None:
+        """The text of a StaticText node, or None if this is not one.
+
+        StaticText always carries InlineTextBox children, which are rendered
+        away as Chrome internals. Treating it as a leaf only when `child_ids` is
+        empty therefore never matches anything.
+        """
+        node = node_map.get(node_id)
+        if node is None:
+            return None
+        role = str(node.role.value) if node.role and node.role.value else ""
+        if role != "StaticText":
+            return None
+        for cid in node.child_ids or []:
+            kid = node_map.get(cid)
+            kid_role = str(kid.role.value) if kid is not None and kid.role and kid.role.value else ""
+            if kid_role not in _SKIP_ROLES:
+                return None
+        return str(node.name.value) if node.name and node.name.value else ""
+
+    def _repeats_parent_name(node_id: str, parent_name: str) -> bool:
+        """Whether a StaticText child only echoes its parent's accessible name.
+
+        A link's name is computed from exactly these children, so printing them
+        again says nothing new. On a link-dense page they are a large share of
+        the snapshot, paid for on every single call.
+        """
+        if not parent_name:
+            return False
+        text = _text_leaf(node_id)
+        return bool(text) and text in parent_name
+
     def _format_node(node_id: str, depth: int) -> str:
         node = node_map.get(node_id)
         if node is None:
@@ -3008,12 +3261,21 @@ async def take_snapshot(
         if not verbose and role in _SKIP_ROLES:
             return ""
 
-        # Collapse container roles (skip node, promote children at same depth)
+        # Collapse container roles (skip node, promote children at same depth).
+        # A focusable one is kept even without a name: a contenteditable div has
+        # role "generic", and collapsing it left only its text node behind, which
+        # is not something fill or click can act on.
         if not verbose and role in _COLLAPSE_ROLES:
             name = ""
             if node.name and node.name.value:
                 name = str(node.name.value)
-            if not name:
+            focusable = False
+            for prop in node.properties or []:
+                pname = prop.name.value if hasattr(prop.name, "value") else str(prop.name)
+                if str(pname) == "focusable" and prop.value and prop.value.value:
+                    focusable = True
+                    break
+            if not name and not focusable:
                 child_parts = []
                 for cid in children_map.get(node_id, []):
                     child_parts.append(_format_node(cid, depth))
@@ -3022,6 +3284,25 @@ async def take_snapshot(
         name = ""
         if node.name and node.name.value:
             name = str(node.name.value)
+
+        # A node with no name of its own, holding nothing but text, costs two
+        # lines to convey one thing. Fold the text into this line instead. This
+        # is lossless: the same characters, one line fewer, and it is where most
+        # of a table-heavy page's bulk sits.
+        merged_children: set[str] = set()
+        if not verbose and not name:
+            kids = children_map.get(node_id, [])
+            texts: list[str] = []
+            for cid in kids:
+                kid_text = _text_leaf(cid)
+                if kid_text is None:
+                    texts = []
+                    break
+                if kid_text:
+                    texts.append(kid_text)
+            if texts:
+                name = " ".join(texts)
+                merged_children = set(kids)
 
         value = ""
         if node.value and node.value.value:
@@ -3070,6 +3351,10 @@ async def take_snapshot(
 
         child_lines = []
         for cid in children_map.get(node_id, []):
+            if cid in merged_children:
+                continue
+            if not verbose and _repeats_parent_name(cid, name):
+                continue
             child_lines.append(_format_node(cid, depth + 1))
 
         return line + "".join(child_lines)
@@ -3166,16 +3451,73 @@ async def upload_file(
     tab = await _active_tab()
     import nodriver.cdp.dom as cdp_dom
 
-    backend_node_id = _uid_to_backend_node_id.get(uid)
-    if backend_node_id is None:
+    if uid not in _uid_to_backend_node_id:
         return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+    if not os.path.isfile(file_path):
+        return f"Error: no such file: {file_path}"
 
-    await tab.send(cdp_dom.set_file_input_files(
-        files=[file_path],
-        backend_node_id=cdp_dom.BackendNodeId(backend_node_id),
-    ))
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    # Chrome renders <input type=file> with an internal shadow button, and that
+    # is what the accessibility tree exposes. Addressing the uid directly makes
+    # setFileInputFiles a silent no-op, so resolve to the real input first.
+    located = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() {"
+            " const isFile = e => e && e.tagName === 'INPUT' && e.type === 'file';"
+            " if (isFile(this)) return this;"
+            " const own = this.querySelector && this.querySelector('input[type=file]');"
+            " if (own) return own;"
+            " if (this.control && isFile(this.control)) return this.control;"
+            " const label = this.closest && this.closest('label');"
+            " if (label && isFile(label.control)) return label.control;"
+            " let n = this;"
+            " for (let i = 0; i < 4 && n; i++) {"
+            "   const found = n.querySelector && n.querySelector('input[type=file]');"
+            "   if (found) return found;"
+            "   n = n.parentElement;"
+            " }"
+            " return null; }"
+        ),
+        object_id=remote_obj.object_id,
+    )
+    if located is None or not getattr(located, "object_id", None):
+        return (
+            f"Error: uid={uid} is not a file input and none was found near it. "
+            'Locate it with query_selector("input[type=file]") and use that element.'
+        )
+
+    try:
+        await tab.send(cdp_dom.set_file_input_files(
+            files=[file_path],
+            object_id=located.object_id,
+        ))
+    except Exception as e:
+        return f"Error attaching {file_path}: {e}"
+
+    # Read it back: the page's own JS may consume and reset the input, which is
+    # a successful upload, but an empty input plus no reaction is not.
+    check = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() { return {n: this.files ? this.files.length : -1, "
+            "name: this.files && this.files[0] ? this.files[0].name : null}; }"
+        ),
+        object_id=located.object_id,
+        return_by_value=True,
+    )
+    attached = (check.value or {}) if check else {}
+    count = attached.get("n", -1)
 
     result = f"Uploaded {file_path} to uid={uid}"
+    if count == 0:
+        result += " (the page consumed the file immediately, which is normal for uploaders that submit on change)"
+    elif count > 0:
+        result += f" — attached as {attached.get('name')}"
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -3577,6 +3919,128 @@ async def query_selector(
         if el.get("text"):
             line += f' — "{el["text"]}"'
         lines.append(line)
+    return "\n".join(lines)
+
+
+@tool(title="Get computed styles", read_only=True)
+async def get_computed_styles(
+    selector: Annotated[
+        str,
+        Field(description=(
+            'CSS selector of the element to inspect, e.g. "#header" or ".btn.primary". '
+            "The first match is used. Leave empty to use `uid` instead."
+        )),
+    ] = "",
+    uid: Annotated[
+        str,
+        Field(description=(
+            "Element uid from the most recent take_snapshot, as an alternative to "
+            "`selector`. Ignored when `selector` is given."
+        )),
+    ] = "",
+    properties: Annotated[
+        list[str] | None,
+        Field(description=(
+            'Only return these CSS properties, e.g. ["display", "color", "font-size"]. '
+            "Omit to get the properties that differ from the browser default, which is "
+            "usually what you want — the full computed set is several hundred entries."
+        )),
+    ] = None,
+) -> str:
+    """Read an element's computed styles, as the browser actually resolved them.
+
+    Computed styles are the end result of the whole cascade, so this answers
+    what a stylesheet alone cannot: why an element is invisible
+    (`display: none`, `visibility: hidden`, `opacity: 0`), what a CSS variable
+    resolved to, or which font actually got used.
+
+    Also reports the element's box: position, size, and whether it is currently
+    in the viewport. An element with zero width or height is present in the DOM
+    but not rendered, which is the usual reason a click appears to do nothing.
+
+    By default only properties that differ from the browser default are
+    returned, because the full set runs to several hundred entries and buries
+    the interesting ones.
+    """
+    tab = await _active_tab()
+
+    if not selector and not uid:
+        return "Error: provide either selector or uid."
+
+    if selector:
+        sel = json.dumps(selector)
+        expr = f"document.querySelector({sel})"
+    else:
+        if uid not in _uid_to_backend_node_id:
+            return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+        try:
+            remote_obj = await _resolve_uid(tab, uid)
+        except ValueError as e:
+            return f"Error: {e}"
+        expr = None
+
+    wanted = json.dumps([p.strip() for p in (properties or []) if p and p.strip()])
+    body = (
+        "function() {"
+        " const el = this;"
+        " if (!el) return null;"
+        f" const want = {wanted};"
+        " const cs = getComputedStyle(el);"
+        " const out = {};"
+        " if (want.length) {"
+        "   for (const p of want) out[p] = cs.getPropertyValue(p);"
+        " } else {"
+        "   const probe = document.createElement(el.tagName);"
+        "   document.body.appendChild(probe);"
+        "   const base = getComputedStyle(probe);"
+        "   for (const p of cs) { const v = cs.getPropertyValue(p);"
+        "     if (v !== base.getPropertyValue(p)) out[p] = v; }"
+        "   probe.remove();"
+        " }"
+        " const r = el.getBoundingClientRect();"
+        # Hand back a JSON string, not an object: CDP returns objects in a typed
+        # wire form that differs between the two call paths below, and decoding
+        # that twice is how this went wrong the first time.
+        " return JSON.stringify({tag: el.tagName.toLowerCase(), styles: out,"
+        "   box: {x: Math.round(r.x), y: Math.round(r.y),"
+        "     width: Math.round(r.width), height: Math.round(r.height)},"
+        "   rendered: r.width > 0 && r.height > 0,"
+        "   inViewport: r.top < innerHeight && r.bottom > 0 && r.left < innerWidth && r.right > 0}); }"
+    )
+
+    try:
+        if expr is not None:
+            raw = await tab.evaluate(f"({body}).call({expr})", await_promise=False)
+        else:
+            remote = await _call_function_on(
+                tab,
+                function_declaration=body,
+                object_id=remote_obj.object_id,
+                return_by_value=True,
+            )
+            raw = remote.value if remote else None
+    except Exception as e:
+        return f"Error reading computed styles: {e}"
+
+    if not raw:
+        return f"No element matches '{selector or uid}'."
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError) as e:
+        return f"Error decoding computed styles: {e}"
+    if not isinstance(data, dict):
+        return f"No element matches '{selector or uid}'."
+
+    styles = data.get("styles") or {}
+    box = data.get("box") or {}
+    lines = [
+        f"<{data.get('tag')}> {selector or f'uid={uid}'}",
+        f"  box: {box.get('width')}x{box.get('height')} at ({box.get('x')}, {box.get('y')})",
+        f"  rendered: {data.get('rendered')} | in viewport: {data.get('inViewport')}",
+        f"  computed styles ({len(styles)}):",
+    ]
+    for k in sorted(styles):
+        lines.append(f"    {k}: {styles[k]}")
     return "\n".join(lines)
 
 
@@ -4103,7 +4567,12 @@ async def list_profiles() -> str:
         if os.path.isdir(os.path.join(_PROFILES_DIR, d))
     )
     running = bool(_browser and not _browser.stopped)
-    active = _selected_profile_name or "temp (ephemeral, auto-deleted)"
+    attached = _connect_target()
+    active = (
+        f"attached to the running browser at {attached[0]}:{attached[1]} (no profile of ours)"
+        if attached
+        else (_selected_profile_name or "temp (ephemeral, auto-deleted)")
+    )
     lines = [
         f"Active profile: {active}",
         f"Browser running: {running}",
@@ -4167,6 +4636,63 @@ async def create_profile(
     else:
         msg += f"\nActivate it with use_profile(\"{safe}\")."
     return msg
+
+
+@tool(title="Attach to a running browser", destructive=True, idempotent=True)
+async def use_running_browser(
+    port: Annotated[
+        int,
+        Field(gt=0, le=65535, description=(
+            "The remote debugging port Chrome was started with, e.g. 9222 for "
+            "--remote-debugging-port=9222."
+        )),
+    ] = 9222,
+    host: Annotated[
+        str,
+        Field(description=(
+            "Host the browser is listening on. Leave at 127.0.0.1 unless you are "
+            "attaching to a browser on another machine or in a container."
+        )),
+    ] = "127.0.0.1",
+) -> str:
+    """Drive a Chrome that is already running, instead of launching a new one.
+
+    This is how you use a browser you are already signed into. Chrome locks its
+    user-data-dir, so the profile holding your real logins cannot be opened a
+    second time — attaching to the running instance is the only way in, and it
+    saves rebuilding every login through the automation.
+
+    The user starts Chrome themselves, once:
+
+        chrome --remote-debugging-port=9222 --user-data-dir=/path/to/profile
+
+    then this tool attaches to it. Every tool then acts on that browser and its
+    real tabs.
+
+    SECURITY: that profile becomes part of the agent's reach. Whatever it is
+    signed into — mail, bank, company systems — is reachable from here, because
+    a cookie jar is all or nothing. Point this at a profile you are willing to
+    expose, not your everyday one.
+
+    While attached, close_browser and every profile switch only detach; they
+    never close a browser they did not start. Return to a self-launched browser
+    with use_temp_profile or use_profile.
+    """
+    global _connect_host, _connect_port, _connect_disabled
+    await _stop_browser()
+    _connect_host, _connect_port, _connect_disabled = host, int(port), False
+    try:
+        browser = await _get_browser()
+    except Exception as e:
+        _connect_host = _connect_port = None
+        _connect_disabled = True
+        return f"Error: {e}"
+    pages = await _format_pages()
+    return (
+        f"Attached to the browser running at {host}:{port}. "
+        f"It has {len(browser.tabs)} tab(s); tools now act on this browser and it "
+        f"stays open when the server stops.{pages}"
+    )
 
 
 @tool(title="Use temporary profile", destructive=True, idempotent=True)

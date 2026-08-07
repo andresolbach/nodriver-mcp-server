@@ -32,7 +32,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ]),
     ("Reading the page", [
         "take_snapshot", "take_screenshot", "get_page_content", "query_selector",
-        "evaluate_script", "save_pdf",
+        "evaluate_script", "get_computed_styles", "save_pdf",
     ]),
     ("Network & console", [
         "list_network_requests", "get_network_request", "block_resources",
@@ -50,7 +50,8 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ("Sessions", ["save_session", "load_session", "list_sessions"]),
     ("Profiles & browser", [
         "list_profiles", "create_profile", "use_profile", "use_temp_profile",
-        "delete_profile", "set_browser_flags", "manage_extensions",
+        "use_running_browser", "delete_profile", "set_browser_flags",
+        "manage_extensions",
     ]),
     ("Anti-detection helpers", ["cf_verify", "bypass_insecure_warning"]),
 ]

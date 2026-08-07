@@ -36,7 +36,7 @@ def _params(tool) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_tool_count(tools):
-    assert len(tools) == 57
+    assert len(tools) == 59
 
 
 def test_tool_names_are_unique(tools):
@@ -61,6 +61,7 @@ def test_no_tool_was_renamed_by_accident(by_name):
         "scroll_to_selector", "select_page", "set_browser_flags", "set_cookie",
         "set_local_storage", "take_memory_snapshot", "take_screenshot",
         "take_snapshot", "type_text", "upload_file", "use_profile",
+        "use_running_browser", "get_computed_styles",
         "use_temp_profile", "wait_for", "wait_for_selector",
     }
     assert set(by_name) == expected
@@ -86,9 +87,21 @@ def test_every_parameter_is_described(tools):
 
 
 def test_descriptions_are_dedented(tools):
-    """Docstring indentation would otherwise ship in every request, for every tool."""
-    indented = [t.name for t in tools if t.description and "\n    " in t.description]
-    assert indented == []
+    """The source file's indentation must not ship in every request.
+
+    Checked by re-running cleandoc: if that changes the text, the description
+    still carries the leading whitespace of the docstring it came from. An
+    intentionally indented block, such as a command example, is left alone,
+    because cleandoc preserves relative indentation.
+    """
+    import inspect as _inspect
+
+    undedented = [
+        t.name
+        for t in tools
+        if t.description and _inspect.cleandoc(t.description) != t.description
+    ]
+    assert undedented == []
 
 
 def test_descriptions_do_not_leak_a_raw_args_block(tools):

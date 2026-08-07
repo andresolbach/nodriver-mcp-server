@@ -1,5 +1,75 @@
 # Changelog
 
+## 1.8.0 — attach to your own browser, a snapshot two thirds smaller, two silent failures fixed
+
+### Two tools reported success while doing nothing
+
+Both were found by using this server on real sites, and both share the worst
+failure mode an agent can meet: the call looks fine, so the agent carries on and
+fails three steps later somewhere unrelated.
+
+- **`fill` left framework-controlled fields empty.** It cleared the field first
+  (`value = ''` plus an input event), which makes React and similar re-render;
+  the focus goes with the replaced node and every keystroke after that lands
+  nowhere. It now selects the existing content and types over it, the way a
+  person does, falls back to inserting the text as one edit, and **reads the
+  value back** — if it did not land, you get an error instead of a false success.
+- **`upload_file` attached nothing.** Chrome renders `<input type=file>` with an
+  internal shadow button, and that is what the accessibility tree exposes, so
+  addressing the uid made `DOM.setFileInputFiles` a silent no-op. It now resolves
+  to the real input (itself, a descendant, or the input a label controls) and
+  reports what was actually attached.
+
+Two more that surfaced while testing the above:
+
+- **A contenteditable element could not be addressed at all.** Its role is
+  `generic`, which the snapshot collapsed away, leaving only the text node
+  behind — and `fill` on that died with a `TypeError` about `toLowerCase`.
+  Focusable containers are now kept in the snapshot, and `fill` resolves a text
+  node to its element and otherwise says plainly that the uid is not fillable.
+- **An attached browser was reconnected on every call.** nodriver derives
+  `.stopped` from a process it spawned, so a browser we attached to always
+  reported stopped. Liveness for those now comes from an actual CDP probe.
+
+### New
+
+- **`use_running_browser`** — drive a Chrome that is already running, instead of
+  launching one. Chrome locks its user-data-dir, so the profile holding your real
+  logins can only be driven by attaching to it. Start Chrome with
+  `--remote-debugging-port=9222` and attach, at runtime or via
+  `NODRIVER_BROWSER_URL`. While attached the server **never closes a browser it
+  did not start**: `close_browser` and profile switches only detach.
+  That profile becomes part of the agent's reach, which the README states plainly.
+- **`get_computed_styles`** — an element's resolved styles, box and whether it is
+  actually rendered and in the viewport. Answers why a click does nothing on an
+  element that is present but has zero size, or why something is invisible.
+- **`evaluate_script` gained `script_path` and `file_path`** — read the function
+  from a .js file (no escaping a long script into JSON) and write the result to
+  disk instead of into the conversation.
+- **`list_pages` now reports each page's CDP `targetId`** and marks the selected
+  page. Unlike the index, a targetId survives other tabs opening and closing.
+
+### Snapshots are roughly two thirds smaller
+
+`take_snapshot` was emitting a `StaticText` line for text that its parent line
+already showed — a link's accessible name is computed from exactly those
+children. The check meant to drop them never fired, because `StaticText` always
+carries `InlineTextBox` children and so never looked like a leaf.
+
+Measured on the Hacker News front page, same page load:
+
+| | chars |
+|---|---|
+| unfiltered (`verbose=true`) | 106,266 |
+| **compact (new default)** | **34,144** |
+
+68% smaller, with **all 201 URLs and all 270 distinct texts still present** —
+verified rather than assumed. Layout-table scaffolding is collapsed too. Real
+data tables are deliberately left alone: flattening `row` and `cell` would leave
+values with no row to belong to. `verbose=true` still returns everything.
+
+Tool count: 57 → 59.
+
 ## 1.7.3 — lead with the symptom, and a Glama manifest
 
 - **README now opens with the problem, not the pitch.** It described the

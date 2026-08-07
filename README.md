@@ -13,7 +13,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 57](https://img.shields.io/badge/tools-57-orange.svg)
+![Tools: 59](https://img.shields.io/badge/tools-59-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -33,19 +33,39 @@ None of that is your script being wrong. It is anti-bot detection — Cloudflare
 
 ## Why this fixes it
 
-[`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` is `undefined` and a session looks like a person using Chrome.
+[`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` reads `false` rather than `true`, and a session looks like a person using Chrome.
 
-This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (57 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
+This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (59 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
 
 **What it will not do**, so you can judge before installing: it does not solve image or text captchas for you, it cannot defeat every protection on every site, and it will not rescue a scraper that hammers a server. If a site blocks you for *what you do* rather than *what you are*, no driver fixes that. `cf_verify` handles the common Cloudflare checkbox challenge; it is not a captcha-solving service.
 
+## Does it actually pass? Here is the evidence
+
+Claiming "undetected" is easy, so here is what the standard fingerprint suite reports when this server drives the page itself. Reproduce it in one line: point your agent at `https://bot.sannysoft.com` and take a snapshot.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/andresolbach/nodriver-mcp-server/main/assets/proof/sannysoft.png" alt="bot.sannysoft.com results: all checks green" width="700">
+</p>
+
+| Check | Result |
+|---|---|
+| `bot.sannysoft.com` — Intoli + fingerprint suite | **58 checks, 0 failed** |
+| `navigator.webdriver` | `false` — a boolean on `Navigator.prototype`, not an own property, exactly as in a normal browser |
+| `window.chrome` | present |
+| `navigator.plugins` | 5 |
+| `navigator.languages` | 4 entries |
+| User agent | no `Headless` token |
+
+**What this does and does not prove.** It shows the browser presents no automation artifacts to client-side fingerprinting, which is what these suites test and what most blocks key off. It does not prove any particular site will let you in: server-side signals such as IP reputation and request rate are outside what any driver controls, and captchas are not solved (see above). Measured on Chrome 150 / Windows 11, headful, with the default profile.
+
 ## Features
 
-- 🕵️ **Undetected by design** — `navigator.webdriver` is `undefined`, no CDP fingerprints.
+- 🕵️ **Undetected by design** — `navigator.webdriver` reads `false`, exactly as in a browser a person is using, and there are no CDP or WebDriver artifacts to find.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **57 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **59 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 🧠 **Schemas written for the agent, not just the compiler** — every parameter carries a description, fixed-value options are real enums, and each tool declares read-only/destructive hints. See [why this matters](#built-for-the-agent-that-calls-it).
-- 📄 **Accessibility-tree snapshots** (`take_snapshot`) — searchable, LLM-friendly page text that's far smaller and faster than screenshots.
+- 📄 **Compact accessibility-tree snapshots** (`take_snapshot`) — searchable page text with a uid per element. Measured on the Hacker News front page: **34 KB against 106 KB unfiltered, 68% smaller, with every link, URL and text preserved.** That saving lands on every single agent step.
+- 🔗 **Attach to a browser you are already signed into** (`use_running_browser`) — drive your real Chrome profile over its debugging port instead of rebuilding logins in a fresh one.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - 💾 **Session save/restore** — persist logins across runs.
 - 🧬 **Ephemeral by default, run many at once** — each session gets its own temp Chrome profile (auto-deleted), so Claude Desktop, Claude Code and VS Code can all drive nodriver **simultaneously without colliding**. Named **persistent profiles** are available on demand for reusable logins.
@@ -147,6 +167,7 @@ If you'd rather paste it yourself, this works in any MCP client (`claude_desktop
 | `NODRIVER_USER_DATA_DIR` | Explicit persistent Chrome profile dir (overrides the default) | Ephemeral temp profile, auto-deleted per session |
 | `NODRIVER_BROWSER_PATH` | Chrome executable path | Auto-detected |
 | `NODRIVER_PROXY` | Proxy server address | None |
+| `NODRIVER_BROWSER_URL` | Attach to a Chrome already running at this address (e.g. `http://127.0.0.1:9222`) instead of launching one | Launch our own |
 | `NODRIVER_ENABLE_TRANSLATE` | Set `true` to re-enable Chrome's Google Translate popup | Disabled |
 | `NODRIVER_ENABLE_EXTENSIONS` | Set `true` to allow externally-installed Chrome extensions (and their prompts) | Disabled |
 
@@ -180,7 +201,26 @@ When you want to **reuse a login across sessions**, create a named persistent pr
 
 Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
 
-## Tools (57)
+## Drive a browser you are already signed into
+
+Chrome locks its user-data-dir, so the profile holding your real logins cannot be opened a second time. The way in is to attach to the browser that already has it open — then you skip rebuilding every login through automation.
+
+Start Chrome yourself, once:
+
+```bash
+# Windows
+chrome.exe --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\agent-profile"
+# macOS / Linux
+google-chrome --remote-debugging-port=9222 --user-data-dir=~/.config/agent-profile
+```
+
+Then attach, either at runtime with `use_running_browser(port=9222)`, or up front by setting `NODRIVER_BROWSER_URL=http://127.0.0.1:9222`. Every tool then acts on that browser and its real tabs.
+
+While attached, this server **never closes a browser it did not start**: `close_browser` and profile switches only detach. Go back to a self-launched browser with `use_temp_profile` or `use_profile`.
+
+> ⚠️ **That profile becomes part of the agent's reach.** Whatever it is signed into — mail, bank, company systems — is reachable from here, because a cookie jar is all or nothing. Point this at a profile you are willing to expose, not your everyday one.
+
+## Tools (59)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
@@ -192,13 +232,13 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 |----------|-------|
 | **Input automation (10)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
 | **Navigation (10)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `wait_for_selector` · `scroll_page` · `scroll_to_selector` |
-| **Snapshots & debugging (10)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `query_selector` · `evaluate_script` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
+| **Snapshots & debugging (11)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `query_selector` · `evaluate_script` · `get_computed_styles` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
 | **Network monitoring (3)** | `list_network_requests` · `get_network_request` · `block_resources` |
 | **Device emulation (4)** | `emulate` · `emulate_device` · `reset_emulation` · `resize_page` |
 | **Performance (3)** | `performance_start_trace` · `performance_stop_trace` · `take_memory_snapshot` |
 | **Cookies & storage (5)** | `get_cookies` · `set_cookie` · `clear_cookies` · `get_local_storage` · `set_local_storage` |
 | **Session management (3)** | `save_session` · `load_session` · `list_sessions` |
-| **Profiles & browser (7)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `delete_profile` · `set_browser_flags` · `manage_extensions` |
+| **Profiles & browser (8)** | `list_profiles` · `create_profile` · `use_profile` · `use_temp_profile` · `use_running_browser` · `delete_profile` · `set_browser_flags` · `manage_extensions` |
 | **Anti-detection helpers (2)** | `cf_verify` · `bypass_insecure_warning` |
 
 📖 **[Full tool reference →](https://github.com/andresolbach/nodriver-mcp-server/blob/main/docs/TOOLS.md)** — every tool with its exact parameters, types, defaults and enum values, generated straight from the live schemas.
@@ -222,12 +262,12 @@ Here, the schema does that work:
 |---------|---------------------|---------------------|
 | Browser backend | Puppeteer (ChromeDriver) | nodriver (direct CDP) |
 | WebDriver fingerprint | ❌ Exposed | ✅ None |
-| `navigator.webdriver` | ❌ `true` | ✅ `undefined` |
+| `navigator.webdriver` | ❌ `true` | ✅ `false`, as in a normal browser |
 | Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
 | Install method | npx | uvx / pip |
 | Language | TypeScript / Node.js | Python |
-| Tool coverage | 29 tools | 57 tools |
-| Per-parameter schema docs | partial | ✅ all 57 tools |
+| Tool coverage | 29 tools | 59 tools |
+| Per-parameter schema docs | partial | ✅ all 59 tools |
 | Tool behaviour hints | ❌ | ✅ read-only / destructive |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
@@ -244,7 +284,7 @@ Tools not implemented: `performance_analyze_insight` (needs the DevTools fronten
 ## FAQ
 
 **Is this an undetected alternative to chrome-devtools-mcp?**
-Yes. It exposes the same tool surface but drives Chrome through nodriver (direct CDP), so `navigator.webdriver` is `undefined` and there are no WebDriver/CDP fingerprints for anti-bot systems to detect.
+Yes. It exposes the same tool surface but drives Chrome through nodriver (direct CDP), so `navigator.webdriver` reads `false` — the same value a browser a person is using reports — and there are no WebDriver/CDP fingerprints for anti-bot systems to detect.
 
 **Can it bypass Cloudflare?**
 It ships a `cf_verify` tool that solves the Cloudflare "verify you are human" challenge, and its undetected profile avoids most bot checks. (No tool can guarantee bypassing every protection.)
