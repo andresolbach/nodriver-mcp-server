@@ -27,7 +27,8 @@ jobs:
         run: uv python install 3.12
 
       # No browser is launched: these assert on the schemas the server hands to
-      # a client, and on the docs staying in step with them.
+      # a client, and on the docs staying in step with them. The browser tests
+      # are excluded by addopts and run in the `browser` job instead.
       - name: Run tests
         run: uv run --group dev pytest -q
 
@@ -36,6 +37,28 @@ jobs:
           uv run python scripts/generate_tool_docs.py
           git diff --exit-code docs/TOOLS.md
         shell: bash
+
+  browser:
+    name: browser tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # These launch a real Chrome, which the schema tests cannot substitute
+      # for: the cookie-scope bug they cover left every schema correct. One OS
+      # is enough — it is CDP behaviour under test, not the platform.
+      - name: Run browser tests
+        run: uv run --group dev pytest -m slow -q
+        env:
+          NODRIVER_HEADLESS: "true"
 
   build:
     name: build distribution

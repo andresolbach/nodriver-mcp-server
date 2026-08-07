@@ -51,3 +51,11 @@ nodriver-mcp = "nodriver_mcp.cli:main"
 dev = [
     "pytest>=8.0",
 ]
+
+[tool.pytest.ini_options]
+# Browser tests are opt-in: `pytest -m slow`. The default run stays schema-only,
+# so it needs no Chrome and finishes in under a second.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: launches a real Chrome",
+]
