@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1 — the landing page did not mention the headline feature
+
+Documentation only; the server is unchanged from 2.0.0.
+
+The Features list, which is the part most readers actually skim, said nothing
+about running several isolated browsers — the whole point of 2.0.0. It does now,
+and links to the section that explains it.
+
+One sentence also still claimed "All 57 tools", a number last true before 1.8.0.
+The consistency check only ever matched the form "Tools: N", so this other
+phrasing drifted freely for three releases. It now checks every "N tools" in the
+README, allowing a different number only on a line that states ours beside it,
+which is what a comparison against another project looks like. PyPI descriptions
+are fixed per release, so 2.0.0's page keeps the wrong sentence; this is the
+release that corrects it.
+
+Tool count: 61 → 61.
+
 ## 2.0.0 — several independent browsers, one server
 
 Two agents pointed at this server used to share one Chrome, because the whole
