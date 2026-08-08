@@ -109,8 +109,10 @@ This is how you open hover-triggered menus, tooltips and dropdowns before
 reading what they reveal — pass include_snapshot=true to get the revealed
 content back in the same call.
 
-Only moves the pointer; it does not scroll. If the element sits outside the
-viewport, call scroll_to_selector first.
+The element is scrolled into view and hit-tested first, the same way click
+does it: a point that lands on a sticky header instead opens that header's
+menu, not the one you asked for. If something covers the element, this says
+what, rather than hovering the wrong thing.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -243,12 +245,13 @@ this tool is for single keys and shortcuts.
 
 Drag one element onto another (press, move, release).
 
-Both uids must come from the same take_snapshot. Works for native HTML5
-drag-and-drop and for mouse-driven sortable lists.
+Both uids must come from the same take_snapshot. Both ends are scrolled into
+view and hit-tested first, and the pointer is moved in steps with the button
+held, which is what mouse-driven sortables and sliders listen for.
 
-Some JS drag libraries require a stream of intermediate mousemove events
-that this does not emit; if a drag silently does nothing, drive it manually
-with click_at and press_key instead.
+This drives the mouse. Native HTML5 drag-and-drop — the dataTransfer kind —
+is a separate protocol that a synthetic mouse does not trigger in Chrome; if
+nothing happens on a page that uses it, that is why.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -1304,9 +1307,11 @@ Use when a page is stuck on a Cloudflare interstitial — a checkbox widget,
 or "Checking your browser before accessing". Drives nodriver's built-in
 verification bypass, which locates the checkbox visually and clicks it.
 
-Requires opencv-python to be installed; without it this returns an error.
-Many challenges also clear by themselves after a few seconds, so
-wait_for(["some text from the real page"]) is worth trying first.
+Needs opencv, which is an optional extra: install nodriver-mcp[cf], or this
+reports that it is missing rather than failing obscurely. Many challenges
+clear by themselves after a few seconds, so wait_for(["some text from the
+real page"]) is worth trying first — and this says so when it looks at the
+page and finds no challenge at all.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

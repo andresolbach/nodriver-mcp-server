@@ -212,3 +212,38 @@ def test_two_spawns_racing_at_the_cap_do_not_deadlock():
         ), results
 
     asyncio.run(scenario())
+
+
+def test_an_unknown_argument_is_refused_rather_than_dropped():
+    """Regression: pydantic ignores unknown fields, so a misspelled argument
+    vanished and the tool ran with its defaults.
+
+    block_resources(resource_types=[...]) — the plausible spelling, and the one an
+    agent reaches for — answered "Resource blocking disabled (all resources
+    allowed)": a success message for a call that asked for the opposite. This is
+    the same class of defect as a tool reporting success while doing nothing, one
+    layer up.
+    """
+
+    async def scenario():
+        result = await mux.call_tool("block_resources", {"resource_types": ["image"]})
+        text = mux._text(result)
+
+        assert result.isError, f"a malformed call was reported as success:\n{text}"
+        assert "resource_types" in text, text
+        # It has to name the argument that does exist, or the agent guesses again.
+        assert "types" in text, text
+        assert "Resource blocking disabled" not in text
+
+    asyncio.run(scenario())
+
+
+def test_a_correct_call_is_untouched():
+    """The check must not become a new way for valid calls to fail."""
+
+    async def scenario():
+        for args in ({}, {"browser": "default"}):
+            result = await mux.call_tool("list_browsers", dict(args))
+            assert not result.isError, mux._text(result)
+
+    asyncio.run(scenario())

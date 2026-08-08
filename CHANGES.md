@@ -192,6 +192,55 @@ shows the sent/received counts; `get_network_request` prints the frames. Payload
 are capped at 2000 characters and each socket keeps its last 200 frames, with the
 number dropped reported rather than silently forgotten.
 
+### A dialog can no longer wedge a tab
+
+A modal `alert`/`confirm`/`prompt` blocks the renderer, so every later call into
+the page hangs until it is answered — and `handle_dialog` was the one call that
+could not answer it. Chrome reports a dialog only to a client that enabled the
+Page domain, and `Page.enable` was sent from `navigate_page` alone, so a tab
+reached through `new_page` answered "No dialog is showing" while being blocked by
+one, with no way out but closing it.
+
+The Page domain is enabled with the rest of a tab's setup now, dialogs are
+tracked as they open and close, `handle_dialog` reports the dialog's own text,
+and the input-delivery warning names an open dialog as the cause instead of
+listing it as a possibility. `Page.enable` is not `Runtime.enable`: it does not
+carry the attached-debugger signal this server deliberately keeps off, and
+navigate_page has always sent it.
+
+### hover and drag were left behind by the click rewrite
+
+1.9.0 gave `click` scrolling and hit-testing, measured against a real page where
+43 of 54 visible links had a centre point that hit something else. `hover` and
+`drag` were still aiming at the raw box centre.
+
+- `hover` scrolls and hit-tests like `click`, and says what is in the way instead
+  of hovering it. It also stops walking the pointer from the viewport origin:
+  nodriver's `Tab.mouse_move` interpolates from (0, 0) every time, firing
+  mouseMoved along the whole diagonal — opening every menu on that line — and
+  then sends a `mouseReleased`, a stray mouseup that drag handles and sliders act
+  on. The pointer now moves from where it actually is, and releases nothing.
+- `drag` hit-tests both ends and holds the button down across the move, which is
+  what mouse-driven sortables listen for and what nodriver's `mouse_drag` left
+  out. Its description no longer claims native HTML5 drag-and-drop: that is a
+  separate protocol a synthetic mouse does not trigger, and saying so beats a
+  silent no-op.
+
+### Smaller things
+
+- **`cf_verify` could never run.** opencv was not a dependency, not even an
+  optional one, so the flagship anti-bot tool always failed with an error from
+  inside nodriver. It is an extra now (`pip install nodriver-mcp[cf]`), the tool
+  says so when it is missing, it reports plainly when the page has no challenge
+  to solve, and it no longer writes its working files into the client's working
+  directory — which for an stdio server is wherever the client happened to start.
+- **An unknown argument is refused instead of dropped.** Pydantic ignores extra
+  fields, so a misspelled argument vanished and the tool ran with its defaults:
+  `block_resources(resource_types=…)` — the plausible spelling — answered
+  "Resource blocking disabled", a success message for a call that asked for the
+  opposite. The router now names the argument it did not understand and lists the
+  ones the tool takes.
+
 ### A smaller snapshot, without losing anything
 
 take_snapshot is the most-called tool in the server, so its size is paid at every

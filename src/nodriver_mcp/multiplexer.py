@@ -520,6 +520,26 @@ _SHUTDOWN_BROWSER = types.Tool(
 # capacity, which is the one moment the creation path refuses.
 _NO_ALLOC: frozenset[str] = frozenset({"close_browser"})
 
+# name -> the arguments it accepts. Built once, from the schemas the server
+# itself advertises, so it cannot drift from them.
+_ACCEPTED_ARGS: dict[str, set[str]] = {}
+
+
+async def _accepted_args(name: str) -> set[str] | None:
+    """Which arguments this tool takes, or None if the tool is unknown here."""
+    if not _ACCEPTED_ARGS:
+        try:
+            for tool in await mcp.list_tools():
+                schema = tool.inputSchema or {}
+                _ACCEPTED_ARGS[tool.name] = set((schema.get("properties") or {}).keys())
+            for tool in (_LIST_BROWSERS, _SHUTDOWN_BROWSER):
+                schema = tool.inputSchema or {}
+                _ACCEPTED_ARGS[tool.name] = set((schema.get("properties") or {}).keys())
+        except Exception as e:  # noqa: BLE001 - never block a call over this
+            logger.warning("could not read tool schemas for argument checking: %r", e)
+            return None
+    return _ACCEPTED_ARGS.get(name)
+
 
 def _decorate(tool: types.Tool) -> types.Tool:
     """Pass a tool through with the `browser` selector added."""
@@ -634,6 +654,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         target = _validate_name(str(args.pop("browser", "") or DEFAULT_BROWSER))
     except RuntimeError as e:
         return _error(str(e))
+
+    # Pydantic drops unknown fields silently, so a misspelled argument used to
+    # vanish and the tool ran with its defaults — block_resources(resource_types=…)
+    # answered "Resource blocking disabled", a success message for a call that
+    # asked for the opposite. Say which argument was not understood instead.
+    accepted = await _accepted_args(name)
+    if accepted is not None:
+        unknown = sorted(set(args) - accepted)
+        if unknown:
+            known = ", ".join(sorted(accepted | {"browser"})) or "(none)"
+            return _error(
+                f"{name} does not take {', '.join(repr(u) for u in unknown)}. "
+                f"It accepts: {known}."
+            )
 
     if name == "list_browsers":
         names = [DEFAULT_BROWSER, *sorted(_workers)]

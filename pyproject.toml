@@ -32,6 +32,12 @@ dependencies = [
     "tomli-w>=1.0.0",
 ]
 
+[project.optional-dependencies]
+# cf_verify locates the Cloudflare checkbox visually, which needs opencv. It is
+# optional because everything else in the server works without it, and it is a
+# large dependency to impose on people who never touch a challenge page.
+cf = ["opencv-python>=4.10"]
+
 [project.urls]
 Homepage = "https://github.com/andresolbach/nodriver-mcp-server"
 Repository = "https://github.com/andresolbach/nodriver-mcp-server"

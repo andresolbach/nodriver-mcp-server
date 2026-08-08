@@ -8,6 +8,7 @@ exposing CDP/WebDriver fingerprints that get detected by anti-bot systems.
 
 import asyncio
 import base64
+import importlib.util
 import inspect
 import json
 import logging
@@ -468,6 +469,13 @@ _tracing_active = False
 _network_collection_enabled_tabs: set[tuple] = set()  # (target_id, session_id) with Network enabled
 _network_handler_targets: set[int] = set()  # id(tab) of tabs whose request handler is installed
 _frame_worlds: dict[tuple, Any] = {}  # (target_id, frame_id) -> isolated-world execution context
+_dialog_tracked_sessions: set[tuple] = set()  # (target_id, session_id) with Page enabled
+_dialog_handler_tabs: set[int] = set()  # id(tab) of tabs whose dialog handlers are installed
+_open_dialogs: dict[Any, dict] = {}  # target key -> the dialog currently blocking it
+_pointer_positions: dict[Any, tuple[float, float]] = {}  # target key -> last pointer position
+# cf_verify has to change the process working directory; serialise it so two
+# calls cannot swap it under each other.
+_CF_LOCK = asyncio.Lock()
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
 _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
@@ -885,6 +893,55 @@ def _request_timing(req: dict) -> str:
     if req.get("from_cache"):
         parts.append("cached")
     return " " + " ".join(parts) if parts else ""
+
+
+async def _auto_enable_dialog_tracking(tab: uc.Tab) -> None:
+    """Enable the Page domain so JavaScript dialogs can be answered at all.
+
+    A modal alert/confirm/prompt blocks the renderer, so every later call into the
+    page hangs until it is dismissed — and handle_dialog was the one call that
+    could not dismiss it, because Chrome only reports a dialog to a client that
+    enabled Page, and Page.enable was sent only from navigate_page. A tab reached
+    through new_page alone therefore answered "No dialog is showing" while being
+    wedged by one, with no way out but closing the tab.
+
+    Page.enable is not Runtime.enable: it does not expose the console-attached
+    debugger signal this server deliberately keeps off, and navigate_page has
+    always sent it anyway.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    session_id = getattr(tab, "session_id", None)
+    if not session_id:
+        return
+    key = (getattr(tab, "target_id", None), session_id)
+    if key in _dialog_tracked_sessions:
+        return
+    _dialog_tracked_sessions.add(key)
+
+    target = _target_key(tab)
+
+    async def _on_open(event: cdp_page.JavascriptDialogOpening):
+        try:
+            kind = getattr(event, "type_", None)
+            _open_dialogs[target] = {
+                "type": str(getattr(kind, "value", kind) or "dialog"),
+                "message": getattr(event, "message", "") or "",
+            }
+        except Exception:
+            pass
+
+    async def _on_closed(event: cdp_page.JavascriptDialogClosed):
+        _open_dialogs.pop(target, None)
+
+    try:
+        await tab.send(cdp_page.enable())
+        if id(tab) not in _dialog_handler_tabs:
+            tab.add_handler(cdp_page.JavascriptDialogOpening, _on_open)
+            tab.add_handler(cdp_page.JavascriptDialogClosed, _on_closed)
+            _dialog_handler_tabs.add(id(tab))
+    except Exception:
+        _dialog_tracked_sessions.discard(key)
 
 
 async def _enable_console_collection(tab: uc.Tab) -> bool:
@@ -2021,16 +2078,59 @@ async def cf_verify() -> str:
     or "Checking your browser before accessing". Drives nodriver's built-in
     verification bypass, which locates the checkbox visually and clicks it.
 
-    Requires opencv-python to be installed; without it this returns an error.
-    Many challenges also clear by themselves after a few seconds, so
-    wait_for(["some text from the real page"]) is worth trying first.
+    Needs opencv, which is an optional extra: install nodriver-mcp[cf], or this
+    reports that it is missing rather than failing obscurely. Many challenges
+    clear by themselves after a few seconds, so wait_for(["some text from the
+    real page"]) is worth trying first — and this says so when it looks at the
+    page and finds no challenge at all.
     """
+    if importlib.util.find_spec("cv2") is None:
+        return (
+            "Error: cf_verify needs opencv, which is not installed. Install it with "
+            "`pip install nodriver-mcp[cf]` (or `pip install opencv-python`). "
+            "Everything else in this server works without it — and a Cloudflare "
+            "interstitial often clears on its own, so try "
+            'wait_for(["text from the real page"]) first.'
+        )
+
     tab = await _active_tab()
     try:
-        await tab.verify_cf()
-        return "Cloudflare verification attempted."
-    except Exception as e:
-        return f"Error: {e}"
+        state = await _evaluate_value(tab, (
+            "(() => {"
+            " const t = (document.title || '').toLowerCase();"
+            " if (t.includes('just a moment') || t.includes('attention required')) return 'challenge';"
+            " if (document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')) return 'challenge';"
+            " if (document.querySelector('#cf-chl-widget, .cf-turnstile, #challenge-form')) return 'challenge';"
+            " return 'none'; })()"
+        ))
+    except Exception:
+        state = "unknown"
+    if state == "none":
+        return (
+            "No Cloudflare challenge is on this page — nothing to verify. If the "
+            "page still looks wrong, read it with get_page_content: a block page "
+            "that is not Cloudflare's needs a different answer."
+        )
+
+    # nodriver's verify_cf writes its screenshot and template into the process
+    # working directory, which for an stdio MCP server is the client's — often
+    # read-only, and never somewhere we should be writing. It swallows the
+    # resulting OSError and then fails opaquely, so give it a scratch directory.
+    async with _CF_LOCK:
+        previous = os.getcwd()
+        workdir = tempfile.mkdtemp(prefix="nodriver-cf-")
+        try:
+            os.chdir(workdir)
+            await tab.verify_cf()
+            return "Cloudflare verification attempted. Check the page before continuing."
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            try:
+                os.chdir(previous)
+            except Exception:
+                pass
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] | str:
@@ -2125,6 +2225,31 @@ async def _read_input_probe(tab: uc.Tab) -> int | None:
         return None
 
 
+async def _move_mouse(tab: uc.Tab, x: float, y: float, buttons: int = 0) -> None:
+    """Move the pointer to (x, y) from wherever it actually is.
+
+    nodriver's Tab.mouse_move interpolates from the viewport origin every single
+    time, firing mouseMoved along the whole diagonal — so every menu and tooltip
+    on that line opens on the way — and then ends with a mouseReleased, a stray
+    mouseup on the target that drag handles, sliders and canvas editors act on.
+    """
+    import nodriver.cdp.input_ as cdp_input
+
+    key = _target_key(tab)
+    last_x, last_y = _pointer_positions.get(key, (x, y))
+    button = cdp_input.MouseButton.LEFT if buttons else cdp_input.MouseButton.NONE
+    steps = 6 if (abs(x - last_x) + abs(y - last_y)) > 8 else 1
+    for i in range(1, steps + 1):
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mouseMoved",
+            x=last_x + (x - last_x) * i / steps,
+            y=last_y + (y - last_y) * i / steps,
+            button=button,
+            buttons=buttons,
+        ))
+    _pointer_positions[key] = (x, y)
+
+
 async def _input_delivery_note(tab: uc.Tab, armed: bool) -> str:
     """A warning when keystrokes were acknowledged but nothing received them.
 
@@ -2136,6 +2261,17 @@ async def _input_delivery_note(tab: uc.Tab, armed: bool) -> str:
         return ""
     if await _read_input_probe(tab) != 0:
         return ""
+    try:
+        dialog = _open_dialogs.get(_target_key(tab))
+    except Exception:
+        # This only annotates another tool's answer; it must never be the thing
+        # that turns a completed action into an error.
+        dialog = None
+    if dialog:
+        return (
+            f" — WARNING: nothing reached the page: a {dialog['type']} dialog is open"
+            " and blocking it. Call handle_dialog first."
+        )
     return (
         " — WARNING: no key event reached the page. The window may be occluded by"
         " another window, a JavaScript dialog may be open, or nothing focusable"
@@ -2566,18 +2702,48 @@ async def drag(
 ) -> str:
     """Drag one element onto another (press, move, release).
 
-    Both uids must come from the same take_snapshot. Works for native HTML5
-    drag-and-drop and for mouse-driven sortable lists.
+    Both uids must come from the same take_snapshot. Both ends are scrolled into
+    view and hit-tested first, and the pointer is moved in steps with the button
+    held, which is what mouse-driven sortables and sliders listen for.
 
-    Some JS drag libraries require a stream of intermediate mousemove events
-    that this does not emit; if a drag silently does nothing, drive it manually
-    with click_at and press_key instead.
+    This drives the mouse. Native HTML5 drag-and-drop — the dataTransfer kind —
+    is a separate protocol that a synthetic mouse does not trigger in Chrome; if
+    nothing happens on a page that uses it, that is why.
     """
     tab = await _active_tab()
+    import nodriver.cdp.input_ as cdp_input
+
     try:
-        src_x, src_y = await _get_box_model(tab, from_uid)
-        dst_x, dst_y = await _get_box_model(tab, to_uid)
-        await tab.mouse_drag((src_x, src_y), (dst_x, dst_y))
+        points = []
+        for uid in (from_uid, to_uid):
+            remote_obj = await _resolve_uid(tab, uid)
+            try:
+                import nodriver.cdp.dom as cdp_dom
+                await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
+            except Exception:
+                pass
+            point = await _clickable_point(tab, remote_obj)
+            if isinstance(point, str):
+                return (
+                    f"Error dragging: uid={uid} cannot be reached — {point}. "
+                    "Nothing was dragged."
+                )
+            points.append(point)
+        (src_x, src_y), (dst_x, dst_y) = points
+
+        await _move_mouse(tab, src_x, src_y)
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mousePressed", x=src_x, y=src_y,
+            button=cdp_input.MouseButton.LEFT, buttons=1, click_count=1
+        ))
+        # Holding the button down across the moves is the part nodriver's
+        # mouse_drag left out, and the part every sortable library watches for.
+        await _move_mouse(tab, dst_x, dst_y, buttons=1)
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mouseReleased", x=dst_x, y=dst_y,
+            button=cdp_input.MouseButton.LEFT, buttons=0, click_count=1
+        ))
+        await tab
         result = f"Dragged uid={from_uid} to uid={to_uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -3384,13 +3550,30 @@ async def handle_dialog(
     """
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
+
+    # A dialog blocks the renderer, so this must not be the call that discovers
+    # the Page domain was never enabled: Chrome reports a dialog only to a client
+    # that enabled it, and without that this answered "no dialog is showing"
+    # while being wedged by one.
+    await _auto_enable_dialog_tracking(tab)
+    pending = _open_dialogs.get(_target_key(tab))
     try:
         if action == "accept":
             await tab.send(cdp_page.handle_java_script_dialog(accept=True, prompt_text=prompt_text))
         else:
             await tab.send(cdp_page.handle_java_script_dialog(accept=False))
     except Exception as e:
+        if pending is None:
+            return (
+                "Error: no dialog is open on this page. If one opened before the "
+                "first navigation on this tab, it was not being tracked; the page "
+                f"may still be blocked by it. ({e})"
+            )
         return f"Error handling dialog (is one open?): {e}"
+    _open_dialogs.pop(_target_key(tab), None)
+    if pending:
+        detail = f' ({pending["type"]}: "{pending["message"][:120]}")' if pending.get("message") else ""
+        return f"Dialog {action}ed{detail}."
     return f"Dialog {action}ed."
 
 
@@ -3402,13 +3585,26 @@ async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
     reading what they reveal — pass include_snapshot=true to get the revealed
     content back in the same call.
 
-    Only moves the pointer; it does not scroll. If the element sits outside the
-    viewport, call scroll_to_selector first.
+    The element is scrolled into view and hit-tested first, the same way click
+    does it: a point that lands on a sticky header instead opens that header's
+    menu, not the one you asked for. If something covers the element, this says
+    what, rather than hovering the wrong thing.
     """
     tab = await _active_tab()
     try:
-        cx, cy = await _get_box_model(tab, uid)
-        await tab.mouse_move(cx, cy)
+        remote_obj = await _resolve_uid(tab, uid)
+        try:
+            import nodriver.cdp.dom as cdp_dom
+            await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
+        except Exception:
+            pass
+        point = await _clickable_point(tab, remote_obj)
+        if isinstance(point, str):
+            return (
+                f"Error hovering uid={uid}: {point}, so the pointer would land on "
+                "that instead. Dismiss or scroll past whatever is in the way."
+            )
+        await _move_mouse(tab, point[0], point[1])
         result = f"Hovered over uid={uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -3739,6 +3935,7 @@ async def navigate_page(
         await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
         # Auto-enable network collection on navigated tab.
         await _auto_enable_network_collection(tab)
+        await _auto_enable_dialog_tracking(tab)
         # Page.navigate does not touch nodriver's cached TargetInfo, and reading
         # tab.target.url straight after it can still report the previous URL.
         await _refresh_targets(await _get_browser())
@@ -3834,6 +4031,9 @@ async def new_page(
 
         # Auto-enable network collection on new tab.
         await _auto_enable_network_collection(tab)
+        # And the Page domain, or a modal dialog on this tab could never be
+        # answered — handle_dialog would report that none is showing.
+        await _auto_enable_dialog_tracking(tab)
 
         device_results: list[str] = []
         if device:

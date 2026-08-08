@@ -59,3 +59,31 @@ def test_the_probe_leaves_no_trace_on_the_page():
     standing out."""
     assert "globalThis.__ndInput" in server._PROBE_ARM
     assert "window." not in server._PROBE_ARM
+
+
+def test_cf_verify_says_what_is_missing_instead_of_failing_obscurely(monkeypatch):
+    """Regression: cf_verify could never run in a default install.
+
+    opencv was not a dependency at all — not even an optional one — so the
+    flagship anti-bot tool always failed, and its error came from inside nodriver
+    with nothing an agent could act on.
+    """
+    monkeypatch.setattr(server.importlib.util, "find_spec", lambda name: None)
+    out = asyncio.run(server.cf_verify())
+
+    assert "opencv" in out
+    assert "nodriver-mcp[cf]" in out, "the message must name the way to install it"
+    # And it must not leave the impression that the whole server is broken.
+    assert "Everything else in this server works without it" in out
+
+
+def test_the_cf_extra_is_declared():
+    """The install hint has to point at something that exists."""
+    import tomllib
+    from pathlib import Path
+
+    root = Path(server.__file__).resolve().parents[2]
+    data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"].get("optional-dependencies", {})
+    assert "cf" in extras, "pyproject declares no [cf] extra"
+    assert any("opencv" in dep for dep in extras["cf"]), extras["cf"]

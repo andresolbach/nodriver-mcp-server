@@ -739,3 +739,107 @@ def test_an_external_url_is_still_shown_in_full():
         assert "https://example.org/deep/path" in snap, f"external URL was mangled:\n{snap}"
 
     _run(scenario)
+
+
+def test_a_dialog_can_be_answered_on_a_tab_that_never_navigated():
+    """Regression: a modal dialog could wedge a tab with no way out.
+
+    A dialog blocks the renderer, so every later call into the page hangs until it
+    is dismissed — and handle_dialog was the one call that could not dismiss it.
+    Chrome reports a dialog only to a client that enabled the Page domain, and
+    Page.enable was sent only from navigate_page, so a tab reached through
+    new_page alone answered "No dialog is showing" while being blocked by one.
+    """
+
+    async def scenario():
+        await _call("new_page", url=(
+            "data:text/html,<button onclick=\"alert('blocking')\" "
+            "aria-label=Boom style='padding:30px'>Go</button>"
+        ))
+        snap = await _call("take_snapshot")
+        button = re.search(r'uid=(\S+) button "Boom"', snap).group(1)
+
+        # The click blocks in the renderer for as long as the alert is up, so it
+        # cannot be awaited — that is the whole shape of the bug.
+        clicking = asyncio.create_task(_call("click", uid=button))
+        await asyncio.sleep(1.5)
+
+        answered = await asyncio.wait_for(
+            _call("handle_dialog", action="accept"), timeout=20
+        )
+        assert "accepted" in answered, answered
+        assert "blocking" in answered, f"the dialog's own text was not reported:\n{answered}"
+
+        recovered = await asyncio.wait_for(
+            _call("evaluate_script", function="() => 'recovered'"), timeout=20
+        )
+        assert "recovered" in recovered, f"the page is still wedged:\n{recovered}"
+        await asyncio.gather(clicking, return_exceptions=True)
+
+    _run(scenario)
+
+
+_POINTER_PAGE = (
+    "data:text/html,<style>div{display:inline-block;width:120px;height:60px;"
+    "margin:4px;border:1px solid}</style>"
+    "<div id=a aria-label=A></div><div id=b aria-label=B></div><div id=c aria-label=C></div>"
+    "<script>window.seen=[];window.ups=0;window.downs=0;window.moves=0;"
+    "document.addEventListener('mousemove',()=>window.moves++);"
+    "for (const d of document.querySelectorAll('div')) {"
+    " d.addEventListener('mouseover',()=>window.seen.push(d.id));"
+    " d.addEventListener('mousedown',()=>window.downs++);"
+    " d.addEventListener('mouseup',()=>window.ups++); }</script>"
+)
+
+
+def test_hover_touches_only_its_target():
+    """Regression: hover walked the pointer from the viewport origin.
+
+    nodriver's Tab.mouse_move interpolates from (0, 0) every time, firing
+    mouseMoved along the whole diagonal — so every menu and tooltip on that line
+    opened on the way — and then sent a mouseReleased, a stray mouseup that drag
+    handles, sliders and canvas editors act on.
+    """
+
+    async def scenario():
+        await _call("new_page", url=_POINTER_PAGE)
+        snap = await _call("take_snapshot")
+        target = re.search(r'uid=(\S+) \S+ "C"', snap).group(1)
+
+        assert "Hovered" in await _call("hover", uid=target)
+
+        seen = await _call("evaluate_script", function="() => window.seen.join(',')")
+        assert "c" in seen, f"the target never saw the pointer:\n{seen}"
+        for other in ("a", "b"):
+            assert other not in seen, f"the pointer swept across {other}:\n{seen}"
+
+        ups = await _call("evaluate_script", function="() => window.ups")
+        assert "0" in ups, f"hover fired a mouseup:\n{ups}"
+
+    _run(scenario)
+
+
+def test_drag_holds_the_button_down_across_the_move():
+    """Regression: drag went through nodriver's mouse_drag, which never holds the
+    button while moving — the one thing every mouse-driven sortable listens for.
+    Both ends are also hit-tested now, so a covered target fails instead of
+    dragging onto whatever was on top of it."""
+
+    async def scenario():
+        await _call("new_page", url=_POINTER_PAGE)
+        snap = await _call("take_snapshot")
+        src = re.search(r'uid=(\S+) \S+ "A"', snap).group(1)
+        dst = re.search(r'uid=(\S+) \S+ "C"', snap).group(1)
+
+        assert "Dragged" in await _call("drag", from_uid=src, to_uid=dst)
+
+        downs = await _call("evaluate_script", function="() => window.downs")
+        ups = await _call("evaluate_script", function="() => window.ups")
+        moves = await _call("evaluate_script", function="() => window.moves")
+        assert "1" in downs, f"no mousedown on the source:\n{downs}"
+        assert "1" in ups, f"no mouseup on the target:\n{ups}"
+        assert int(re.search(r"(\d+)", moves).group(1)) > 1, (
+            f"the pointer jumped instead of moving:\n{moves}"
+        )
+
+    _run(scenario)
