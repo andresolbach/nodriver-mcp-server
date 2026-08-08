@@ -239,3 +239,103 @@ def test_a_selector_that_cannot_parse_is_reported_not_treated_as_a_hit():
         assert "Timeout" in real, real
 
     _run(scenario)
+
+
+def test_a_response_body_can_actually_be_retrieved():
+    """Regression: Network.getResponseBody failed for 100% of requests.
+
+    Network.enable was sent with no buffer sizes, so Chrome retained no resource
+    bodies at all and answered "No resource with given identifier found" even for
+    a request issued a second earlier — the documented flagship workflow, find
+    the page's own API call and read the JSON it already received, could never
+    work. The guard was also keyed on id(tab), which does not change when the CDP
+    session under it does, so the one call that mattered was skipped.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://httpbingo.org/")
+        await _call(
+            "evaluate_script",
+            function="async () => { const r = await fetch('/json'); return (await r.text()).length; }",
+        )
+        await asyncio.sleep(0.5)
+
+        listing = await _call("list_network_requests", resource_types=["Fetch"])
+        match = re.search(r"\[(\d+)\] GET \S+/json", listing)
+        assert match, f"the fetch was not captured:\n{listing}"
+
+        body = await _call("get_network_request", reqid=int(match.group(1)))
+        assert "-32000" not in body, f"body still unavailable:\n{body}"
+        assert "slideshow" in body, f"body did not contain the JSON:\n{body[:400]}"
+
+    _run(scenario)
+
+
+def test_block_resources_actually_blocks_across_a_navigation():
+    """Regression: it reported success while every image still loaded.
+
+    setBlockedURLs is a Network-domain command and is ignored when the domain is
+    not enabled on the session it is sent to.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+        await _call("block_resources", types=["image"])
+        await _call("navigate_page", url="https://books.toscrape.com/")
+
+        counts = await _call("evaluate_script", function=(
+            "() => { const a = [...document.images]; "
+            "return a.length + ':' + a.filter(i => i.naturalWidth > 0).length; }"
+        ))
+        total, loaded = re.search(r"(\d+):(\d+)", counts).groups()
+        assert int(total) > 0, f"no images on the page to block:\n{counts}"
+        assert int(loaded) == 0, f"{loaded} of {total} images still loaded:\n{counts}"
+
+    _run(scenario)
+
+
+def test_a_trace_survives_a_navigation():
+    """Regression: Tracing.end answered "Tracing is not started".
+
+    nodriver re-attached after every navigation, minting a new CDP session, so
+    the trace started on the old one was unreachable — and recording a page load
+    is the whole point of the tool. Traces were also always empty because
+    Tracing.start asked for ReturnAsStream while only dataCollected was read.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+        await _call("performance_start_trace", reload_page=False, auto_stop=False)
+        await _call("navigate_page", url="https://example.org")
+
+        trace = await _call("performance_stop_trace")
+        match = re.search(r"(\d+) events collected", trace)
+        assert match, f"stop_trace did not report a count:\n{trace}"
+        assert int(match.group(1)) > 0, f"trace was empty:\n{trace}"
+
+    _run(scenario)
+
+
+def test_a_navigation_that_fails_is_reported_as_a_failure():
+    """Regression: nodriver discards Page.navigate's errorText, so a dead domain
+    came back as a successful navigation and the agent scraped the previous page.
+
+    An HTTP error status is deliberately not a failure: a 404 that comes with a
+    body is a page, and reading it is often the point.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+
+        dead = await _call(
+            "navigate_page", url="https://this-domain-truly-does-not-exist-xyz42.invalid"
+        )
+        assert "ERR_NAME_NOT_RESOLVED" in dead or "failed" in dead.lower(), dead
+
+        found = await _call(
+            "navigate_page", url="https://the-internet.herokuapp.com/does-not-exist"
+        )
+        assert "Error" not in found.split("\n")[0], f"a 404 with a body must load:\n{found}"
+        assert "Not Found" in await _call("get_page_content", max_chars=200)
+
+    _run(scenario)

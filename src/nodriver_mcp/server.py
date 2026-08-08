@@ -465,7 +465,8 @@ _network_requests: list[dict] = []
 _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
-_network_collection_enabled_tabs: set[int] = set()  # track which tabs have network collection enabled
+_network_collection_enabled_tabs: set[tuple] = set()  # (target_id, session_id) with Network enabled
+_network_handler_targets: set = set()  # targets whose RequestWillBeSent handler is installed
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
 _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
@@ -590,13 +591,24 @@ def _preserve_on_navigation() -> None:
 # Auto-collection for network (console collection is explicit)
 # ---------------------------------------------------------------------------
 async def _auto_enable_network_collection(tab: uc.Tab) -> None:
-    """Auto-enable network event collection on a tab."""
-    tab_id = id(tab)
-    if tab_id in _network_collection_enabled_tabs:
-        return
-    _network_collection_enabled_tabs.add(tab_id)
+    """Enable network collection on this tab's current CDP session.
 
+    Keyed by (target, session) rather than by the Tab object. Network.enable is a
+    per-session command, and id(tab) does not change when the session under it
+    does — so the guard used to skip the one call that mattered, leaving the
+    domain enabled only on a session nobody was talking to any more. Measured
+    symptom: get_network_request could not retrieve a single response body, and
+    block_resources reported success while every image still loaded.
+    """
     import nodriver.cdp.network as cdp_net
+
+    session_key = (getattr(tab, "target_id", None), getattr(tab, "session_id", None))
+    if session_key in _network_collection_enabled_tabs:
+        return
+    _network_collection_enabled_tabs.add(session_key)
+    # The event handler belongs to the target, not the session: adding it again
+    # after a session change would record every request twice.
+    needs_handler = getattr(tab, "target_id", None) not in _network_handler_targets
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
         global _request_counter
@@ -620,10 +632,23 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             pass
 
     try:
-        await tab.send(cdp_net.enable())
-        tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+        # The buffer sizes are the whole reason get_network_request could not
+        # return a response body: with them omitted Chrome keeps no resource
+        # bodies, so Network.getResponseBody answered "No resource with given
+        # identifier found" for every request, including one issued a second
+        # earlier. DevTools itself passes these. Measured: without them 0 of 3
+        # bodies were retrievable, with them the same JSON came back in full.
+        await tab.send(
+            cdp_net.enable(
+                max_total_buffer_size=50_000_000,
+                max_resource_buffer_size=10_000_000,
+            )
+        )
+        if needs_handler:
+            tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+            _network_handler_targets.add(getattr(tab, "target_id", None))
     except Exception:
-        pass
+        _network_collection_enabled_tabs.discard(session_key)
 
 
 async def _enable_console_collection(tab: uc.Tab) -> bool:
@@ -1332,6 +1357,59 @@ async def _open_new_tab(
     tab = await _await_with_timeout(browser.get(url, new_tab=True), timeout, "Open new page")
     await _await_with_timeout(tab, timeout, "Wait for new page")
     return tab
+
+
+async def _navigate_same_tab(tab: uc.Tab, target_url: str) -> str:
+    """Navigate this tab over CDP, without nodriver's re-attach.
+
+    Tab.get() delegates to Browser.get(), which navigates the *first* page target
+    rather than self, and then calls connection.attach() again. That mints a brand
+    new CDP session for the same target and never detaches the old one, so every
+    domain this server enabled belongs to a stranded session while commands go to
+    a session where nothing was ever enabled. Tracing.end answered "Tracing is not
+    started", Network.getResponseBody could not find any request, and every
+    reset/clear/disable call wrote into the orphan.
+
+    Page.navigate resolves once the navigation has committed or failed, so the
+    document is already the new one by the time this returns, and errorText and
+    isDownload — both discarded by nodriver — become visible.
+
+    Returns a note to append to the tool's answer, or "".
+    """
+    import nodriver.cdp.page as cdp_page
+
+    frame_id, loader_id, error_text, is_download = await tab.send(
+        cdp_page.navigate(url=target_url)
+    )
+    if is_download:
+        return " (the URL was a download, not a page; the tab did not change)"
+    if error_text:
+        # Chrome reports an HTTP error status with no body as a navigation
+        # failure, but the navigation committed and the page is readable — a 404
+        # page is a page. Only a transport-level failure means there is nothing
+        # there, and that is what deserves to be an error.
+        if "ERR_HTTP_RESPONSE_CODE_FAILURE" in error_text:
+            return (
+                " (no page was loaded: the server answered with an HTTP error status"
+                " and an empty body, so Chrome showed its own error page. An error"
+                " status that does come with a body renders normally.)"
+            )
+        raise RuntimeError(f"navigation failed: {error_text}")
+
+    # Wait for the new document to be usable, but never for its subresources: a
+    # page with one hanging image is still readable, and blocking on the load
+    # event would turn a two-second call into a thirty-second one.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while loop.time() - start < 5.0:
+        try:
+            state = await _evaluate_value(tab, "document.readyState")
+        except Exception:
+            state = None
+        if state in ("interactive", "complete"):
+            break
+        await asyncio.sleep(0.05)
+    return ""
 
 
 async def _refresh_targets(browser: uc.Browser) -> None:
@@ -2383,6 +2461,9 @@ async def get_network_request(
     listed while its body is already gone.
     """
     tab = await _active_tab()
+    # getResponseBody is a Network-domain command: without the domain enabled on
+    # *this* session Chrome holds no body to give back.
+    await _auto_enable_network_collection(tab)
     import nodriver.cdp.network as cdp_net
 
     if reqid is None:
@@ -2787,12 +2868,14 @@ async def navigate_page(
     if init_script:
         await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=init_script))
 
+    note = ""
+
     async def _navigate() -> None:
+        nonlocal note
         if type == "url":
             if not url:
                 raise ValueError("URL is required for type=url.")
-            await tab.get(url)
-            await tab
+            note = await _navigate_same_tab(tab, url)
         elif type == "back":
             await tab.back()
             await tab
@@ -2811,9 +2894,12 @@ async def navigate_page(
         await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
         # Auto-enable network collection on navigated tab.
         await _auto_enable_network_collection(tab)
+        # Page.navigate does not touch nodriver's cached TargetInfo, and reading
+        # tab.target.url straight after it can still report the previous URL.
+        await _refresh_targets(await _get_browser())
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
-        return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{pages}"
+        return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{note}{pages}"
     except Exception as e:
         return f"Error: {e}"
     finally:
@@ -4492,6 +4578,10 @@ async def block_resources(
             patterns.extend(f"*.{ext}*" for ext in _RESOURCE_EXTS[key])
         elif key:
             unknown.append(t)
+    # setBlockedURLs is a Network-domain command and is silently ignored when the
+    # domain is not enabled on this session — which is how block_resources could
+    # report success while every image still loaded.
+    await _auto_enable_network_collection(tab)
     await tab.send(cdp_net.set_blocked_ur_ls(urls=patterns))
     if not valid:
         base = "Resource blocking disabled (all resources allowed)."

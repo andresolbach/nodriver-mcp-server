@@ -10,22 +10,48 @@ load, and one site out of eight that simply blocked it. Everything below is the
 layer on top of that, where the recurring defect was not a missing feature but a
 tool answering "done" when nothing had happened.
 
-### One upstream call explained six of them
+### Navigation no longer churns the CDP session
 
-`navigate_page` goes through nodriver's `Tab.get()`, and `Browser.get()` calls
-`connection.attach()` again after every navigation: a new CDP session on the same
-target, with the old one never detached. Commands then go to the new session,
-while events keep arriving over the old one — and nodriver's dispatcher matches
-on event type without looking at `sessionId`, so collection keeps working and
-everything *looks* healthy.
+`navigate_page` went through nodriver's `Tab.get()`, which delegates to
+`Browser.get()` — and that navigates the *first* page target rather than the tab
+it was called on, then calls `connection.attach()` again. Every navigation minted
+a brand new CDP session for the same target and never detached the old one, so
+each domain this server had enabled belonged to a stranded session while commands
+went to a session where nothing was ever enabled. nodriver's event dispatcher
+matches on event type without looking at `sessionId`, so events kept arriving and
+everything *looked* healthy.
 
-That is why `get_network_request` could not return a response body for any
-request (100% `-32000 No resource with given identifier found`), why
-`block_resources` blocked nothing, why `reset_emulation` and
-`disable_console_collection` had no effect after the first navigation, and why a
-long scrape accumulates one stranded inspector session per navigation. The
-navigation path is not rewritten in this release; the repairs below are the ones
-that stand on their own, and the session churn is the next piece of work.
+Same-tab navigation now sends `Page.navigate` directly and waits for the new
+document to be usable. `Tab.back`, `forward` and `reload` were already sending on
+the right connection and are untouched. Measured: the session id is now identical
+before and after a navigation, `performance_stop_trace` stopped answering
+"Tracing is not started", and `reset_emulation` and `disable_console_collection`
+take effect after a navigation instead of writing into an orphan.
+
+Two things fall out of it that nodriver was discarding. `Page.navigate` returns
+`errorText`, so a domain that does not resolve is now an error instead of a
+success on the previous page; and it returns `isDownload`, so a URL that turns
+out to be a download says so rather than reporting a navigation that did not
+happen. An HTTP error *status* is deliberately not treated as a failure — a 404
+that comes with a body is a page, and reading it is usually the point. A 404 with
+an empty body is the one case Chrome refuses outright, and the response says so.
+
+### Response bodies work now, which was a second cause
+
+Removing the session churn was not enough: `Network.enable` was sent with no
+buffer sizes, so Chrome retained no resource bodies whatsoever and
+`Network.getResponseBody` answered `-32000 No resource with given identifier
+found` for every request, including one issued a second earlier. DevTools passes
+these sizes; this now passes 50 MB total and 10 MB per resource. Measured: 0 of 3
+bodies retrievable before, the full JSON after.
+
+The same call was also guarded on `id(tab)`, which does not change when the CDP
+session under it does, so the guard reliably skipped the one call that mattered.
+It is keyed on `(target, session)` now, with the event handler still registered
+once per target so nothing is recorded twice. That is also why `block_resources`
+could report success while every image loaded: `setBlockedURLs` is a
+Network-domain command and is ignored when the domain is not enabled on the
+session it is sent to.
 
 ### Fixed
 
@@ -81,7 +107,8 @@ that stand on their own, and the session churn is the next piece of work.
 - **Performance traces were always empty.** `Tracing.start` asked for
   `ReturnAsStream` while `stop_trace` only listens for `Tracing.dataCollected`,
   which that transfer mode never emits. It uses `ReportEvents`, and says so when a
-  trace is empty rather than quietly not writing the file it was given.
+  trace is empty rather than quietly not writing the file it was given. Measured
+  on one page: 0 events before, 18 655 after.
 - **`take_snapshot`'s 200 000-character cap applied to `file_path` too**, so the
   escape hatch for a page too large to read inline was capped at the same size and
   a big page could not be read in full by any means. The cap is inline only now,
@@ -129,12 +156,18 @@ Chromes. Seven of the audit's eighteen agents never got a browser at all.
 
 ### Tests
 
-Ten new regression tests, each of which fails against the previous release: five
-on the registry's bookkeeping with a stub worker, four that need a real Chrome
-(the session round trip, the JSON shape and the unparseable selector), and one
-pure data check that no device preset ships its own q-values. The existing suite
-is a schema-and-drift contract and would have caught none of the defects above,
-which is the point of the new browser-level ones.
+Fifteen new regression tests, every one of which fails against the previous
+release: six on the registry's bookkeeping with a stub worker (including one that
+would hang forever if the reclaim sweep waited on another name's lock), eight
+that need a real Chrome — the session round trip, the JSON shape, the unparseable
+selector, response-body retrieval, resource blocking across a navigation, a trace
+across a navigation and a navigation that genuinely fails — and one pure data
+check that no device preset ships its own q-values.
+
+The existing suite is a schema-and-drift contract and would have caught none of
+the defects above; it asserts that the prose and the signatures agree, which is
+worth having and is not the same thing as asserting that a tool does what it
+says. Every defect in this release was of the second kind.
 
 Tool count: 61 -> 61.
 
