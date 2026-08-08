@@ -706,6 +706,98 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         except Exception:
             pass
 
+    def _socket(request_id: Any) -> dict | None:
+        wanted = str(request_id)
+        for rec in reversed(_network_requests):
+            if rec["id"] == wanted and rec["type"] == "WebSocket":
+                return rec
+        return None
+
+    def _add_frame(request_id: Any, direction: str, event: Any) -> None:
+        rec = _socket(request_id)
+        if rec is None:
+            return
+        frame = getattr(event, "response", None)
+        opcode = getattr(frame, "opcode", None)
+        payload = getattr(frame, "payload_data", "") or ""
+        rec["frames"].append({
+            "dir": direction,
+            # opcode 1 is text; anything else is base64 binary, and saying which
+            # matters because the payload is unreadable otherwise.
+            "kind": "text" if opcode == 1 else f"opcode {opcode:g}" if opcode else "?",
+            "data": payload[:_WS_PAYLOAD_CHARS],
+            "truncated": len(payload) > _WS_PAYLOAD_CHARS,
+        })
+        rec["frames_sent" if direction == "sent" else "frames_received"] += 1
+        if len(rec["frames"]) > _WS_FRAME_CAP:
+            rec["frames"].pop(0)
+            rec["frames_dropped"] += 1
+
+    async def _on_ws_created(event: cdp_net.WebSocketCreated):
+        global _request_counter
+        try:
+            _network_requests.append({
+                "seq": _request_counter,
+                "id": str(event.request_id),
+                "url": event.url,
+                "method": "GET",
+                "timestamp": "",
+                "type": "WebSocket",
+                "status": None, "status_text": "", "mime_type": "",
+                "response_headers": {}, "from_cache": False, "size": None,
+                "duration_ms": None, "failed": None, "redirect_to": None,
+                "frames": [], "frames_sent": 0, "frames_received": 0,
+                "frames_dropped": 0, "closed": False,
+            })
+            _request_counter += 1
+            if len(_network_requests) > 1000:
+                _network_requests.pop(0)
+        except Exception:
+            pass
+
+    async def _on_ws_handshake(event: cdp_net.WebSocketHandshakeResponseReceived):
+        try:
+            rec = _socket(event.request_id)
+            if rec is None:
+                return
+            r = event.response
+            rec["status"] = getattr(r, "status", None)
+            rec["status_text"] = getattr(r, "status_text", "") or ""
+            headers = getattr(r, "headers", None)
+            if headers:
+                rec["response_headers"] = {str(k): str(v) for k, v in dict(headers).items()}
+        except Exception:
+            pass
+
+    async def _on_ws_sent(event: cdp_net.WebSocketFrameSent):
+        try:
+            _add_frame(event.request_id, "sent", event)
+        except Exception:
+            pass
+
+    async def _on_ws_received(event: cdp_net.WebSocketFrameReceived):
+        try:
+            _add_frame(event.request_id, "recv", event)
+        except Exception:
+            pass
+
+    async def _on_ws_closed(event: cdp_net.WebSocketClosed):
+        try:
+            rec = _socket(event.request_id)
+            if rec is not None:
+                rec["closed"] = True
+        except Exception:
+            pass
+
+    async def _on_ws_error(event: cdp_net.WebSocketFrameError):
+        try:
+            rec = _socket(event.request_id)
+            if rec is not None:
+                rec["failed"] = True
+                rec["status_text"] = getattr(event, "error_message", "") or "frame error"
+        except Exception:
+            pass
+
     async def _on_failed(event: cdp_net.LoadingFailed):
         try:
             rec = _latest(event.request_id)
@@ -737,6 +829,12 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             tab.add_handler(cdp_net.ResponseReceived, _on_response)
             tab.add_handler(cdp_net.LoadingFinished, _on_finished)
             tab.add_handler(cdp_net.LoadingFailed, _on_failed)
+            tab.add_handler(cdp_net.WebSocketCreated, _on_ws_created)
+            tab.add_handler(cdp_net.WebSocketHandshakeResponseReceived, _on_ws_handshake)
+            tab.add_handler(cdp_net.WebSocketFrameSent, _on_ws_sent)
+            tab.add_handler(cdp_net.WebSocketFrameReceived, _on_ws_received)
+            tab.add_handler(cdp_net.WebSocketClosed, _on_ws_closed)
+            tab.add_handler(cdp_net.WebSocketFrameError, _on_ws_error)
             _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
@@ -765,7 +863,19 @@ def _request_outcome(req: dict) -> str:
     return str(status)
 
 
+# A chatty socket would otherwise grow without bound in a long session.
+_WS_FRAME_CAP = 200
+_WS_PAYLOAD_CHARS = 2000
+
+
 def _request_timing(req: dict) -> str:
+    if req.get("type") == "WebSocket":
+        parts = [f"{req.get('frames_sent', 0)} sent", f"{req.get('frames_received', 0)} recv"]
+        if req.get("frames_dropped"):
+            parts.append(f"{req['frames_dropped']} dropped")
+        if req.get("closed"):
+            parts.append("closed")
+        return " " + " ".join(parts)
     parts = []
     if req.get("duration_ms") is not None:
         parts.append(f"{req['duration_ms']:g}ms")
@@ -2907,6 +3017,23 @@ async def get_network_request(
         lines.append(f"  Response headers ({len(headers)}):")
         for key in sorted(headers):
             lines.append(f"    {key}: {headers[key][:200]}")
+
+    if req.get("type") == "WebSocket":
+        frames = req.get("frames") or []
+        if req.get("frames_dropped"):
+            lines.append(
+                f"  Frames: showing the last {len(frames)}; "
+                f"{req['frames_dropped']} older one(s) dropped."
+            )
+        else:
+            lines.append(f"  Frames ({len(frames)}):")
+        for frame in frames:
+            arrow = "->" if frame["dir"] == "sent" else "<-"
+            suffix = " …(truncated)" if frame.get("truncated") else ""
+            kind = "" if frame["kind"] == "text" else f" [{frame['kind']}]"
+            lines.append(f"    {arrow}{kind} {frame['data']}{suffix}")
+        # There is no response body for a socket, so stop before asking for one.
+        return "\n".join(lines)
 
     try:
         request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))

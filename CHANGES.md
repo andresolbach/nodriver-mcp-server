@@ -144,6 +144,21 @@ the entry that caused it. A response that arrived outranks a later transport
 error, because Chrome aborts the body of a `fetch()` nobody reads — reporting that
 as FAILED hid the 500 the caller was looking for.
 
+### WebSockets are visible
+
+`WebSocket` was an offered value of `resource_types` that could never match,
+because nothing subscribed to any `Network.webSocket*` event. A live socket
+produced no entries at all, so on a real-time site the actual data channel was
+the one thing the server could not see — and the only workaround, an
+`init_script` shim replacing `window.WebSocket`, de-natives the API and
+undermines the stealth this server exists for.
+
+Sockets are recorded with their handshake status and response headers, and their
+frames with direction, text-or-binary opcode and payload. `list_network_requests`
+shows the sent/received counts; `get_network_request` prints the frames. Payloads
+are capped at 2000 characters and each socket keeps its last 200 frames, with the
+number dropped reported rather than silently forgotten.
+
 ### Forms know what kind of control they are talking to
 
 `_fill_element` branched on `tagName` and never read `input.type` — `this.type`

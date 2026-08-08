@@ -535,3 +535,42 @@ def test_the_network_log_distinguishes_outcomes():
         assert "Transfer:" in detail, f"no timing/size:\n{detail}"
 
     _run(scenario)
+
+
+def test_websocket_traffic_is_captured_with_its_frames():
+    """Regression: WebSocket was an offered resource_types value that never matched.
+
+    Nothing subscribed to any Network.webSocket* event, so a live socket produced
+    no entries at all — for a real-time site the actual data channel was invisible,
+    and the only workaround was an init_script shim replacing window.WebSocket,
+    which de-natives the API and undermines the stealth the server exists for.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://httpbingo.org/")
+        sent = await _call("evaluate_script", function=(
+            "async () => {"
+            " const ws = new WebSocket('wss://httpbingo.org/websocket/echo');"
+            " await new Promise(r => ws.onopen = r);"
+            " ws.send('audit-one'); ws.send('audit-two');"
+            " await new Promise(r => setTimeout(r, 500));"
+            " ws.close();"
+            " return 'done'; }"
+        ))
+        assert "done" in sent, f"the socket never opened:\n{sent}"
+        await asyncio.sleep(1.5)
+
+        listing = await _call("list_network_requests", resource_types=["WebSocket"])
+        assert "websocket/echo" in listing, f"no socket in the log:\n{listing}"
+        assert "101" in listing, f"no handshake status:\n{listing}"
+        assert "2 sent" in listing and "2 recv" in listing, f"frames not counted:\n{listing}"
+
+        match = re.search(r"\[(\d+)\] \S+ GET wss://", listing)
+        assert match, listing
+        detail = await _call("get_network_request", reqid=int(match.group(1)))
+        assert "audit-one" in detail and "audit-two" in detail, f"no frame payloads:\n{detail}"
+        assert "->" in detail and "<-" in detail, f"frame direction missing:\n{detail}"
+        # An echo server sends back what it received, so both directions appear.
+        assert detail.count("audit-one") == 2, f"expected it sent and echoed:\n{detail}"
+
+    _run(scenario)
