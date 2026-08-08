@@ -81,6 +81,38 @@ def test_cf_verify_says_what_is_missing_instead_of_failing_obscurely(monkeypatch
     assert "Everything else in this server works without it" in out
 
 
+def test_a_failed_attach_names_the_cause(monkeypatch):
+    """Regression: a failed attach returned the bare connection error.
+
+    Chrome refuses the debugging port when --user-data-dir is its own default
+    directory — measured on 151: the browser starts, reports nothing, and no port
+    ever opens. All the tool said was that the connection was refused, which sends
+    you checking the port number, the one thing that was right.
+    """
+
+    async def no_browser():
+        raise OSError("Connect call failed ('127.0.0.1', 9222)")
+
+    # monkeypatch restores these, so the failure path's own writes to them do not
+    # leak into the next test.
+    monkeypatch.setattr(server, "_connect_disabled", False)
+    monkeypatch.setattr(server, "_connect_host", None)
+    monkeypatch.setattr(server, "_connect_port", None)
+    monkeypatch.setattr(server, "_stop_browser", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(server, "_get_browser", no_browser)
+
+    with pytest.raises(server.ToolFailure) as excinfo:
+        asyncio.run(server.use_running_browser(port=9222))
+    out = str(excinfo.value)
+
+    assert "--user-data-dir" in out, "the message has to name the actual cause"
+    assert "default directory" in out
+    assert "9222" in out, "and which endpoint it tried"
+    # The original error stays: it is the only part that can point at a different
+    # cause than the one guessed here.
+    assert "Connect call failed" in out
+
+
 def test_the_cf_extra_is_declared():
     """The install hint has to point at something that exists."""
     import tomllib

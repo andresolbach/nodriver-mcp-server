@@ -1219,6 +1219,13 @@ The user starts Chrome themselves, once:
 then this tool attaches to it. Every tool then acts on that browser and its
 real tabs.
 
+`--user-data-dir` is not optional, and it must not be Chrome's own default
+directory. Since Chrome 136 the port is refused there — Chrome starts
+normally, says nothing, and nothing ever listens, which is a confusing way
+to fail. So the everyday profile cannot be reached by adding the flag to
+it; it has to be a directory of its own, and a copy of an existing profile
+is accepted (`--profile-directory` then picks which profile inside it).
+
 SECURITY: that profile becomes part of the agent's reach. Whatever it is
 signed into — mail, bank, company systems — is reachable from here, because
 a cookie jar is all or nothing. Point this at a profile you are willing to
