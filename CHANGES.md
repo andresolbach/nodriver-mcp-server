@@ -124,6 +124,26 @@ session it is sent to.
   renderer, a detached execution context and an open JS dialog all looked like
   "not there yet". The timeout now carries the last error it hit.
 
+### The network log says what happened
+
+Only `Network.requestWillBeSent` was ever subscribed, so nothing from the
+response side was collected. A 500, a 404, a redirect, a transport failure and a
+request still in flight all rendered as the same line — in the one tool whose job
+is telling you which request went wrong.
+
+`responseReceived`, `loadingFinished` and `loadingFailed` are collected too, so
+each entry now carries its status, status text, content type, response headers,
+transfer size, duration and whether it came from cache. `list_network_requests`
+leads with the outcome (`500`, `302->`, `FAILED(net::ERR_...)`, or `pending` for a
+request that has genuinely not answered yet) and `get_network_request` lists the
+response headers.
+
+A redirect arrives as a second `requestWillBeSent` for the same request id, so a
+chain used to look like unrelated repeated requests; the hop is recorded against
+the entry that caused it. A response that arrived outranks a later transport
+error, because Chrome aborts the body of a `fetch()` nobody reads — reporting that
+as FAILED hid the 500 the caller was looking for.
+
 ### Forms know what kind of control they are talking to
 
 `_fill_element` branched on `tagName` and never read `input.type` — `this.type`

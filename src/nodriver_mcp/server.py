@@ -634,10 +634,88 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                 "method": event.request.method,
                 "timestamp": str(event.timestamp),
                 "type": str(resource_type),
+                # Filled in by the response-side handlers below. Until then the
+                # request is genuinely still in flight, and saying so is the point:
+                # a pending request and a completed 200 used to look identical.
+                "status": None,
+                "status_text": "",
+                "mime_type": "",
+                "response_headers": {},
+                "from_cache": False,
+                "size": None,
+                "duration_ms": None,
+                "failed": None,
+                "redirect_to": None,
             })
+            # A redirect arrives as another requestWillBeSent for the SAME request
+            # id, carrying the response that caused it. Record where it went, so a
+            # 301 chain is visible instead of looking like repeated requests.
+            redirect = getattr(event, "redirect_response", None)
+            if redirect is not None:
+                for rec in reversed(_network_requests[:-1]):
+                    if rec["id"] == str(event.request_id) and rec["status"] is None:
+                        rec["status"] = getattr(redirect, "status", None)
+                        rec["status_text"] = getattr(redirect, "status_text", "") or ""
+                        rec["redirect_to"] = event.request.url
+                        break
             _request_counter += 1
             if len(_network_requests) > 1000:
                 _network_requests.pop(0)
+        except Exception:
+            pass
+
+    def _latest(request_id: Any) -> dict | None:
+        """The most recent record for this request id that is still open."""
+        wanted = str(request_id)
+        for rec in reversed(_network_requests):
+            if rec["id"] == wanted and rec.get("redirect_to") is None:
+                return rec
+        return None
+
+    async def _on_response(event: cdp_net.ResponseReceived):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            r = event.response
+            rec["status"] = getattr(r, "status", None)
+            rec["status_text"] = getattr(r, "status_text", "") or ""
+            rec["mime_type"] = getattr(r, "mime_type", "") or ""
+            rec["from_cache"] = bool(getattr(r, "from_disk_cache", False))
+            headers = getattr(r, "headers", None)
+            if headers:
+                # CDP Headers is a dict subclass; copy so later mutation cannot
+                # reach into the event object.
+                rec["response_headers"] = {str(k): str(v) for k, v in dict(headers).items()}
+            timing = getattr(r, "timing", None)
+            if timing is not None:
+                rec["_request_time"] = getattr(timing, "request_time", None)
+        except Exception:
+            pass
+
+    async def _on_finished(event: cdp_net.LoadingFinished):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            rec["size"] = int(getattr(event, "encoded_data_length", 0) or 0)
+            rec["failed"] = False
+            start = rec.get("_request_time")
+            if start:
+                rec["duration_ms"] = round((float(event.timestamp) - float(start)) * 1000, 1)
+        except Exception:
+            pass
+
+    async def _on_failed(event: cdp_net.LoadingFailed):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            rec["failed"] = True
+            rec["status_text"] = (
+                getattr(event, "error_text", "") or "" ) or rec.get("status_text", "")
+            if getattr(event, "canceled", False):
+                rec["status_text"] = (rec["status_text"] + " (canceled)").strip()
         except Exception:
             pass
 
@@ -656,9 +734,46 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         )
         if needs_handler:
             tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+            tab.add_handler(cdp_net.ResponseReceived, _on_response)
+            tab.add_handler(cdp_net.LoadingFinished, _on_finished)
+            tab.add_handler(cdp_net.LoadingFailed, _on_failed)
             _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
+
+
+def _request_outcome(req: dict) -> str:
+    """A short verdict for one request, so failures are visible at a glance.
+
+    A 500, a 404, a redirect, a DNS failure and a request still in flight used to
+    render as identical lines, which made the network log useless for the one job
+    it has: telling you which request went wrong.
+    """
+    status = req.get("status")
+    # A response that arrived outranks a later transport error. An unconsumed
+    # fetch body is aborted by Chrome as a matter of course, and reporting that
+    # as FAILED hid the 500 the caller was actually looking for.
+    if status is None:
+        if req.get("failed"):
+            return f"FAILED({req.get('status_text') or 'error'})"
+        return "pending"
+    if req.get("redirect_to"):
+        # ASCII on purpose: this string can end up on a cp1252 Windows console.
+        return f"{status}->"
+    if req.get("failed"):
+        return f"{status} (body incomplete)"
+    return str(status)
+
+
+def _request_timing(req: dict) -> str:
+    parts = []
+    if req.get("duration_ms") is not None:
+        parts.append(f"{req['duration_ms']:g}ms")
+    if req.get("size"):
+        parts.append(f"{req['size']}B")
+    if req.get("from_cache"):
+        parts.append("cached")
+    return " " + " ".join(parts) if parts else ""
 
 
 async def _enable_console_collection(tab: uc.Tab) -> bool:
@@ -2767,6 +2882,32 @@ async def get_network_request(
     lines.append(f"  Method: {req['method']}")
     lines.append(f"  Type: {req['type']}")
 
+    status = req.get("status")
+    if status is None and req.get("failed"):
+        lines.append(f"  Outcome: FAILED — {req.get('status_text') or 'network error'}")
+    elif status is None:
+        lines.append("  Outcome: still in flight (no response yet)")
+    else:
+        text = f" {req['status_text']}" if req.get("status_text") else ""
+        lines.append(f"  Status: {status}{text}")
+        if req.get("failed"):
+            lines.append(
+                "  Note: the response arrived but its body did not finish loading"
+                " — normal for a fetch() whose body is never read."
+            )
+    if req.get("redirect_to"):
+        lines.append(f"  Redirected to: {req['redirect_to']}")
+    if req.get("mime_type"):
+        lines.append(f"  Content type: {req['mime_type']}")
+    detail = _request_timing(req).strip()
+    if detail:
+        lines.append(f"  Transfer: {detail}")
+    headers = req.get("response_headers") or {}
+    if headers:
+        lines.append(f"  Response headers ({len(headers)}):")
+        for key in sorted(headers):
+            lines.append(f"    {key}: {headers[key][:200]}")
+
     try:
         request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))
         if request_file_path:
@@ -3040,7 +3181,10 @@ async def list_network_requests(
 
     lines = [f"Network requests ({len(filtered)} of {total}):"]
     for req in filtered:
-        lines.append(f"  [{req.get('seq', '?')}] {req['method']} {req['url'][:150]} ({req['type']})")
+        lines.append(
+            f"  [{req.get('seq', '?')}] {_request_outcome(req)} {req['method']} "
+            f"{req['url'][:150]} ({req['type']}){_request_timing(req)}"
+        )
     return "\n".join(lines)
 
 

@@ -261,7 +261,7 @@ def test_a_response_body_can_actually_be_retrieved():
         await asyncio.sleep(0.5)
 
         listing = await _call("list_network_requests", resource_types=["Fetch"])
-        match = re.search(r"\[(\d+)\] GET \S+/json", listing)
+        match = re.search(r"\[(\d+)\] \S+ GET \S+/json", listing)
         assert match, f"the fetch was not captured:\n{listing}"
 
         body = await _call("get_network_request", reqid=int(match.group(1)))
@@ -487,5 +487,51 @@ def test_a_native_date_input_is_set_and_reported_honestly():
 
         bad = await _call("fill", uid=date_uid, value="08/08/2026")
         assert "Error" in bad and "YYYY-MM-DD" in bad, f"wrong format accepted:\n{bad}"
+
+    _run(scenario)
+
+
+def test_the_network_log_distinguishes_outcomes():
+    """Regression: a 500, a 404, a redirect, a transport failure and a request
+    still in flight all rendered as the same line.
+
+    Only requestWillBeSent was subscribed, so nothing on the response side was
+    ever collected — no status, no headers, no timing, no failure flag. The one
+    job of a network log is telling you which request went wrong.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://httpbingo.org/")
+        await _call("evaluate_script", function=(
+            "async () => {"
+            " await (await fetch('/status/500')).text();"
+            " await (await fetch('/status/404')).text();"
+            " await (await fetch('/redirect/1')).text();"
+            " return 1; }"
+        ))
+        await asyncio.sleep(1.5)
+
+        listing = await _call("list_network_requests")
+        assert re.search(r"\b500\b.*status/500", listing), f"no 500 status:\n{listing}"
+        assert re.search(r"\b404\b.*status/404", listing), f"no 404 status:\n{listing}"
+        assert "->" in listing, f"no redirect marked:\n{listing}"
+        assert re.search(r"\d+(\.\d+)?ms", listing), f"no timing:\n{listing}"
+
+        # A blocked request is the one deterministic transport failure available
+        # here: fetching an unroutable host from an https page dies in the
+        # mixed-content check before the network stack and produces no events.
+        await _call("block_resources", types=["image"])
+        await _call("navigate_page", url="https://books.toscrape.com/")
+        await asyncio.sleep(0.8)
+        blocked = await _call("list_network_requests", resource_types=["Image"])
+        assert "FAILED" in blocked, f"a blocked request was not marked failed:\n{blocked}"
+
+        match = re.search(r"\[(\d+)\] 500", listing)
+        assert match, listing
+        detail = await _call("get_network_request", reqid=int(match.group(1)))
+        assert "Status: 500" in detail, detail
+        assert "Response headers" in detail, f"no headers:\n{detail}"
+        assert "content-type" in detail.lower(), f"no content-type header:\n{detail}"
+        assert "Transfer:" in detail, f"no timing/size:\n{detail}"
 
     _run(scenario)
