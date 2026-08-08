@@ -259,14 +259,17 @@ def test_a_failing_tool_is_marked_as_an_error():
     """
 
     async def scenario():
-        # A uid that was never issued: an honest "I could not", not a bad argument.
-        result = await mux.call_tool("click", {"uid": "999_999"})
+        # A preset that does not exist: an honest "I could not", not a bad
+        # argument. It is refused before a browser is ever needed, which is what
+        # lets this run on a CI box with no Chrome — the browser-level version of
+        # this assertion lives in test_browser_behaviour.
+        result = await mux.call_tool("emulate_device", {"device": "nokia_3310"})
         text = mux._text(result)
 
-        assert result.isError, f"a failed click was reported as success:\n{text}"
+        assert result.isError, f"a failed call was reported as success:\n{text}"
         # And the reason still has to be readable, not swallowed by the flag.
-        assert "unknown uid" in text, text
-        assert "snapshot" in text, text
+        assert "nokia_3310" in text, text
+        assert "pixel_7" in text, "the failure must name the presets that do exist"
 
     asyncio.run(scenario())
 
