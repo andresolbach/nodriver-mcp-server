@@ -17,10 +17,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from nodriver_mcp.multiplexer import (  # noqa: E402
+    _LIST_BROWSERS,
+    _SHUTDOWN_BROWSER,
+    list_tools as client_tools,
+)
 from nodriver_mcp.server import mcp  # noqa: E402
 
 # Grouping mirrors the README table so the two never tell different stories.
 CATEGORIES: list[tuple[str, list[str]]] = [
+    ("Several browsers", [_LIST_BROWSERS.name, _SHUTDOWN_BROWSER.name]),
     ("Input automation", [
         "click", "click_at", "hover", "fill", "fill_form", "type_text",
         "press_key", "drag", "upload_file", "handle_dialog",
@@ -165,7 +171,7 @@ def render(tools) -> str:
 
 
 def main() -> None:
-    tools = asyncio.run(mcp.list_tools())
+    tools = asyncio.run(client_tools())
     out = ROOT / "docs" / "TOOLS.md"
     out.parent.mkdir(exist_ok=True)
     out.write_text(render(tools), encoding="utf-8")

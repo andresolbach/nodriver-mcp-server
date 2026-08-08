@@ -1,5 +1,98 @@
 # Changelog
 
+## 2.0.0 — several independent browsers, one server
+
+Two agents pointed at this server used to share one Chrome, because the whole
+browser world lives in module globals: one browser, one selected tab, one
+console and network buffer. Agent B calls `select_page`, and agent A's next
+`click` lands on a tab it never opened, with every uid it holds gone stale.
+Nothing errors. The second agent simply acts on the wrong page.
+
+Every tool now takes an optional `browser` argument, and a name that does not
+exist yet creates one on the spot: its own Chrome, in its own process, with its
+own profile, cookies, tabs, snapshot uids and captured traffic. Rewriting ~190
+global accesses into per-session objects would have touched all 59 tools, so a
+browser became a process instead. The tools did not change at all, and isolation
+stopped being something the code has to remember.
+
+**Nothing changes for a session that does not use it.** Omit the argument and
+you get the browser called `"default"`, which runs inside the server process on
+the same code path as before — one process, one Chrome. Only extra names spawn
+anything, so the feature is free to everyone not using it. Tool schemas are read
+locally too, so listing them starts no subprocess either.
+
+Two new tools: `list_browsers` (what is open, without starting anything) and
+`shutdown_browser` (quits one browser's Chrome and frees its name, where
+`close_browser` keeps its profile and flags for next time). Up to 12 browsers at
+once, including the default.
+
+The `browser` argument's own description is deliberately terse, because it rides
+along on all 61 tools and would otherwise cost roughly 7000 tokens of repetition
+in every session, most of it paid by people who never open a second browser. The
+reasoning, the hazards and the costs live in the server instructions instead,
+which are sent once — and there they can be spelled out properly.
+
+### Found by reviewing this release before shipping it
+
+An adversarial review of the merge raised 41 findings; seven survived
+verification, several reproduced against the running code. All are fixed, each
+with a regression test that failed against the first cut.
+
+- **The temp-profile sweep could have deleted a live profile on Linux and
+  macOS.** 1.9.5 swept anything in the system temp directory named `uc_*` that
+  was old enough, relying on a rename failing to protect a directory still in
+  use. That protection only exists on Windows; POSIX renames a directory happily
+  while its files are open. A browser left running for two hours could have had
+  its cookies, logins and localStorage deleted underneath it. The sweep now
+  removes only profiles this server recorded as its own, and only once the
+  process that recorded one is gone — ownership is checkable, a filename is a
+  guess. The test that was supposed to cover the old guard never reached it: it
+  wrote a file into the directory first, which reset the mtime the age check
+  reads, so the sweep skipped on age and the rename was never attempted.
+- **`_MAX_BROWSERS` did not hold under load.** The slot was taken only after the
+  spawn finished, so concurrent first calls all counted the same free registry
+  and all spawned. Ten simultaneous requests opened ten browsers regardless of
+  the cap. The slot is now claimed before the slow part.
+- **A worker whose subprocess died was never noticed.** Its lifecycle task waits
+  on an event only this process sets, so every flag kept saying "running", the
+  respawn path was unreachable, and each later call to that name waited out the
+  full five-minute timeout while the orphaned Chrome kept running. Workers are
+  now pinged before reuse and replaced when they stop answering.
+- **`shutdown_browser` raced first use.** It read the registry without the lock
+  that guards a spawn, so a shutdown arriving while a browser was starting
+  answered "nothing to shut down" and then let the Chrome finish coming up.
+- **`list_browsers` could fail with a one-character error.** It snapshotted the
+  names, then awaited per browser, and indexed the registry afterwards — a
+  browser retired in between raised a bare `KeyError`.
+- **Errors on the default browser said everything twice.** FastMCP already
+  raises `Error executing tool <name>: …`, and the routing layer added the same
+  prefix again, on exactly the path where nothing was supposed to change.
+- **Workers relied on nodriver's atexit handler.** They served until stdin
+  closed and then simply exited, leaving the browser to the unreliable cleanup
+  1.9.5 exists to replace. They now shut it down deliberately, in the same event
+  loop, before the process ends.
+
+One finding was refuted rather than fixed: with `NODRIVER_BROWSER_URL` set,
+every browser name does attach to the same Chrome, but that is what the setting
+asks for, and per-process state means the tabs still cannot collide.
+
+### Smaller things
+
+Two more fell out of comparing the new entry point against the old one rather
+than assuming they matched:
+
+- **Resources and prompts still answer.** FastMCP registers those handlers
+  whether or not anything is defined, so this server advertised both
+  capabilities and replied with an empty list. Serving only tools would have
+  turned that into `Method not found` for any client that probes. They are
+  forwarded, and a test now compares the advertised capabilities against the
+  single-browser server directly.
+- **The server reports its own version.** FastMCP left it unset, and the SDK
+  then falls back to the version of the `mcp` library, so every release so far
+  introduced itself as "1.26.0". It now says 2.0.0.
+
+Tool count: 59 → 61.
+
 ## 1.9.5 — orphaned Chromes and temp profiles that were never cleaned up
 
 Closing a browser was fire-and-forget. nodriver's `Browser.stop()` schedules

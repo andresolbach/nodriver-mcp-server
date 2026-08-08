@@ -1,86 +1,176 @@
 """Tests for the abandoned-temp-profile sweep.
 
-The sweep deletes directories it did not create, in a directory shared with
-every other program on the machine. So the interesting assertions are not that
-it removes things — they are all the cases where it must keep its hands off.
+The sweep deletes directories on disk, so the interesting assertions are not
+that it removes things — they are every case where it must keep its hands off.
+
+An earlier design swept anything in the system temp directory named `uc_*` that
+was old enough, and relied on a rename failing to protect a profile still in
+use. That guard only exists on Windows; POSIX renames a directory happily while
+its files are open, so on Linux and macOS a browser left running for a couple of
+hours would have had its live profile deleted underneath it. The sweep now only
+touches profiles this server recorded as its own, and only once the process that
+recorded one is gone.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
 import pytest
 
-from nodriver_mcp.server import sweep_stale_temp_profiles
+from nodriver_mcp.server import (
+    _claim_temp_profile,
+    _pid_alive,
+    _release_temp_profile,
+    sweep_stale_temp_profiles,
+)
+
+DEAD_PID = 0x7FFFFFF0  # implausible, and verified dead below
+OLD = 10 * 3600
 
 
 @pytest.fixture
-def temp_root(tmp_path, monkeypatch):
-    """Point the sweep at a directory of our own, never the real one."""
-    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+def claims(tmp_path, monkeypatch):
+    """Point both the claim store and the profiles at directories of our own."""
+    store = tmp_path / "claims"
+    store.mkdir()
+    monkeypatch.setattr("nodriver_mcp.server._PROFILE_CLAIMS_DIR", str(store))
     return tmp_path
 
 
-def _aged_dir(root, name, age_s):
+def _profile(root, name, *, pid, age_s):
     d = root / name
     d.mkdir()
-    (d / "Preferences").write_text("{}", encoding="utf-8")
-    old = time.time() - age_s
-    os.utime(d, (old, old))
+    (d / "Cookies").write_text("session tokens", encoding="utf-8")
+    _claim_temp_profile(str(d))
+    # Rewrite the claim with the pid and age this test needs.
+    from nodriver_mcp.server import _claim_path
+
+    with open(_claim_path(str(d)), encoding="utf-8") as fh:
+        claim = json.load(fh)
+    claim["pid"] = pid
+    claim["created"] = time.time() - age_s
+    with open(_claim_path(str(d)), "w", encoding="utf-8") as fh:
+        json.dump(claim, fh)
     return d
 
 
-def test_removes_an_abandoned_profile(temp_root):
-    d = _aged_dir(temp_root, "uc_abandoned", 10 * 3600)
+# ---------------------------------------------------------------------------
+# Knowing whether a process is alive is the whole basis of the sweep
+# ---------------------------------------------------------------------------
+
+def test_this_process_counts_as_alive():
+    assert _pid_alive(os.getpid()) is True
+
+
+def test_an_unused_pid_counts_as_dead():
+    assert _pid_alive(DEAD_PID) is False
+
+
+@pytest.mark.parametrize("pid", [0, -1, -12345])
+def test_nonsense_pids_are_dead_not_errors(pid):
+    assert _pid_alive(pid) is False
+
+
+def test_asking_never_kills_the_process_it_asks_about():
+    """os.kill(pid, 0) is the usual trick and is wrong on Windows, where os.kill
+    ignores the signal and calls TerminateProcess."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert _pid_alive(proc.pid) is True
+        assert _pid_alive(proc.pid) is True
+        assert proc.poll() is None, "asking whether it was alive killed it"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# What it removes
+# ---------------------------------------------------------------------------
+
+def test_removes_a_profile_whose_owner_is_gone(claims):
+    d = _profile(claims, "uc_abandoned", pid=DEAD_PID, age_s=OLD)
     assert sweep_stale_temp_profiles() == 1
     assert not d.exists()
 
 
-def test_keeps_a_recent_profile(temp_root):
-    """A young directory may belong to a browser that is running right now."""
-    d = _aged_dir(temp_root, "uc_fresh", 60)
+def test_forgets_the_claim_once_the_profile_is_gone(claims):
+    _profile(claims, "uc_abandoned", pid=DEAD_PID, age_s=OLD)
+    sweep_stale_temp_profiles()
+    assert sweep_stale_temp_profiles() == 0, "the claim outlived the profile"
+
+
+# ---------------------------------------------------------------------------
+# What it must never touch
+# ---------------------------------------------------------------------------
+
+def test_keeps_a_profile_whose_owner_is_still_running(claims):
+    """The guard that matters. This process is the owner, so however old the
+    claim is, the profile is in use."""
+    d = _profile(claims, "uc_inuse", pid=os.getpid(), age_s=OLD)
+    assert sweep_stale_temp_profiles() == 0
+    assert (d / "Cookies").read_text(encoding="utf-8") == "session tokens"
+
+
+def test_keeps_a_recent_profile_even_if_the_pid_is_gone(claims):
+    """A short-lived pid can be recycled onto another process; waiting out the
+    age window costs nothing and removes that whole class of mistake."""
+    d = _profile(claims, "uc_fresh", pid=DEAD_PID, age_s=60)
     assert sweep_stale_temp_profiles() == 0
     assert d.exists()
 
 
-def test_ignores_directories_that_are_not_nodriver_profiles(temp_root):
-    """The temp directory belongs to the whole machine, not to us."""
-    keep = _aged_dir(temp_root, "important_backup", 10 * 3600)
-    also = _aged_dir(temp_root, "pip-build-xyz", 10 * 3600)
-    assert sweep_stale_temp_profiles() == 0
-    assert keep.exists() and also.exists()
+def test_never_touches_a_profile_it_did_not_claim(claims):
+    """The case the previous design got wrong.
 
-
-def test_ignores_files_that_merely_start_with_the_prefix(temp_root):
-    f = temp_root / "uc_notadirectory.log"
-    f.write_text("x", encoding="utf-8")
-    old = time.time() - 10 * 3600
-    os.utime(f, (old, old))
-    assert sweep_stale_temp_profiles() == 0
-    assert f.exists()
-
-
-def test_a_locked_profile_is_left_whole(temp_root):
-    """The guard that matters: a profile still in use must not be touched.
-
-    Windows refuses to rename a directory that holds an open file, which is what
-    the sweep relies on. Deleting in place would strip files out from under a
-    running Chrome instead — a far worse outcome than a leftover directory.
+    A `uc_*` directory belonging to another program, another user's nodriver, or
+    a version that did not record claims is not ours to delete, no matter how
+    old it looks.
     """
-    d = _aged_dir(temp_root, "uc_inuse", 10 * 3600)
-    locked = d / "Cookies"
-    locked.write_text("session tokens", encoding="utf-8")
-    handle = open(locked, "r+b")  # noqa: SIM115 - held open on purpose
-    try:
-        sweep_stale_temp_profiles()
-        assert locked.exists(), "the sweep deleted a file from a profile in use"
-        assert locked.read_bytes() == b"session tokens"
-    finally:
-        handle.close()
+    stranger = claims / "uc_someone_elses"
+    stranger.mkdir()
+    (stranger / "Cookies").write_text("their session", encoding="utf-8")
+    old = time.time() - OLD
+    os.utime(stranger, (old, old))
 
-
-def test_survives_a_temp_directory_it_cannot_read(monkeypatch):
-    """Never let a broken temp directory stop the server from starting."""
-    monkeypatch.setattr("tempfile.gettempdir", lambda: "/definitely/not/here")
     assert sweep_stale_temp_profiles() == 0
+    assert (stranger / "Cookies").read_text(encoding="utf-8") == "their session"
+
+
+def test_an_unreadable_claim_is_dropped_without_guessing(claims):
+    """A corrupt note must not turn into a deletion of something inferred."""
+    victim = claims / "uc_unrelated"
+    victim.mkdir()
+    (victim / "Cookies").write_text("keep me", encoding="utf-8")
+
+    from nodriver_mcp.server import _PROFILE_CLAIMS_DIR
+
+    broken = os.path.join(_PROFILE_CLAIMS_DIR, "broken.json")
+    with open(broken, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+
+    assert sweep_stale_temp_profiles() == 0
+    assert victim.exists() and (victim / "Cookies").exists()
+    assert not os.path.exists(broken), "the unreadable claim was kept"
+
+
+def test_survives_a_missing_claim_store(monkeypatch):
+    """Never let bookkeeping stop the server from starting."""
+    monkeypatch.setattr(
+        "nodriver_mcp.server._PROFILE_CLAIMS_DIR", "/definitely/not/here"
+    )
+    assert sweep_stale_temp_profiles() == 0
+
+
+def test_releasing_a_claim_leaves_the_profile_alone(claims):
+    """Release is bookkeeping only; the directory belongs to the caller."""
+    d = _profile(claims, "uc_kept", pid=DEAD_PID, age_s=OLD)
+    _release_temp_profile(str(d))
+    assert sweep_stale_temp_profiles() == 0
+    assert d.exists()

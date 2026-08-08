@@ -13,7 +13,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 59](https://img.shields.io/badge/tools-59-orange.svg)
+![Tools: 61](https://img.shields.io/badge/tools-61-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -35,7 +35,7 @@ None of that is your script being wrong. It is anti-bot detection — Cloudflare
 
 [`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` reads `false` rather than `true`, and a session looks like a person using Chrome.
 
-This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (59 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
+This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (61 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
 
 **What it will not do**, so you can judge before installing: it does not solve image or text captchas for you, it cannot defeat every protection on every site, and it will not rescue a scraper that hammers a server. If a site blocks you for *what you do* rather than *what you are*, no driver fixes that. `cf_verify` handles the common Cloudflare checkbox challenge; it is not a captcha-solving service.
 
@@ -62,7 +62,7 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` reads `false`, exactly as in a browser a person is using, and there are no CDP or WebDriver artifacts to find.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
-- 🧩 **59 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **61 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 🧠 **Schemas written for the agent, not just the compiler** — every parameter carries a description, fixed-value options are real enums, and each tool declares read-only/destructive hints. See [why this matters](#built-for-the-agent-that-calls-it).
 - 📄 **Compact accessibility-tree snapshots** (`take_snapshot`) — searchable page text with a uid per element. Measured on the Hacker News front page: **34 KB against 106 KB unfiltered, 68% smaller, with every link, URL and text preserved.** That saving lands on every single agent step.
 - 🔗 **Attach to a browser you are already signed into** (`use_running_browser`) — drive your real Chrome profile over its debugging port instead of rebuilding logins in a fresh one.
@@ -187,9 +187,32 @@ To use an extension permanently, switch to a persistent profile, install it once
 
 > **Unpacked extensions need Chromium or Chrome for Testing.** Official Chrome builds dropped `--load-extension` in v137, and as of Chrome 151 neither `--enable-unsafe-extension-debugging` nor disabling `DisableLoadExtensionCommandLineSwitch` brings it back — the flag is accepted and the extension is silently never registered. `manage_extensions` detects a branded build and says so instead of pretending it worked. Point `NODRIVER_BROWSER_PATH` at Chromium / Chrome for Testing if you need unpacked loading.
 
-## Profiles & running multiple instances at once
+## Several agents, several browsers
 
-By default every server instance launches Chrome with a **fresh temporary profile** that nodriver creates and deletes automatically. That means you can run nodriver from **Claude Desktop, Claude Code and the VS Code extension at the same time** — each gets its own isolated Chrome, and they never fight over a shared profile. No configuration, no detection logic, nothing to clean up.
+One agent working alone can skip this section: without the `browser` argument everything runs on a single shared browser, exactly as before.
+
+Point **two agents** at one browser, though, and they collide. They share the selected tab, so a `select_page` or a navigation by one silently changes what the other sees, and every `uid` the other is holding goes stale. Nothing errors — the second agent simply acts on the wrong page.
+
+So every tool takes an optional `browser` argument, and a name that does not exist yet creates one on the spot:
+
+```jsonc
+{ "url": "https://example.com", "browser": "agent-a" }
+```
+
+Each name is a **separate Chrome in a separate process**, with its own profile, cookies, tabs, snapshot uids and console/network capture. Isolation is structural rather than careful: there is no shared state left to collide over, and a Chrome that hangs or crashes takes down nothing but its own browser.
+
+The default costs nothing. `"default"` runs inside the server process itself, so a session that never opens a second browser is the same single process and the same code path it always was. Only extra names spawn anything.
+
+| Tool | |
+|---|---|
+| `list_browsers` | What is open: names, whether Chrome runs, profile, tabs and their URLs. Reports without starting anything. |
+| `shutdown_browser` | Quits one browser's Chrome and frees its name. `close_browser` only quits Chrome and keeps the browser's profile and flags for next time. |
+
+Each extra browser is a Python process plus a full Chrome — roughly 200 MB and about a second to start. Up to **12** can be open at once, including the default. Two callers sharing one *name* still share one Chrome: the isolation is per browser, not per caller, so parallel agents each need their own.
+
+## Profiles
+
+By default every browser launches Chrome with a **fresh temporary profile** that is created and deleted automatically. That also means you can run nodriver from **Claude Desktop, Claude Code and the VS Code extension at the same time** — each gets its own isolated Chrome, and they never fight over a shared profile. No configuration, no detection logic, nothing to clean up.
 
 When you want to **reuse a login across sessions**, create a named persistent profile and switch to it:
 
@@ -220,7 +243,7 @@ While attached, this server **never closes a browser it did not start**: `close_
 
 > ⚠️ **That profile becomes part of the agent's reach.** Whatever it is signed into — mail, bank, company systems — is reachable from here, because a cookie jar is all or nothing. Point this at a profile you are willing to expose, not your everyday one.
 
-## Tools (59)
+## Tools (61)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
@@ -230,6 +253,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 
 | Category | Tools |
 |----------|-------|
+| **Several browsers (2)** | `list_browsers` · `shutdown_browser` |
 | **Input automation (10)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
 | **Navigation (10)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `wait_for_selector` · `scroll_page` · `scroll_to_selector` |
 | **Snapshots & debugging (11)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `query_selector` · `evaluate_script` · `get_computed_styles` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
@@ -266,8 +290,9 @@ Here, the schema does that work:
 | Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
 | Install method | npx | uvx / pip |
 | Language | TypeScript / Node.js | Python |
-| Tool coverage | 29 tools | 59 tools |
-| Per-parameter schema docs | partial | ✅ all 59 tools |
+| Parallel browsers | one | up to 12, isolated |
+| Tool coverage | 29 tools | 61 tools |
+| Per-parameter schema docs | partial | ✅ all 61 tools |
 | Tool behaviour hints | ❌ | ✅ read-only / destructive |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).

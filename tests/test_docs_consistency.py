@@ -14,6 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from nodriver_mcp.multiplexer import (
+    _HIDDEN_TOOLS,
+    _LIST_BROWSERS,
+    _SHUTDOWN_BROWSER,
+)
 from nodriver_mcp.server import mcp
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,14 +27,20 @@ CHANGES = (ROOT / "CHANGES.md").read_text(encoding="utf-8")
 PYPROJECT = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
 
+MUX_ONLY = (_LIST_BROWSERS.name, _SHUTDOWN_BROWSER.name)
+
+
 @pytest.fixture(scope="module")
 def tool_names():
-    return sorted(t.name for t in asyncio.run(mcp.list_tools()))
+    """The names a client actually sees: the server's own, minus the internal
+    ones, plus the two the routing layer serves itself."""
+    own = [t.name for t in asyncio.run(mcp.list_tools()) if t.name not in _HIDDEN_TOOLS]
+    return sorted([*own, *MUX_ONLY])
 
 
 def test_readme_states_the_real_tool_count(tool_names):
     count = len(tool_names)
-    stated = {int(n) for n in re.findall(r"(?:Tools|tools)[:\-\s]+(\d{2})\b", README)}
+    stated = {int(n) for n in re.findall(r"(?:Tools|tools)[:\-\s]+\(?(\d{2})\b", README)}
     assert stated, "README no longer states a tool count anywhere"
     wrong = {n for n in stated if n != count}
     assert not wrong, f"README claims {sorted(wrong)} tools, server has {count}"

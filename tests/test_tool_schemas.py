@@ -36,7 +36,9 @@ def _params(tool) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_tool_count(tools):
-    assert len(tools) == 59
+    # 59 browser tools + browser_status, which the routing layer consumes and
+    # hides from clients.
+    assert len(tools) == 60
 
 
 def test_tool_names_are_unique(tools):
@@ -47,7 +49,8 @@ def test_tool_names_are_unique(tools):
 def test_no_tool_was_renamed_by_accident(by_name):
     """Tool names are public API — a rename silently breaks every user's prompts."""
     expected = {
-        "block_resources", "bypass_insecure_warning", "cf_verify", "clear_cookies",
+        "block_resources", "browser_status", "bypass_insecure_warning",
+        "cf_verify", "clear_cookies",
         "click", "click_at", "close_browser", "close_page", "create_profile",
         "delete_profile", "disable_console_collection", "drag", "emulate",
         "emulate_device", "enable_console_collection", "evaluate_script", "fill",

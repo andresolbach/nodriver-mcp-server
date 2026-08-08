@@ -45,6 +45,14 @@ def main():
         action="store_true",
         help="List all available MCP client targets",
     )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help=(
+            "Run the single-browser server on stdio. Spawned automatically, one "
+            "per extra browser; not meant to be configured directly."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     def _add_scope(p):
@@ -104,6 +112,15 @@ def main():
         )
         return
 
-    # Default: run the MCP server
-    from .server import main as server_main
-    server_main()
+    if args.worker:
+        # One browser, all state in module globals. Spawned per extra browser
+        # name by the routing layer below.
+        from .server import main as server_main
+        server_main()
+        return
+
+    # Default: the routing layer, which is what clients connect to. The
+    # "default" browser runs inside this process, so a session that never asks
+    # for a second one costs exactly what it did before.
+    from .multiplexer import main as serve
+    serve()

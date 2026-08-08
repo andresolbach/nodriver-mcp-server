@@ -263,6 +263,13 @@ async def _get_browser() -> uc.Browser:
                 headless, _selected_profile_name or "temp",
             )
 
+            # Record ownership of a throwaway profile, so that if this process
+            # is killed before it can clean up, the next start knows the
+            # directory is ours and that nobody is using it any more.
+            config = getattr(_browser, "config", None)
+            if config is not None and not getattr(config, "uses_custom_data_dir", True):
+                _claim_temp_profile(str(config.user_data_dir))
+
             # Auto-enable network collection on the first tab.
             # Console collection is opt-in because Runtime.enable() can be detected.
             await _auto_enable_network_collection(_browser.main_tab)
@@ -1345,6 +1352,11 @@ async def _close_browser_and_profile(b: uc.Browser) -> None:
                     await asyncio.sleep(0.25 * (attempt + 1))
             else:
                 logger.warning("could not remove temp profile %s", path)
+            # Release the claim only once the directory is really gone. Dropping
+            # it while the directory is still stuck would hide it from the sweep
+            # that exists to catch exactly that case.
+            if not os.path.exists(path):
+                _release_temp_profile(path)
 
     # 4. Drop it from nodriver's registry so its atexit handler does not repeat
     #    all of the above against a browser that is already gone.
@@ -4733,6 +4745,46 @@ async def manage_extensions(
 
 
 # ---------------------------------------------------------------------------
+# Worker introspection (used by the multiplexer, hidden from clients)
+# ---------------------------------------------------------------------------
+
+@tool(title="Browser status", read_only=True)
+async def browser_status() -> str:
+    """Report this worker's browser state as JSON, without ever launching Chrome.
+
+    Internal plumbing for the multiplexer's list_browsers, which has to describe
+    every browser slot without starting the ones that were never used. Every
+    other read-only tool would launch Chrome on the spot to answer.
+    """
+    attached = _connect_target()
+    alive = bool(_browser is not None and (attached or not _browser.stopped))
+    tabs: list[dict[str, str]] = []
+    if alive and _browser is not None:
+        for t in _browser.tabs:
+            try:
+                tabs.append({"url": t.target.url or "", "title": t.target.title or ""})
+            except Exception:
+                pass
+    # The directory Chrome was actually launched on, which for a throwaway
+    # profile is a temp dir nobody named — and the thing whose removal on
+    # shutdown is worth being able to check.
+    live_dir = None
+    if _browser is not None:
+        live_dir = str(getattr(getattr(_browser, "config", None), "user_data_dir", "") or "") or None
+    return json.dumps({
+        "pid": os.getpid(),
+        "chrome_running": alive,
+        "attached_to": f"{attached[0]}:{attached[1]}" if attached else None,
+        "profile": _selected_profile_name or ("(attached)" if attached else "temp"),
+        "profile_dir": _selected_profile_dir,
+        "user_data_dir": live_dir,
+        "tab_count": len(tabs),
+        "tabs": tabs[:20],
+        "selected_target_id": _selected_target_id,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Chrome profile (user-data-dir) management
 # ---------------------------------------------------------------------------
 
@@ -4979,65 +5031,168 @@ async def delete_profile(
 # Entry point
 # ---------------------------------------------------------------------------
 
-# Temp profiles left behind by a browser whose process was killed rather than
-# closed. Old enough that no live browser can plausibly still be using one.
+# A temp profile whose owning process is gone is only swept once it is also this
+# old, which blunts PID reuse: a recycled PID within the window makes the sweep
+# skip, never delete.
 _STALE_PROFILE_AGE_S = 2 * 60 * 60
+
+# One small file per live temp profile, so concurrent servers never contend over
+# a shared index and a crash cannot corrupt one.
+_PROFILE_CLAIMS_DIR = os.path.join(
+    os.path.expanduser("~"), ".nodriver-mcp", "temp-profiles"
+)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this id is running.
+
+    os.kill(pid, 0) is the usual trick and is wrong on Windows, where os.kill
+    ignores the signal and calls TerminateProcess — asking "are you alive"
+    would kill the process being asked.
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True  # cannot tell; treat as alive and leave the profile be
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # someone else's process, so certainly not ours to delete
+    except OSError:
+        return False
+    return True
+
+
+def _claim_path(profile_dir: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256(os.path.abspath(profile_dir).encode("utf-8")).hexdigest()
+    return os.path.join(_PROFILE_CLAIMS_DIR, f"{digest[:32]}.json")
+
+
+def _claim_temp_profile(profile_dir: str) -> None:
+    """Record that this process owns this throwaway profile."""
+    try:
+        os.makedirs(_PROFILE_CLAIMS_DIR, exist_ok=True)
+        with open(_claim_path(profile_dir), "w", encoding="utf-8") as fh:
+            json.dump({"path": profile_dir, "pid": os.getpid(), "created": time.time()}, fh)
+    except OSError:
+        logger.debug("could not record the temp profile claim", exc_info=True)
+
+
+def _release_temp_profile(profile_dir: str) -> None:
+    try:
+        os.remove(_claim_path(profile_dir))
+    except OSError:
+        pass
 
 
 def sweep_stale_temp_profiles(max_age_s: int = _STALE_PROFILE_AGE_S) -> int:
-    """Delete abandoned nodriver temp profiles. Returns how many went.
+    """Delete temp profiles whose owning process is gone. Returns how many went.
 
     When the server is killed instead of asked to exit, nothing in-process runs:
     Chrome is orphaned and its profile stays in the temp directory. Nothing can
-    clean that up later except a sweep at the next start, which is why this
+    clean that up afterwards except a sweep at the next start, which is why this
     exists despite _close_browser_and_profile handling every orderly shutdown.
 
-    Two guards keep it away from a profile still in use. The directory must be
-    older than max_age_s, and it is renamed before being deleted: Windows
-    refuses to rename a directory holding open files, so a live browser's
-    profile fails the rename and is left completely untouched. Deleting in
-    place would instead strip files out from under a running Chrome.
+    It only ever removes a profile this server family created and recorded, and
+    only once the process that recorded it is gone. An earlier version instead
+    swept anything in the temp directory named `uc_*` that was old enough,
+    relying on a rename failing to protect a profile still in use. That guard
+    only exists on Windows: POSIX renames a directory happily while its files
+    are open, so on Linux and macOS a browser left running for a couple of hours
+    would have had its live profile — cookies, logins, localStorage — deleted
+    underneath it. Owning a claim is checkable; guessing from a filename is not.
     """
-    root = tempfile.gettempdir()
-    cutoff = time.time() - max_age_s
     removed = 0
     try:
-        names = os.listdir(root)
+        claims = os.listdir(_PROFILE_CLAIMS_DIR)
     except OSError:
         return 0
-    for name in names:
-        # nodriver's own prefix, from tempfile.mkdtemp(prefix="uc_").
-        if not name.startswith("uc_") or name.endswith(".sweeping"):
+    cutoff = time.time() - max_age_s
+    for entry in claims:
+        claim_file = os.path.join(_PROFILE_CLAIMS_DIR, entry)
+        try:
+            with open(claim_file, encoding="utf-8") as fh:
+                claim = json.load(fh)
+            path = str(claim["path"])
+            pid = int(claim["pid"])
+            created = float(claim.get("created", 0))
+        except (OSError, ValueError, KeyError, TypeError):
+            # Unreadable claim: drop the note, never guess at a directory.
+            try:
+                os.remove(claim_file)
+            except OSError:
+                pass
             continue
-        path = os.path.join(root, name)
-        try:
-            if not os.path.isdir(path) or os.path.getmtime(path) > cutoff:
-                continue
-        except OSError:
+        if not os.path.isdir(path):
+            # Directory already gone; the note protects nothing and is noise.
+            try:
+                os.remove(claim_file)
+            except OSError:
+                pass
             continue
-        staged = path + ".sweeping"
+        if _pid_alive(pid) or created > cutoff:
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.exists(path):
+                removed += 1
         try:
-            os.rename(path, staged)
+            os.remove(claim_file)
         except OSError:
-            continue  # still in use, or someone else got there first
-        try:
-            shutil.rmtree(staged, ignore_errors=True)
-            removed += 1
-        except Exception:
             pass
     if removed:
-        logger.info("removed %d abandoned temp profile(s) from %s", removed, root)
+        logger.info("removed %d abandoned temp profile(s)", removed)
     return removed
+
+
+async def _serve_stdio() -> None:
+    """Serve until the client closes stdin, then shut the browser down properly.
+
+    The teardown has to happen in this loop, not after it. Doing it from a
+    second asyncio.run would try to close websockets belonging to a loop that
+    is already gone, which fails and leaves Chrome running — and without it the
+    only cleanup left is nodriver's atexit handler, the unreliable path this
+    exists to replace.
+    """
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        try:
+            await _stop_browser()
+        except Exception:
+            logger.debug("closing the browser on exit failed", exc_info=True)
 
 
 def main():
     """Run the MCP server via stdio transport."""
-    # A killed server cannot clean up after itself, so the next start does it.
-    try:
-        sweep_stale_temp_profiles()
-    except Exception:
-        logger.debug("temp profile sweep failed", exc_info=True)
-    mcp.run(transport="stdio")
+    import anyio
+
+    # Skipped in a worker: the routing layer sweeps once for all of them, and a
+    # dozen workers racing over the same directories would be pointless.
+    if not os.environ.get("NODRIVER_BROWSER_NAME"):
+        try:
+            sweep_stale_temp_profiles()
+        except Exception:
+            logger.debug("temp profile sweep failed", exc_info=True)
+    anyio.run(_serve_stdio)
 
 
 if __name__ == "__main__":
