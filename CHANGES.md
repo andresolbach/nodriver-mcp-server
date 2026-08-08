@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.9.5 — orphaned Chromes and temp profiles that were never cleaned up
+
+Closing a browser was fire-and-forget. nodriver's `Browser.stop()` schedules
+the connection close as a task nobody awaits, terminates Chrome in the same
+breath, and leaves the throwaway profile to an `atexit` handler that retries
+for 0.75 seconds. Chrome releases its files asynchronously on Windows — the
+same race `delete_profile` hit in 1.9.3 — so the directory regularly survived.
+
+Worse, none of it runs when the process is killed rather than asked to exit,
+which is how an MCP server usually ends: the client restarts and terminates it.
+Measured by killing the server mid-session: Chrome lived on as eight orphaned
+processes and its profile stayed behind. On one developer machine that had
+accumulated 16 abandoned profiles holding 1.8 GB.
+
+`close_browser` and every profile switch now shut down in order and wait for
+each step: close the CDP sockets, terminate Chrome, wait for the process to
+actually exit, then remove the directory with retries that outlast the race.
+The browser is deregistered from nodriver's atexit list so it is not torn down
+twice, which also silences the `RuntimeError: Event loop is closed` noise that
+used to appear in the log on every shutdown.
+
+For the case nothing in-process can cover — being killed — the server sweeps
+abandoned `uc_*` profiles from the temp directory at startup. Two guards keep
+it away from a profile in use: the directory must be older than two hours, and
+it is renamed before being deleted, so a live browser's profile fails the
+rename and is left entirely alone rather than being emptied underneath it.
+
+Tool count: 59 → 59.
+
 ## 1.9.4 — get_cookies and save_session only saw one tab's cookies
 
 `get_cookies` says it reads the whole browser cookie jar unless you pass `url`.

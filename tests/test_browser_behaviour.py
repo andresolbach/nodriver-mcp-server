@@ -90,6 +90,35 @@ def test_get_cookies_reads_the_whole_jar_not_just_the_selected_tab():
     _run(scenario)
 
 
+def test_close_browser_removes_the_throwaway_profile():
+    """Regression: nodriver leaves this to an atexit handler that loses the race.
+
+    Browser.stop() terminates Chrome and hands the profile to an atexit handler
+    with 0.75s of retries, while Chrome releases its files asynchronously on
+    Windows. Measured on one developer machine: 16 abandoned profiles holding
+    1.8 GB. close_browser now waits for the process to exit before removing the
+    directory itself.
+    """
+    from pathlib import Path
+
+    from nodriver_mcp import server
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+        profile = Path(str(server._browser.config.user_data_dir))
+        assert profile.is_dir(), f"browser reported no live profile dir: {profile}"
+        assert not server._browser.config.uses_custom_data_dir, (
+            "this test only means anything on a throwaway profile"
+        )
+
+        await _call("close_browser")
+        assert not profile.exists(), f"temp profile survived close_browser: {profile}"
+
+    # close_browser is the subject here, so no _run(): its teardown would run a
+    # second one against a browser that is already gone.
+    asyncio.run(scenario())
+
+
 def test_save_session_stores_cookies_from_every_tab():
     """Regression: the same CDP call, in the costlier place.
 

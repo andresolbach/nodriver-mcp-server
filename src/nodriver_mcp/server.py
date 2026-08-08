@@ -12,6 +12,8 @@ import inspect
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 from typing import Annotated, Any, Literal
 
@@ -1286,6 +1288,74 @@ def _safe_profile_name(name: str) -> str:
     return "".join(c for c in (name or "").strip() if c.isalnum() or c in "-_")
 
 
+async def _close_browser_and_profile(b: uc.Browser) -> None:
+    """Shut a browser down completely, waiting for each step to finish.
+
+    nodriver's own Browser.stop() schedules the connection close as a
+    fire-and-forget task and terminates Chrome in the same breath, then leaves
+    the temp profile to an atexit handler. Neither survives a process that is
+    killed rather than asked to exit — which is exactly how an MCP server ends
+    when its client restarts. Measured: Chrome lives on as orphaned processes
+    and its profile stays behind, several hundred MB at a time.
+
+    Doing it here means the browser is really gone by the time this returns.
+    """
+    # 1. Close the CDP websockets we hold, awaited rather than scheduled. Tabs
+    #    first: each is its own connection, and a live one keeps Chrome busy.
+    connections = [t for t in (getattr(b, "tabs", None) or [])]
+    main = getattr(b, "connection", None)
+    if main is not None:
+        connections.append(main)
+    for conn in connections:
+        try:
+            await asyncio.wait_for(conn.aclose(), timeout=5)
+        except Exception:
+            pass
+
+    # 2. Terminate Chrome and wait for the process to actually be gone, so the
+    #    profile below is not still held open when we try to remove it.
+    proc = getattr(b, "_process", None)
+    if proc is not None:
+        for signal_it in (proc.terminate, proc.kill):
+            try:
+                signal_it()
+                await asyncio.wait_for(proc.wait(), timeout=10)
+                break
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+    # 3. Remove the throwaway profile. A persistent one the user chose is theirs
+    #    to keep, and uses_custom_data_dir is how nodriver tells them apart.
+    config = getattr(b, "config", None)
+    if config is not None and not getattr(config, "uses_custom_data_dir", True):
+        path = str(getattr(config, "user_data_dir", "") or "")
+        if path:
+            for attempt in range(8):
+                try:
+                    shutil.rmtree(path)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    # Chrome releases its files asynchronously on Windows; the
+                    # same race delete_profile had. nodriver gives up after
+                    # 0.75s, which is where the leftovers come from.
+                    await asyncio.sleep(0.25 * (attempt + 1))
+            else:
+                logger.warning("could not remove temp profile %s", path)
+
+    # 4. Drop it from nodriver's registry so its atexit handler does not repeat
+    #    all of the above against a browser that is already gone.
+    try:
+        from nodriver.core.util import __registered__instances__
+
+        __registered__instances__.discard(b)
+    except Exception:
+        pass
+
+
 async def _stop_browser() -> bool:
     """Stop the running browser (if any) and reset per-browser state, keeping the
     selected profile. Returns True if a browser was actually running.
@@ -1301,9 +1371,13 @@ async def _stop_browser() -> bool:
     was_running = _browser is not None and (attached or not _browser.stopped)
     if _browser is not None and not attached:
         try:
-            _browser.stop()
+            await _close_browser_and_profile(_browser)
         except Exception:
-            pass
+            logger.warning("clean shutdown failed, falling back", exc_info=True)
+            try:
+                _browser.stop()
+            except Exception:
+                pass
     _browser = None
     _selected_target_id = None
     _network_collection_enabled_tabs.clear()
@@ -4879,7 +4953,6 @@ async def delete_profile(
     path = os.path.join(_PROFILES_DIR, safe)
     if not os.path.isdir(path):
         return f"Error: profile '{safe}' does not exist."
-    import shutil
 
     # Chrome releases a profile directory asynchronously, so deleting right
     # after switching away from it hits files that are still open. That is a
@@ -4906,8 +4979,64 @@ async def delete_profile(
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Temp profiles left behind by a browser whose process was killed rather than
+# closed. Old enough that no live browser can plausibly still be using one.
+_STALE_PROFILE_AGE_S = 2 * 60 * 60
+
+
+def sweep_stale_temp_profiles(max_age_s: int = _STALE_PROFILE_AGE_S) -> int:
+    """Delete abandoned nodriver temp profiles. Returns how many went.
+
+    When the server is killed instead of asked to exit, nothing in-process runs:
+    Chrome is orphaned and its profile stays in the temp directory. Nothing can
+    clean that up later except a sweep at the next start, which is why this
+    exists despite _close_browser_and_profile handling every orderly shutdown.
+
+    Two guards keep it away from a profile still in use. The directory must be
+    older than max_age_s, and it is renamed before being deleted: Windows
+    refuses to rename a directory holding open files, so a live browser's
+    profile fails the rename and is left completely untouched. Deleting in
+    place would instead strip files out from under a running Chrome.
+    """
+    root = tempfile.gettempdir()
+    cutoff = time.time() - max_age_s
+    removed = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        # nodriver's own prefix, from tempfile.mkdtemp(prefix="uc_").
+        if not name.startswith("uc_") or name.endswith(".sweeping"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path) or os.path.getmtime(path) > cutoff:
+                continue
+        except OSError:
+            continue
+        staged = path + ".sweeping"
+        try:
+            os.rename(path, staged)
+        except OSError:
+            continue  # still in use, or someone else got there first
+        try:
+            shutil.rmtree(staged, ignore_errors=True)
+            removed += 1
+        except Exception:
+            pass
+    if removed:
+        logger.info("removed %d abandoned temp profile(s) from %s", removed, root)
+    return removed
+
+
 def main():
     """Run the MCP server via stdio transport."""
+    # A killed server cannot clean up after itself, so the next start does it.
+    try:
+        sweep_stale_temp_profiles()
+    except Exception:
+        logger.debug("temp profile sweep failed", exc_info=True)
     mcp.run(transport="stdio")
 
 
