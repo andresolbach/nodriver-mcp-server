@@ -2,19 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.andresolbach/nodriver-mcp-server",
   "title": "nodriver — undetected browser automation",
-  "description": "Undetected anti-bot Chrome automation. 61 tools, parallel isolated browsers.",
+  "description": "Undetected anti-bot Chrome automation. 64 tools, parallel isolated browsers.",
   "repository": {
     "url": "https://github.com/andresolbach/nodriver-mcp-server",
     "source": "github"
   },
-  "version": "2.0.1",
+  "version": "2.1.0",
   "websiteUrl": "https://pypi.org/project/nodriver-mcp/",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "nodriver-mcp",
-      "version": "2.0.1",
+      "version": "2.1.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

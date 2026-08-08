@@ -8,10 +8,12 @@ exposing CDP/WebDriver fingerprints that get detected by anti-bot systems.
 
 import asyncio
 import base64
+import importlib.util
 import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -232,6 +234,19 @@ async def _get_browser() -> uc.Browser:
             browser_args: list[str] = [f"--disable-features={','.join(disabled_features)}"]
             if not extensions_on:
                 browser_args.append("--disable-extensions")
+            # Chrome treats a window another window covers as hidden: timers drop
+            # to ~1/s, rAF stops, and input delivery to the renderer becomes
+            # unreliable — while every tool still reports success. That is
+            # guaranteed the moment two agents each own a browser, and it is why
+            # Puppeteer and Playwright both pass these three by default.
+            # --window-size also fixes outerWidth/outerHeight reading 0, which is
+            # itself a fingerprint signal on a server whose point is not standing out.
+            browser_args += [
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--window-size=1280,900",
+            ]
             browser_args.extend(_extra_browser_args)
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
@@ -452,8 +467,18 @@ _network_requests: list[dict] = []
 _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
-_network_collection_enabled_tabs: set[int] = set()  # track which tabs have network collection enabled
+_network_collection_enabled_tabs: set[tuple] = set()  # (target_id, session_id) with Network enabled
+_network_handler_targets: set[int] = set()  # id(tab) of tabs whose request handler is installed
+_frame_worlds: dict[tuple, Any] = {}  # (target_id, frame_id) -> isolated-world execution context
+_dialog_tracked_sessions: set[tuple] = set()  # (target_id, session_id) with Page enabled
+_dialog_handler_tabs: set[int] = set()  # id(tab) of tabs whose dialog handlers are installed
+_open_dialogs: dict[Any, dict] = {}  # target key -> the dialog currently blocking it
+_pointer_positions: dict[Any, tuple[float, float]] = {}  # target key -> last pointer position
+# cf_verify has to change the process working directory; serialise it so two
+# calls cannot swap it under each other.
+_CF_LOCK = asyncio.Lock()
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
+_console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 _selected_target_id: str | None = None  # target_id chosen via select_page(); honored by _active_tab()
 _request_counter: int = 0  # monotonic id assigned to each collected network request
@@ -468,7 +493,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
         ),
         "platform": "Android",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         "metadata": {
             "platform": "Android",
             "platform_version": "14",
@@ -486,7 +511,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
         ),
         "platform": "Android",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         "metadata": {
             "platform": "Android",
             "platform_version": "14",
@@ -505,7 +530,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
         ),
         "platform": "iOS",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         # Safari does not send Sec-CH-UA client hints; omit UA-CH metadata.
         "metadata": None,
     },
@@ -576,13 +601,34 @@ def _preserve_on_navigation() -> None:
 # Auto-collection for network (console collection is explicit)
 # ---------------------------------------------------------------------------
 async def _auto_enable_network_collection(tab: uc.Tab) -> None:
-    """Auto-enable network event collection on a tab."""
-    tab_id = id(tab)
-    if tab_id in _network_collection_enabled_tabs:
-        return
-    _network_collection_enabled_tabs.add(tab_id)
+    """Enable network collection on this tab's current CDP session.
 
+    Keyed by (target, session) rather than by the Tab object. Network.enable is a
+    per-session command, and id(tab) does not change when the session under it
+    does — so the guard used to skip the one call that mattered, leaving the
+    domain enabled only on a session nobody was talking to any more. Measured
+    symptom: get_network_request could not retrieve a single response body, and
+    block_resources reported success while every image still loaded.
+    """
     import nodriver.cdp.network as cdp_net
+
+    session_id = getattr(tab, "session_id", None)
+    if not session_id:
+        # No session yet: tab.send would go to the browser-level connection and
+        # enable Network there instead. That scope stays enabled, so once the page
+        # session is enabled too, Chrome reports every request twice and
+        # nodriver's dispatcher — which ignores sessionId — delivers both. Skip;
+        # the next call, after the attach, does it on the right session.
+        return
+    session_key = (getattr(tab, "target_id", None), session_id)
+    if session_key in _network_collection_enabled_tabs:
+        return
+    _network_collection_enabled_tabs.add(session_key)
+    # The handler belongs to the Tab object, not the session: adding it again
+    # after a session change records every later request twice. id(tab) is the
+    # right key here for the same reason it was the wrong one for the enable —
+    # it tracks the object the handler is attached to, not the session state.
+    needs_handler = id(tab) not in _network_handler_targets
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
         global _request_counter
@@ -598,6 +644,120 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                 "method": event.request.method,
                 "timestamp": str(event.timestamp),
                 "type": str(resource_type),
+                # Filled in by the response-side handlers below. Until then the
+                # request is genuinely still in flight, and saying so is the point:
+                # a pending request and a completed 200 used to look identical.
+                "status": None,
+                "status_text": "",
+                "mime_type": "",
+                "response_headers": {},
+                "from_cache": False,
+                "size": None,
+                "duration_ms": None,
+                "failed": None,
+                "redirect_to": None,
+            })
+            # A redirect arrives as another requestWillBeSent for the SAME request
+            # id, carrying the response that caused it. Record where it went, so a
+            # 301 chain is visible instead of looking like repeated requests.
+            redirect = getattr(event, "redirect_response", None)
+            if redirect is not None:
+                for rec in reversed(_network_requests[:-1]):
+                    if rec["id"] == str(event.request_id) and rec["status"] is None:
+                        rec["status"] = getattr(redirect, "status", None)
+                        rec["status_text"] = getattr(redirect, "status_text", "") or ""
+                        rec["redirect_to"] = event.request.url
+                        break
+            _request_counter += 1
+            if len(_network_requests) > 1000:
+                _network_requests.pop(0)
+        except Exception:
+            pass
+
+    def _latest(request_id: Any) -> dict | None:
+        """The most recent record for this request id that is still open."""
+        wanted = str(request_id)
+        for rec in reversed(_network_requests):
+            if rec["id"] == wanted and rec.get("redirect_to") is None:
+                return rec
+        return None
+
+    async def _on_response(event: cdp_net.ResponseReceived):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            r = event.response
+            rec["status"] = getattr(r, "status", None)
+            rec["status_text"] = getattr(r, "status_text", "") or ""
+            rec["mime_type"] = getattr(r, "mime_type", "") or ""
+            rec["from_cache"] = bool(getattr(r, "from_disk_cache", False))
+            headers = getattr(r, "headers", None)
+            if headers:
+                # CDP Headers is a dict subclass; copy so later mutation cannot
+                # reach into the event object.
+                rec["response_headers"] = {str(k): str(v) for k, v in dict(headers).items()}
+            timing = getattr(r, "timing", None)
+            if timing is not None:
+                rec["_request_time"] = getattr(timing, "request_time", None)
+        except Exception:
+            pass
+
+    async def _on_finished(event: cdp_net.LoadingFinished):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            rec["size"] = int(getattr(event, "encoded_data_length", 0) or 0)
+            rec["failed"] = False
+            start = rec.get("_request_time")
+            if start:
+                rec["duration_ms"] = round((float(event.timestamp) - float(start)) * 1000, 1)
+        except Exception:
+            pass
+
+    def _socket(request_id: Any) -> dict | None:
+        wanted = str(request_id)
+        for rec in reversed(_network_requests):
+            if rec["id"] == wanted and rec["type"] == "WebSocket":
+                return rec
+        return None
+
+    def _add_frame(request_id: Any, direction: str, event: Any) -> None:
+        rec = _socket(request_id)
+        if rec is None:
+            return
+        frame = getattr(event, "response", None)
+        opcode = getattr(frame, "opcode", None)
+        payload = getattr(frame, "payload_data", "") or ""
+        rec["frames"].append({
+            "dir": direction,
+            # opcode 1 is text; anything else is base64 binary, and saying which
+            # matters because the payload is unreadable otherwise.
+            "kind": "text" if opcode == 1 else f"opcode {opcode:g}" if opcode else "?",
+            "data": payload[:_WS_PAYLOAD_CHARS],
+            "truncated": len(payload) > _WS_PAYLOAD_CHARS,
+        })
+        rec["frames_sent" if direction == "sent" else "frames_received"] += 1
+        if len(rec["frames"]) > _WS_FRAME_CAP:
+            rec["frames"].pop(0)
+            rec["frames_dropped"] += 1
+
+    async def _on_ws_created(event: cdp_net.WebSocketCreated):
+        global _request_counter
+        try:
+            _network_requests.append({
+                "seq": _request_counter,
+                "id": str(event.request_id),
+                "url": event.url,
+                "method": "GET",
+                "timestamp": "",
+                "type": "WebSocket",
+                "status": None, "status_text": "", "mime_type": "",
+                "response_headers": {}, "from_cache": False, "size": None,
+                "duration_ms": None, "failed": None, "redirect_to": None,
+                "frames": [], "frames_sent": 0, "frames_received": 0,
+                "frames_dropped": 0, "closed": False,
             })
             _request_counter += 1
             if len(_network_requests) > 1000:
@@ -605,11 +765,184 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         except Exception:
             pass
 
+    async def _on_ws_handshake(event: cdp_net.WebSocketHandshakeResponseReceived):
+        try:
+            rec = _socket(event.request_id)
+            if rec is None:
+                return
+            r = event.response
+            rec["status"] = getattr(r, "status", None)
+            rec["status_text"] = getattr(r, "status_text", "") or ""
+            headers = getattr(r, "headers", None)
+            if headers:
+                rec["response_headers"] = {str(k): str(v) for k, v in dict(headers).items()}
+        except Exception:
+            pass
+
+    async def _on_ws_sent(event: cdp_net.WebSocketFrameSent):
+        try:
+            _add_frame(event.request_id, "sent", event)
+        except Exception:
+            pass
+
+    async def _on_ws_received(event: cdp_net.WebSocketFrameReceived):
+        try:
+            _add_frame(event.request_id, "recv", event)
+        except Exception:
+            pass
+
+    async def _on_ws_closed(event: cdp_net.WebSocketClosed):
+        try:
+            rec = _socket(event.request_id)
+            if rec is not None:
+                rec["closed"] = True
+        except Exception:
+            pass
+
+    async def _on_ws_error(event: cdp_net.WebSocketFrameError):
+        try:
+            rec = _socket(event.request_id)
+            if rec is not None:
+                rec["failed"] = True
+                rec["status_text"] = getattr(event, "error_message", "") or "frame error"
+        except Exception:
+            pass
+
+    async def _on_failed(event: cdp_net.LoadingFailed):
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            rec["failed"] = True
+            rec["status_text"] = (
+                getattr(event, "error_text", "") or "" ) or rec.get("status_text", "")
+            if getattr(event, "canceled", False):
+                rec["status_text"] = (rec["status_text"] + " (canceled)").strip()
+        except Exception:
+            pass
+
     try:
-        await tab.send(cdp_net.enable())
-        tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+        # The buffer sizes are the whole reason get_network_request could not
+        # return a response body: with them omitted Chrome keeps no resource
+        # bodies, so Network.getResponseBody answered "No resource with given
+        # identifier found" for every request, including one issued a second
+        # earlier. DevTools itself passes these. Measured: without them 0 of 3
+        # bodies were retrievable, with them the same JSON came back in full.
+        await tab.send(
+            cdp_net.enable(
+                max_total_buffer_size=50_000_000,
+                max_resource_buffer_size=10_000_000,
+            )
+        )
+        if needs_handler:
+            tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
+            tab.add_handler(cdp_net.ResponseReceived, _on_response)
+            tab.add_handler(cdp_net.LoadingFinished, _on_finished)
+            tab.add_handler(cdp_net.LoadingFailed, _on_failed)
+            tab.add_handler(cdp_net.WebSocketCreated, _on_ws_created)
+            tab.add_handler(cdp_net.WebSocketHandshakeResponseReceived, _on_ws_handshake)
+            tab.add_handler(cdp_net.WebSocketFrameSent, _on_ws_sent)
+            tab.add_handler(cdp_net.WebSocketFrameReceived, _on_ws_received)
+            tab.add_handler(cdp_net.WebSocketClosed, _on_ws_closed)
+            tab.add_handler(cdp_net.WebSocketFrameError, _on_ws_error)
+            _network_handler_targets.add(id(tab))
     except Exception:
-        pass
+        _network_collection_enabled_tabs.discard(session_key)
+
+
+def _request_outcome(req: dict) -> str:
+    """A short verdict for one request, so failures are visible at a glance.
+
+    A 500, a 404, a redirect, a DNS failure and a request still in flight used to
+    render as identical lines, which made the network log useless for the one job
+    it has: telling you which request went wrong.
+    """
+    status = req.get("status")
+    # A response that arrived outranks a later transport error. An unconsumed
+    # fetch body is aborted by Chrome as a matter of course, and reporting that
+    # as FAILED hid the 500 the caller was actually looking for.
+    if status is None:
+        if req.get("failed"):
+            return f"FAILED({req.get('status_text') or 'error'})"
+        return "pending"
+    if req.get("redirect_to"):
+        # ASCII on purpose: this string can end up on a cp1252 Windows console.
+        return f"{status}->"
+    if req.get("failed"):
+        return f"{status} (body incomplete)"
+    return str(status)
+
+
+# A chatty socket would otherwise grow without bound in a long session.
+_WS_FRAME_CAP = 200
+_WS_PAYLOAD_CHARS = 2000
+
+
+def _request_timing(req: dict) -> str:
+    if req.get("type") == "WebSocket":
+        parts = [f"{req.get('frames_sent', 0)} sent", f"{req.get('frames_received', 0)} recv"]
+        if req.get("frames_dropped"):
+            parts.append(f"{req['frames_dropped']} dropped")
+        if req.get("closed"):
+            parts.append("closed")
+        return " " + " ".join(parts)
+    parts = []
+    if req.get("duration_ms") is not None:
+        parts.append(f"{req['duration_ms']:g}ms")
+    if req.get("size"):
+        parts.append(f"{req['size']}B")
+    if req.get("from_cache"):
+        parts.append("cached")
+    return " " + " ".join(parts) if parts else ""
+
+
+async def _auto_enable_dialog_tracking(tab: uc.Tab) -> None:
+    """Enable the Page domain so JavaScript dialogs can be answered at all.
+
+    A modal alert/confirm/prompt blocks the renderer, so every later call into the
+    page hangs until it is dismissed — and handle_dialog was the one call that
+    could not dismiss it, because Chrome only reports a dialog to a client that
+    enabled Page, and Page.enable was sent only from navigate_page. A tab reached
+    through new_page alone therefore answered "No dialog is showing" while being
+    wedged by one, with no way out but closing the tab.
+
+    Page.enable is not Runtime.enable: it does not expose the console-attached
+    debugger signal this server deliberately keeps off, and navigate_page has
+    always sent it anyway.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    session_id = getattr(tab, "session_id", None)
+    if not session_id:
+        return
+    key = (getattr(tab, "target_id", None), session_id)
+    if key in _dialog_tracked_sessions:
+        return
+    _dialog_tracked_sessions.add(key)
+
+    target = _target_key(tab)
+
+    async def _on_open(event: cdp_page.JavascriptDialogOpening):
+        try:
+            kind = getattr(event, "type_", None)
+            _open_dialogs[target] = {
+                "type": str(getattr(kind, "value", kind) or "dialog"),
+                "message": getattr(event, "message", "") or "",
+            }
+        except Exception:
+            pass
+
+    async def _on_closed(event: cdp_page.JavascriptDialogClosed):
+        _open_dialogs.pop(target, None)
+
+    try:
+        await tab.send(cdp_page.enable())
+        if id(tab) not in _dialog_handler_tabs:
+            tab.add_handler(cdp_page.JavascriptDialogOpening, _on_open)
+            tab.add_handler(cdp_page.JavascriptDialogClosed, _on_closed)
+            _dialog_handler_tabs.add(id(tab))
+    except Exception:
+        _dialog_tracked_sessions.discard(key)
 
 
 async def _enable_console_collection(tab: uc.Tab) -> bool:
@@ -646,9 +979,43 @@ async def _enable_console_collection(tab: uc.Tab) -> bool:
         except Exception:
             pass
 
+    async def _on_exception(event):
+        """Capture uncaught errors and unhandled promise rejections.
+
+        Runtime.consoleAPICalled only fires for explicit console.* calls, so
+        without this an uncaught TypeError — the thing you actually want when a
+        page is broken — was reported as "0 messages".
+        """
+        global _console_counter
+        try:
+            det = getattr(event, "exception_details", None)
+            exc = getattr(det, "exception", None)
+            text = (
+                getattr(exc, "description", None)
+                or getattr(exc, "value", None)
+                or getattr(det, "text", None)
+                or "Uncaught exception"
+            )
+            url = getattr(det, "url", "") or ""
+            line = getattr(det, "line_number", None)
+            where = f" ({url}:{line})" if url else ""
+            _console_messages.append({
+                "seq": _console_counter,
+                "type": "error",
+                "text": f"{text}{where}",
+                "timestamp": str(getattr(event, "timestamp", "")),
+            })
+            _console_counter += 1
+            if len(_console_messages) > 1000:
+                _console_messages.pop(0)
+        except Exception:
+            pass
+
     try:
         await tab.send(cdp_runtime.enable())
         tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
+        tab.add_handler(cdp_runtime.ExceptionThrown, _on_exception)
+        _console_handlers[tab_id] = (_on_console, _on_exception)
         _console_collection_enabled_tabs.add(tab_id)
         return True
     except Exception:
@@ -663,10 +1030,17 @@ async def _disable_console_collection(tab: uc.Tab) -> bool:
 
     import nodriver.cdp.runtime as cdp_runtime
 
-    try:
-        tab.remove_handler(cdp_runtime.ConsoleAPICalled)
-    except Exception:
-        pass
+    # remove_handler(event_type, callback) — callback is required. Passing only
+    # the type raised TypeError into a bare except, so the handler was never
+    # removed and every re-enable added another one, duplicating every message.
+    handlers = _console_handlers.pop(tab_id, ())
+    for event_type, cb in zip(
+        (cdp_runtime.ConsoleAPICalled, cdp_runtime.ExceptionThrown), handlers
+    ):
+        try:
+            tab.remove_handler(event_type, cb)
+        except Exception:
+            pass
 
     try:
         await tab.send(cdp_runtime.disable())
@@ -771,22 +1145,114 @@ _SELECT_CONTENTS = (
 )
 
 
-async def _read_field(tab: uc.Tab, remote_obj: Any) -> str:
-    """Current text of an input, textarea, select or contenteditable."""
+_PROBE_FIELD = (
+    "function() {"
+    " if (!this || !this.tagName) return null;"
+    " const tag = this.tagName.toLowerCase();"
+    " return {"
+    "   tag: this.isContentEditable ? 'contenteditable' : tag,"
+    "   type: (this.getAttribute && this.getAttribute('type') || this.type || '').toLowerCase(),"
+    "   readOnly: !!this.readOnly, disabled: !!this.disabled,"
+    " }; }"
+)
+
+# Typing into these is locale-dependent and does not survive a read-back: a date
+# input shows "08/08/2026" while its value is "2026-08-08", so the select-and-type
+# path reported an error for a fill that had in fact worked. They are set through
+# a scripted assignment plus input+change, and the response says so, the same way
+# click discloses its synthetic fallback.
+_SCRIPTED_VALUE_TYPES = {
+    "date", "month", "week", "time", "datetime-local", "color", "range",
+}
+# Not value-bearing at all — filling them silently did something else entirely.
+_NOT_FILLABLE = {
+    "checkbox": "set_checked",
+    "radio": "set_checked",
+    "file": "upload_file",
+    "button": None,
+    "submit": None,
+    "reset": None,
+    "image": None,
+}
+
+
+async def _read_field(tab: uc.Tab, remote_obj: Any, field_type: str = "") -> str:
+    """Current value of an input, textarea, select or contenteditable.
+
+    Type-aware, because `el.value` is the wrong property for several of them: a
+    checkbox's value is its submit value and never changes when it is ticked, so
+    comparing it made the check vacuous — fill reported success for a radio that
+    was never selected.
+    """
+    if field_type in ("checkbox", "radio"):
+        expr = "function() { return this.checked ? 'true' : 'false'; }"
+    else:
+        expr = "function() { return this.isContentEditable ? this.innerText : (this.value ?? ''); }"
     obj = await _call_function_on(
-        tab,
-        function_declaration=(
-            "function() { return this.isContentEditable ? this.innerText : (this.value ?? ''); }"
-        ),
-        object_id=remote_obj.object_id,
-        return_by_value=True,
+        tab, function_declaration=expr, object_id=remote_obj.object_id, return_by_value=True
     )
     if obj is None or obj.value is None:
         return ""
     return str(obj.value)
 
 
-async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
+async def _select_options(tab: uc.Tab, remote_obj: Any) -> list[dict]:
+    """Every option of a <select>, so a failure can name the real choices."""
+    obj = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() { return [...(this.options || [])].map((o, i) => "
+            "({index: i, value: o.value, label: (o.label || o.textContent || '').trim()})); }"
+        ),
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    return list(obj.value) if obj and isinstance(obj.value, list) else []
+
+
+async def _set_select_value(tab: uc.Tab, remote_obj: Any, wanted: str) -> str:
+    """Choose a <select> option by value, then by visible label, then by index.
+
+    Matching only the value attribute meant an agent had to guess it, and the
+    failure said nothing about what was actually on offer.
+    """
+    import nodriver.cdp.runtime as cdp_runtime
+
+    result = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function(want) {"
+            " const opts = [...(this.options || [])];"
+            " let opt = opts.find(o => o.value === want);"
+            " let how = 'value';"
+            " if (!opt) { opt = opts.find(o => (o.label || o.textContent || '').trim() === want);"
+            "             how = 'label'; }"
+            " if (!opt && /^\\d+$/.test(want) && opts[+want]) { opt = opts[+want]; how = 'index'; }"
+            " if (!opt) return {ok: false};"
+            " this.value = opt.value;"
+            " this.dispatchEvent(new Event('input', {bubbles: true}));"
+            " this.dispatchEvent(new Event('change', {bubbles: true}));"
+            " return {ok: this.value === opt.value, how: how, value: opt.value,"
+            "         label: (opt.label || opt.textContent || '').trim()}; }"
+        ),
+        object_id=remote_obj.object_id,
+        arguments=[cdp_runtime.CallArgument(value=wanted)],
+        return_by_value=True,
+    )
+    info = result.value if result and isinstance(result.value, dict) else {}
+    if not info.get("ok"):
+        options = await _select_options(tab, remote_obj)
+        shown = ", ".join(f"{o['value']!r} ({o['label']})" for o in options[:15]) or "(none)"
+        more = f" and {len(options) - 15} more" if len(options) > 15 else ""
+        raise RuntimeError(
+            f"no option matching {wanted!r} in this <select>. Available: {shown}{more}."
+        )
+    if info.get("how") == "value":
+        return ""
+    return f" (matched the option by {info['how']}: value={info['value']!r})"
+
+
+async def _fill_element(tab: uc.Tab, uid: str, value: str) -> str:
     """Fill one input, textarea, select or contenteditable by uid.
 
     Clearing a field before typing (``value = ''`` plus an input event) makes a
@@ -814,41 +1280,66 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     if element is not None and getattr(element, "object_id", None):
         remote_obj = element
 
-    tag_obj = await _call_function_on(
+    probe = await _call_function_on(
         tab,
-        function_declaration=(
-            "function() { if (!this || !this.tagName) return ''; "
-            "return this.isContentEditable ? 'contenteditable' : this.tagName.toLowerCase(); }"
-        ),
+        function_declaration=_PROBE_FIELD,
         object_id=remote_obj.object_id,
         return_by_value=True,
     )
-    tag = tag_obj.value if tag_obj else ""
-    if not tag:
+    info = probe.value if probe and isinstance(probe.value, dict) else None
+    if not info:
         raise RuntimeError(
             f"uid={uid} is not an element that can be filled. Take a fresh "
             "take_snapshot and use the uid of the input, textarea, select or "
             "editable element itself."
         )
+    tag = str(info.get("tag") or "")
+    field_type = str(info.get("type") or "")
+
+    if info.get("disabled"):
+        raise RuntimeError(
+            f"uid={uid} is disabled, so nothing can be entered into it. The page "
+            "usually enables it in response to another field."
+        )
+
+    # A checkbox is not a text field. The select-and-type path used to run on one
+    # anyway, which typed the value into whatever had focus — the previously
+    # filled field in a fill_form — while the read-back compared el.value, which
+    # a checkbox never changes, so it reported success.
+    if tag == "input" and field_type in _NOT_FILLABLE:
+        better = _NOT_FILLABLE[field_type]
+        hint = f" Use {better} instead." if better else ""
+        raise RuntimeError(
+            f"uid={uid} is an <input type={field_type}>, which holds no text.{hint}"
+        )
 
     if tag == "select":
+        return await _set_select_value(tab, remote_obj, value)
+
+    if tag == "input" and field_type in _SCRIPTED_VALUE_TYPES:
         await _call_function_on(
             tab,
             function_declaration=(
-                "function(val) { this.value = val; "
-                "this.dispatchEvent(new Event('change', {bubbles: true})); }"
+                "function(val) { this.focus(); this.value = val;"
+                " this.dispatchEvent(new Event('input', {bubbles: true}));"
+                " this.dispatchEvent(new Event('change', {bubbles: true})); }"
             ),
             object_id=remote_obj.object_id,
             arguments=[cdp_runtime.CallArgument(value=value)],
             return_by_value=True,
         )
         await tab
-        if await _read_field(tab, remote_obj) != value:
+        got = await _read_field(tab, remote_obj, field_type)
+        if got != value:
             raise RuntimeError(
-                f"no option with value {value!r} in this <select>. "
-                "Use the option's value attribute, not its visible label."
+                f"the {field_type} input did not accept {value!r}; it now holds "
+                f"{got!r}. These inputs need their wire format, not what is "
+                "displayed — a date wants YYYY-MM-DD, a time HH:MM, a colour #rrggbb."
             )
-        return
+        return (
+            f" (set as a value on the {field_type} input rather than typed; the page"
+            " saw input and change events, but no keystrokes)"
+        )
 
     await _call_function_on(
         tab,
@@ -864,8 +1355,8 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     def _matches(got: str) -> bool:
         return got.strip() == value.strip() if tag == "contenteditable" else got == value
 
-    if _matches(await _read_field(tab, remote_obj)):
-        return
+    if _matches(await _read_field(tab, remote_obj, field_type)):
+        return ""
 
     # Synthesised key events were dropped. Insert the text as a single edit,
     # which rich-text and some framework-managed fields accept instead.
@@ -878,13 +1369,15 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     await tab.send(cdp_input.insert_text(value))
     await tab
 
-    got = await _read_field(tab, remote_obj)
+    got = await _read_field(tab, remote_obj, field_type)
     if not _matches(got):
+        extra = " It is marked read-only." if info.get("readOnly") else ""
         raise RuntimeError(
-            f"the field did not accept the value; it now holds {got!r}. "
+            f"the field did not accept the value; it now holds {got!r}.{extra} "
             "It may be read-only or disabled, covered by an overlay, or it "
             "rewrites what is typed (a masked or formatted input)."
         )
+    return ""
 
 
 async def _double_click(tab: uc.Tab, x: float, y: float) -> None:
@@ -991,6 +1484,12 @@ async def _wait_for_target(browser: uc.Browser, target_id: Any, timeout_ms: int)
             if tab.target_id == target_id:
                 tab._browser = browser
                 return tab
+        # A target created through CDP directly is not in nodriver's inventory
+        # until something refreshes it; without this the loop can only time out.
+        try:
+            await browser.update_targets()
+        except Exception:
+            pass
         await asyncio.sleep(0.1)
 
     raise TimeoutError(f"New page did not appear within {int(timeout_s * 1000)}ms")
@@ -1163,6 +1662,28 @@ async def _apply_emulation(
     return results
 
 
+async def _match_real_chrome_version(tab: uc.Tab, user_agent: str) -> str:
+    """Put the running browser's Chrome version into a preset's user agent.
+
+    The presets ship a fixed version, but Chrome fills navigator.userAgentData
+    from the real build — so a preset written against Chrome 150 announced
+    "Chrome/150" in the UA string while its own client hints said 151. Comparing
+    the two is one line of JavaScript and a reliable tell, on a server whose whole
+    point is not standing out. Anything the browser cannot be talked out of has to
+    be matched rather than contradicted.
+    """
+    if "Chrome/" not in user_agent:
+        return user_agent  # Safari-shaped presets carry no Chrome token
+    try:
+        real = str(await _evaluate_value(tab, "navigator.userAgent") or "")
+        match = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", real)
+        if not match:
+            return user_agent
+        return re.sub(r"Chrome/\d+\.\d+\.\d+\.\d+", f"Chrome/{match.group(1)}", user_agent)
+    except Exception:
+        return user_agent
+
+
 async def _apply_device_preset(tab: uc.Tab, device: str) -> list[str]:
     """Apply a named device preset to a tab."""
     resolved = _resolve_device_preset(device)
@@ -1171,9 +1692,10 @@ async def _apply_device_preset(tab: uc.Tab, device: str) -> list[str]:
         raise ValueError(f"Unknown device preset '{device}'. Supported presets: {supported}")
 
     metadata = _build_user_agent_metadata(resolved["metadata"]) if resolved.get("metadata") else None
+    user_agent = await _match_real_chrome_version(tab, resolved["user_agent"])
     results = await _apply_emulation(
         tab,
-        user_agent=resolved["user_agent"],
+        user_agent=user_agent,
         user_agent_platform=resolved["platform"],
         user_agent_metadata=metadata,
         accept_language=resolved.get("accept_language", ""),
@@ -1241,21 +1763,24 @@ async def _open_new_tab(
         ctx = _named_browser_contexts.get(isolated_context)
         if ctx is None:
             ctx = await _await_with_timeout(
-                browser.connection.send(
-                    cdp_target.create_browser_context(dispose_on_detach=False)
-                ),
+                # Browser subclasses Connection, so it sends CDP itself.
+                # browser.connection is initialised to None by nodriver and never
+                # assigned, so reaching through it raises AttributeError every time.
+                browser.send(cdp_target.create_browser_context(dispose_on_detach=False)),
                 timeout,
                 f"Create isolated context '{isolated_context}'",
             )
             _named_browser_contexts[isolated_context] = ctx
 
         target_id = await _await_with_timeout(
-            browser.connection.send(
+            browser.send(
                 cdp_target.create_target(
                     url=url,
                     browser_context_id=ctx,
                     background=background,
-                    for_tab=True,
+                    # for_tab=True asks for a target of type "tab", which
+                    # browser.tabs filters out — _wait_for_target would then
+                    # never find it and always time out.
                 )
             ),
             timeout,
@@ -1268,6 +1793,140 @@ async def _open_new_tab(
     tab = await _await_with_timeout(browser.get(url, new_tab=True), timeout, "Open new page")
     await _await_with_timeout(tab, timeout, "Wait for new page")
     return tab
+
+
+async def _frame_list(tab: uc.Tab) -> list[dict]:
+    """Flatten the page's frame tree, main frame first.
+
+    Everything frame-aware in the server is built on this. Chrome's own AX tree
+    call stops at the frame boundary, so a page's payment field, consent wall or
+    embedded editor was simply unreachable — a snapshot showed a bare Iframe node
+    and nothing inside it.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    tree = await tab.send(cdp_page.get_frame_tree())
+    frames: list[dict] = []
+
+    def walk(node: Any, depth: int, parent: str) -> None:
+        frame = getattr(node, "frame", None)
+        if frame is None:
+            return
+        frame_id = str(getattr(frame, "id_", "") or "")
+        frames.append({
+            "index": len(frames),
+            "frame_id": frame_id,
+            "url": getattr(frame, "url", "") or "",
+            "name": getattr(frame, "name", "") or "",
+            "depth": depth,
+            "parent": parent,
+        })
+        for child in (getattr(node, "child_frames", None) or []):
+            walk(child, depth + 1, frame_id)
+
+    walk(tree, 0, "")
+    return frames
+
+
+async def _resolve_frame(tab: uc.Tab, frame: str) -> tuple[str, str]:
+    """Turn a frame index or id into (frame_id, url), or raise with the choices."""
+    frames = await _frame_list(tab)
+    wanted = (frame or "").strip()
+    if wanted.isdigit():
+        idx = int(wanted)
+        if idx < len(frames):
+            return frames[idx]["frame_id"], frames[idx]["url"]
+    else:
+        for entry in frames:
+            if entry["frame_id"] == wanted or (entry["name"] and entry["name"] == wanted):
+                return entry["frame_id"], entry["url"]
+    listing = "; ".join(f"{f['index']}={f['url'][:60] or f['name'] or '(blank)'}" for f in frames)
+    raise RuntimeError(
+        f"no frame matching {frame!r}. This page has {len(frames)}: {listing}. "
+        "Pass the index, the frame id or its name."
+    )
+
+
+@tool(title="List frames", read_only=True)
+async def list_frames() -> str:
+    """List the page's frames, so their content can be reached at all.
+
+    Chrome's accessibility tree stops at a frame boundary, and
+    document.querySelector never crosses one, so anything inside an iframe —
+    payment fields, consent walls, embedded editors, CAPTCHA widgets — is
+    invisible to take_snapshot and query_selector by default.
+
+    Index 0 is always the main frame. Pass an index or frame id as the `frame`
+    argument of get_page_content, query_selector, evaluate_script,
+    wait_for_selector or take_snapshot to work inside one.
+    """
+    tab = await _active_tab()
+    try:
+        frames = await _frame_list(tab)
+    except Exception as e:
+        return f"Error listing frames: {e}"
+    if len(frames) == 1:
+        return "1 frame (the main document); this page has no iframes."
+    lines = [f"{len(frames)} frames:"]
+    for f in frames:
+        indent = "  " * f["depth"]
+        name = f' name="{f["name"]}"' if f["name"] else ""
+        label = " (main frame)" if f["depth"] == 0 else ""
+        lines.append(f"  [{f['index']}] {indent}{f['url'] or '(blank)'}{name}{label}")
+    return "\n".join(lines)
+
+
+async def _navigate_same_tab(tab: uc.Tab, target_url: str) -> str:
+    """Navigate this tab over CDP, without nodriver's re-attach.
+
+    Tab.get() delegates to Browser.get(), which navigates the *first* page target
+    rather than self, and then calls connection.attach() again. That mints a brand
+    new CDP session for the same target and never detaches the old one, so every
+    domain this server enabled belongs to a stranded session while commands go to
+    a session where nothing was ever enabled. Tracing.end answered "Tracing is not
+    started", Network.getResponseBody could not find any request, and every
+    reset/clear/disable call wrote into the orphan.
+
+    Page.navigate resolves once the navigation has committed or failed, so the
+    document is already the new one by the time this returns, and errorText and
+    isDownload — both discarded by nodriver — become visible.
+
+    Returns a note to append to the tool's answer, or "".
+    """
+    import nodriver.cdp.page as cdp_page
+
+    frame_id, loader_id, error_text, is_download = await tab.send(
+        cdp_page.navigate(url=target_url)
+    )
+    if is_download:
+        return " (the URL was a download, not a page; the tab did not change)"
+    if error_text:
+        # Chrome reports an HTTP error status with no body as a navigation
+        # failure, but the navigation committed and the page is readable — a 404
+        # page is a page. Only a transport-level failure means there is nothing
+        # there, and that is what deserves to be an error.
+        if "ERR_HTTP_RESPONSE_CODE_FAILURE" in error_text:
+            return (
+                " (no page was loaded: the server answered with an HTTP error status"
+                " and an empty body, so Chrome showed its own error page. An error"
+                " status that does come with a body renders normally.)"
+            )
+        raise RuntimeError(f"navigation failed: {error_text}")
+
+    # Wait for the new document to be usable, but never for its subresources: a
+    # page with one hanging image is still readable, and blocking on the load
+    # event would turn a two-second call into a thirty-second one.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while loop.time() - start < 5.0:
+        try:
+            state = await _evaluate_value(tab, "document.readyState")
+        except Exception:
+            state = None
+        if state in ("interactive", "complete"):
+            break
+        await asyncio.sleep(0.05)
+    return ""
 
 
 async def _refresh_targets(browser: uc.Browser) -> None:
@@ -1443,16 +2102,82 @@ async def cf_verify() -> str:
     or "Checking your browser before accessing". Drives nodriver's built-in
     verification bypass, which locates the checkbox visually and clicks it.
 
-    Requires opencv-python to be installed; without it this returns an error.
-    Many challenges also clear by themselves after a few seconds, so
-    wait_for(["some text from the real page"]) is worth trying first.
+    Needs opencv, which is an optional extra: install nodriver-mcp[cf], or this
+    reports that it is missing rather than failing obscurely. Many challenges
+    clear by themselves after a few seconds, so wait_for(["some text from the
+    real page"]) is worth trying first — and this says so when it looks at the
+    page and finds no challenge at all.
     """
+    if importlib.util.find_spec("cv2") is None:
+        return (
+            "Error: cf_verify needs opencv, which is not installed. Install it with "
+            "`pip install nodriver-mcp[cf]` (or `pip install opencv-python`). "
+            "Everything else in this server works without it — and a Cloudflare "
+            "interstitial often clears on its own, so try "
+            'wait_for(["text from the real page"]) first.'
+        )
+
     tab = await _active_tab()
     try:
-        await tab.verify_cf()
-        return "Cloudflare verification attempted."
-    except Exception as e:
-        return f"Error: {e}"
+        state = await _evaluate_value(tab, (
+            "(() => {"
+            " const t = (document.title || '').toLowerCase();"
+            " if (t.includes('just a moment') || t.includes('attention required')) return 'challenge';"
+            " if (document.querySelector('iframe[src*=\"challenges.cloudflare.com\"]')) return 'challenge';"
+            " if (document.querySelector('#cf-chl-widget, .cf-turnstile, #challenge-form')) return 'challenge';"
+            " return 'none'; })()"
+        ))
+    except Exception:
+        state = "unknown"
+    if state == "none":
+        return (
+            "No Cloudflare challenge is on this page — nothing to verify. If the "
+            "page still looks wrong, read it with get_page_content: a block page "
+            "that is not Cloudflare's needs a different answer."
+        )
+
+    # nodriver's verify_cf writes its screenshot and template into the process
+    # working directory, which for an stdio MCP server is the client's — often
+    # read-only, and never somewhere we should be writing. It swallows the
+    # resulting OSError and then fails opaquely, so give it a scratch directory.
+    async with _CF_LOCK:
+        previous = os.getcwd()
+        workdir = tempfile.mkdtemp(prefix="nodriver-cf-")
+        try:
+            os.chdir(workdir)
+            await tab.verify_cf()
+            return "Cloudflare verification attempted. Check the page before continuing."
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            try:
+                os.chdir(previous)
+            except Exception:
+                pass
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _as_element(tab: uc.Tab, remote_obj: Any) -> Any:
+    """The element for this object, promoting a text node to its parent.
+
+    A snapshot uid can land on a StaticText node, and everything that measures or
+    clicks needs an element — without this the caller got
+    "this.getBoundingClientRect is not a function", which says nothing about the
+    real problem. _fill_element has always done this; the pointer tools had not.
+    """
+    try:
+        promoted = await _call_function_on(
+            tab,
+            function_declaration=(
+                "function() { return this.nodeType === 3 ? this.parentElement : this; }"
+            ),
+            object_id=remote_obj.object_id,
+        )
+        if promoted is not None and getattr(promoted, "object_id", None):
+            return promoted
+    except Exception:
+        pass
+    return remote_obj
 
 
 async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] | str:
@@ -1465,6 +2190,12 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
     is actually hit, and try a few points before giving up.
 
     Returns (x, y) on success, or a string describing the blocker.
+
+    For an element inside an iframe the hit test necessarily runs in that frame's
+    own document, so the point it returns is relative to the frame's viewport
+    while CDP input is delivered in the top-level one. The frame's offset is added
+    back, or every click into a frame would land somewhere else entirely — and
+    report success for it.
     """
     obj = await _call_function_on(
         tab,
@@ -1479,7 +2210,8 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
             "   const x = r.left + r.width * fx, y = r.top + r.height * fy;"
             "   if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;"
             "   const el = document.elementFromPoint(x, y);"
-            "   if (el && (el === this || this.contains(el))) return JSON.stringify({x, y});"
+            "   if (el && (el === this || this.contains(el)))"
+            "     return JSON.stringify({x, y, rx: r.left, ry: r.top});"
             "   if (el && !blocker) blocker = el;"
             " }"
             " if (!blocker) return JSON.stringify({"
@@ -1498,8 +2230,168 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
     except (TypeError, ValueError):
         return "the page did not report a hit point"
     if "x" in data:
-        return float(data["x"]), float(data["y"])
+        dx, dy = await _frame_offset(
+            tab, remote_obj, float(data.get("rx", 0.0)), float(data.get("ry", 0.0))
+        )
+        return float(data["x"]) + dx, float(data["y"]) + dy
     return str(data.get("reason", "something else is in the way"))
+
+
+_PROBE_ARM = (
+    "() => { globalThis.__ndInput = 0;"
+    " if (!globalThis.__ndArmed) {"
+    "   globalThis.__ndArmed = true;"
+    "   const bump = () => { globalThis.__ndInput = (globalThis.__ndInput || 0) + 1; };"
+    "   document.addEventListener('pointerdown', bump, true);"
+    "   document.addEventListener('keydown', bump, true);"
+    " } return true; }"
+)
+
+
+async def _arm_input_probe(tab: uc.Tab) -> bool:
+    """Start counting input events the page receives, invisibly to the page.
+
+    The counter lives in an isolated world, so `window` keeps no trace of it — a
+    global on the page would itself be a detection signal on a server whose whole
+    point is not standing out. Listeners registered from an isolated world do see
+    real DOM events, which is what makes this possible at all.
+    """
+    try:
+        await _evaluate_value(tab, f"({_PROBE_ARM})()", frame="0")
+        return True
+    except Exception:
+        return False
+
+
+async def _read_input_probe(tab: uc.Tab) -> int | None:
+    """How many input events arrived since arming, or None if it could not be read."""
+    try:
+        value = await _evaluate_value(tab, "globalThis.__ndInput ?? null", frame="0")
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+async def _move_mouse(tab: uc.Tab, x: float, y: float, buttons: int = 0) -> None:
+    """Move the pointer to (x, y) from wherever it actually is.
+
+    nodriver's Tab.mouse_move interpolates from the viewport origin every single
+    time, firing mouseMoved along the whole diagonal — so every menu and tooltip
+    on that line opens on the way — and then ends with a mouseReleased, a stray
+    mouseup on the target that drag handles, sliders and canvas editors act on.
+    """
+    import nodriver.cdp.input_ as cdp_input
+
+    key = _target_key(tab)
+    last_x, last_y = _pointer_positions.get(key, (x, y))
+    button = cdp_input.MouseButton.LEFT if buttons else cdp_input.MouseButton.NONE
+    steps = 6 if (abs(x - last_x) + abs(y - last_y)) > 8 else 1
+    for i in range(1, steps + 1):
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mouseMoved",
+            x=last_x + (x - last_x) * i / steps,
+            y=last_y + (y - last_y) * i / steps,
+            button=button,
+            buttons=buttons,
+        ))
+    _pointer_positions[key] = (x, y)
+
+
+async def _input_delivery_note(tab: uc.Tab, armed: bool) -> str:
+    """A warning when keystrokes were acknowledged but nothing received them.
+
+    A CDP Input ack proves only that the browser queued the event. An occluded
+    window, an open JavaScript dialog or a wedged renderer swallow it, and every
+    tool here used to report success regardless.
+    """
+    if not armed:
+        return ""
+    if await _read_input_probe(tab) != 0:
+        return ""
+    try:
+        dialog = _open_dialogs.get(_target_key(tab))
+    except Exception:
+        # This only annotates another tool's answer; it must never be the thing
+        # that turns a completed action into an error.
+        dialog = None
+    if dialog:
+        return (
+            f" — WARNING: nothing reached the page: a {dialog['type']} dialog is open"
+            " and blocking it. Call handle_dialog first."
+        )
+    return (
+        " — WARNING: no key event reached the page. The window may be occluded by"
+        " another window, a JavaScript dialog may be open, or nothing focusable"
+        " has focus. The page is not known to have changed."
+    )
+
+
+async def _focused_description(tab: uc.Tab) -> str:
+    """A short label for whatever currently has focus, e.g. 'input#email'.
+
+    type_text types into the focused element and used to say only how many
+    characters it sent, so typing into the wrong field — or into a page with
+    nothing focused — looked identical to success.
+    """
+    try:
+        return str(await _evaluate_value(tab, (
+            "(() => { const el = document.activeElement;"
+            " if (!el || el === document.body) return '';"
+            " const id = el.id ? '#' + el.id : '';"
+            " const name = el.getAttribute && el.getAttribute('name');"
+            " return el.tagName.toLowerCase() + id + (!id && name ? '[name=' + name + ']' : ''); })()"
+        )) or "")
+    except Exception:
+        return ""
+
+
+async def _element_in_frame(tab: uc.Tab, remote_obj: Any) -> bool:
+    """Whether this element lives in a child frame rather than the main document.
+
+    Only consulted when a delivery probe saw nothing: events inside an iframe do
+    not reach the top document, so silence there is expected and must not be
+    reported as a failed click.
+    """
+    try:
+        rect = await _call_function_on(
+            tab,
+            function_declaration=(
+                "function() { const r = this.getBoundingClientRect();"
+                " return JSON.stringify([r.left, r.top]); }"
+            ),
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        local = json.loads(rect.value) if rect and rect.value else [0, 0]
+        dx, dy = await _frame_offset(tab, remote_obj, float(local[0]), float(local[1]))
+        return abs(dx) > 1 or abs(dy) > 1
+    except Exception:
+        return False
+
+
+async def _frame_offset(tab: uc.Tab, remote_obj: Any, rx: float, ry: float) -> tuple[float, float]:
+    """How far this element's own coordinate space is from the top-level viewport.
+
+    Rather than identifying the element's frame — DOM.describeNode reports a
+    frameId only for the <iframe> element itself, never for nodes inside it — this
+    measures the shift directly: DOM.getBoxModel answers in top-level coordinates
+    for any node, and getBoundingClientRect answered in the element's own
+    document. The difference is the offset, whatever the nesting depth, and it is
+    zero for a main-frame element, so the same code path serves both.
+    """
+    import nodriver.cdp.dom as cdp_dom
+
+    try:
+        model = await tab.send(cdp_dom.get_box_model(object_id=remote_obj.object_id))
+        # border quad is [x1,y1, x2,y2, ...]; the first corner is the top-left.
+        quad = model.border
+        dx, dy = float(quad[0]) - rx, float(quad[1]) - ry
+        # A sub-pixel difference is rounding, not a frame.
+        return (dx, dy) if abs(dx) > 1 or abs(dy) > 1 else (0.0, 0.0)
+    except Exception:
+        # An unshifted click that then reports honestly beats failing every
+        # ordinary main-frame click on a box-model hiccup.
+        return 0.0, 0.0
 
 
 async def _cdp_click(tab: uc.Tab, remote_obj: Any, x: float, y: float, dbl_click: bool) -> None:
@@ -1593,7 +2485,7 @@ async def click(
     if uid not in _uid_to_backend_node_id:
         return f"Error clicking uid={uid}: unknown uid. Take a new snapshot first."
     try:
-        remote_obj = await _resolve_uid(tab, uid)
+        remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
     except ValueError as e:
         return f"Error clicking uid={uid}: {e}"
 
@@ -1603,6 +2495,7 @@ async def click(
     # can take the renderer down, and a page that leaves the CDP call hanging
     # or erroring. Every step is bounded so a wedged page cannot hang the call.
     fallback_reason = ""
+    delivered: int | None = None
     if _target_key(tab) in _touch_emulated_targets:
         fallback_reason = "touch-emulated target"
     else:
@@ -1626,11 +2519,14 @@ async def click(
                 )
             fallback_reason = point
         else:
+            armed = await _arm_input_probe(tab)
             try:
                 await asyncio.wait_for(
                     _cdp_click(tab, remote_obj, point[0], point[1], dbl_click),
                     timeout=_CLICK_TIMEOUT_S,
                 )
+                if armed:
+                    delivered = await _read_input_probe(tab)
             except asyncio.TimeoutError:
                 fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
             except Exception as e:
@@ -1652,6 +2548,21 @@ async def click(
     result = f"Clicked uid={uid}"
     if fallback_reason:
         result += f" (scripted click, page sees isTrusted=false — {fallback_reason})"
+    elif delivered == 0:
+        # The CDP call was acknowledged, which only proves the browser queued the
+        # event. Reporting a click nothing received is the failure mode that costs
+        # an agent the most: it continues, and breaks somewhere unrelated later.
+        if await _element_in_frame(tab, remote_obj):
+            result += (
+                " (delivery not verified: the element is inside a frame, and events"
+                " there do not reach the top document)"
+            )
+        else:
+            result += (
+                " — WARNING: no input event reached the page. The window may be"
+                " occluded by another window, a JavaScript dialog may be open, or the"
+                " renderer may be busy. Nothing on the page is known to have changed."
+            )
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -1801,6 +2712,11 @@ async def close_browser() -> str:
     On an ephemeral temp profile (the default) this discards cookies, logins and
     localStorage — save_session first if you need them back. Persistent profiles
     created with create_profile keep everything.
+
+    It keeps the browser itself. The name, its selected profile and its launch
+    flags survive for the next relaunch, so the name goes on counting against the
+    12-browser limit. When an agent is finished for good, call shutdown_browser
+    instead: it also releases the name.
     """
     attached = _connect_target() is not None
     running = await _stop_browser()
@@ -1812,7 +2728,9 @@ async def close_browser() -> str:
             if running else "Was not attached to a browser."
         )
     return (
-        "Browser closed. It will relaunch on the next action."
+        "Browser closed. It will relaunch on the next action. The browser keeps "
+        "its name and its slot against the 12-browser limit — use shutdown_browser "
+        "to release those too."
         if running else "No browser was running."
     )
 
@@ -1831,18 +2749,48 @@ async def drag(
 ) -> str:
     """Drag one element onto another (press, move, release).
 
-    Both uids must come from the same take_snapshot. Works for native HTML5
-    drag-and-drop and for mouse-driven sortable lists.
+    Both uids must come from the same take_snapshot. Both ends are scrolled into
+    view and hit-tested first, and the pointer is moved in steps with the button
+    held, which is what mouse-driven sortables and sliders listen for.
 
-    Some JS drag libraries require a stream of intermediate mousemove events
-    that this does not emit; if a drag silently does nothing, drive it manually
-    with click_at and press_key instead.
+    This drives the mouse. Native HTML5 drag-and-drop — the dataTransfer kind —
+    is a separate protocol that a synthetic mouse does not trigger in Chrome; if
+    nothing happens on a page that uses it, that is why.
     """
     tab = await _active_tab()
+    import nodriver.cdp.input_ as cdp_input
+
     try:
-        src_x, src_y = await _get_box_model(tab, from_uid)
-        dst_x, dst_y = await _get_box_model(tab, to_uid)
-        await tab.mouse_drag((src_x, src_y), (dst_x, dst_y))
+        points = []
+        for uid in (from_uid, to_uid):
+            remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
+            try:
+                import nodriver.cdp.dom as cdp_dom
+                await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
+            except Exception:
+                pass
+            point = await _clickable_point(tab, remote_obj)
+            if isinstance(point, str):
+                return (
+                    f"Error dragging: uid={uid} cannot be reached — {point}. "
+                    "Nothing was dragged."
+                )
+            points.append(point)
+        (src_x, src_y), (dst_x, dst_y) = points
+
+        await _move_mouse(tab, src_x, src_y)
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mousePressed", x=src_x, y=src_y,
+            button=cdp_input.MouseButton.LEFT, buttons=1, click_count=1
+        ))
+        # Holding the button down across the moves is the part nodriver's
+        # mouse_drag left out, and the part every sortable library watches for.
+        await _move_mouse(tab, dst_x, dst_y, buttons=1)
+        await tab.send(cdp_input.dispatch_mouse_event(
+            "mouseReleased", x=dst_x, y=dst_y,
+            button=cdp_input.MouseButton.LEFT, buttons=0, click_count=1
+        ))
+        await tab
         result = f"Dragged uid={from_uid} to uid={to_uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -1961,6 +2909,84 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
+async def _frame_context(tab: Any, frame: str) -> Any:
+    """An execution context inside a named frame, for reading its DOM.
+
+    Uses Page.createIsolatedWorld rather than the frame's main world, because
+    finding the main world's context id needs Runtime.enable — the one domain this
+    server keeps off by default precisely because attaching it is detectable. An
+    isolated world shares the DOM, which is what every reader here wants; it does
+    not share the page's own JS variables, and the tool descriptions say so.
+
+    Worlds are cached per frame so a loop over rows does not create one per call,
+    and a stale one (after the frame navigated) is replaced rather than raised.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    frame_id, _url = await _resolve_frame(tab, frame)
+    key = (getattr(tab, "target_id", None), frame_id)
+    context_id = _frame_worlds.get(key)
+    if context_id is not None:
+        return context_id
+    context_id = await tab.send(
+        cdp_page.create_isolated_world(
+            frame_id=cdp_page.FrameId(frame_id),
+            world_name="nodriver-mcp",
+            grant_univeral_access=True,
+        )
+    )
+    _frame_worlds[key] = context_id
+    return context_id
+
+
+async def _evaluate_value(
+    tab: Any, expression: str, await_promise: bool = False, frame: str = ""
+) -> Any:
+    """Evaluate an expression and return its value as plain JSON.
+
+    nodriver's Tab.evaluate cannot be used where the result matters. It asks for
+    "deep" serialization, so an object comes back as CDP's wire format —
+    [["a", {"type": "number", "value": 1}], ...] instead of {"a": 1} — which is
+    several times the tokens and not what any caller wants. Worse, on a JS error
+    it *returns* the ExceptionDetails object instead of raising, and that object
+    is truthy, so `if await tab.evaluate(...)` treats a broken selector as a hit.
+
+    This asks for the value directly and raises on a JS error, so both problems
+    disappear at every call site that uses it.
+    """
+    import nodriver.cdp.runtime as cdp_runtime
+
+    context_id = None
+    if frame:
+        for attempt in (1, 2):
+            try:
+                context_id = await _frame_context(tab, frame)
+                break
+            except Exception:
+                # The cached world may belong to a document that has navigated
+                # away. Drop it and ask once more before giving up.
+                if attempt == 2:
+                    raise
+                _frame_worlds.clear()
+
+    remote, errors = await tab.send(
+        cdp_runtime.evaluate(
+            expression=expression,
+            user_gesture=True,
+            await_promise=await_promise,
+            return_by_value=True,
+            allow_unsafe_eval_blocked_by_csp=True,
+            context_id=context_id,
+        )
+    )
+    if errors:
+        text = getattr(errors, "text", None) or "JavaScript error"
+        exc = getattr(errors, "exception", None)
+        detail = getattr(exc, "description", None) or getattr(exc, "value", None)
+        raise RuntimeError(f"{text}: {detail}" if detail else text)
+    return remote.value if remote is not None else None
+
+
 @tool(title="Evaluate JavaScript", open_world=True)
 async def evaluate_script(
     function: Annotated[
@@ -1986,6 +3012,16 @@ async def evaluate_script(
         Field(description=(
             "Write the JSON result to this local path instead of returning it — for "
             "extractions too large to put in the conversation."
+        )),
+    ] = "",
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Run inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Runs in an isolated world, which "
+            "shares the frame's DOM but not its own JavaScript variables, so use it "
+            "to read and drive the DOM rather than to call the page's own functions. "
+            "Ignored when `args` is given, since a uid already carries its frame."
         )),
     ] = "",
     args: Annotated[
@@ -2066,7 +3102,7 @@ async def evaluate_script(
             expr = function.strip()
             if expr.startswith("(") or expr.startswith("function") or expr.startswith("async"):
                 expr = f"({expr})()"
-            result = await tab.evaluate(expr, await_promise=True)
+            result = await _evaluate_value(tab, expr, await_promise=True, frame=frame)
             return _deliver(result)
     except Exception as e:
         return f"Error: {e}"
@@ -2104,8 +3140,8 @@ async def fill(
     """
     tab = await _active_tab()
     try:
-        await _fill_element(tab, uid, value)
-        result = f"Filled uid={uid} with \"{value}\""
+        note = await _fill_element(tab, uid, value)
+        result = f"Filled uid={uid} with \"{value}\"{note}"
         result += await _maybe_snapshot(include_snapshot)
         return result
     except Exception as e:
@@ -2154,13 +3190,170 @@ async def fill_form(
         uid = elem_spec.uid
         value = elem_spec.value
         try:
-            await _fill_element(tab, uid, value)
-            results.append(f"  uid={uid}: filled")
+            note = await _fill_element(tab, uid, value)
+            results.append(f"  uid={uid}: filled{note}")
         except Exception as e:
             results.append(f"  uid={uid}: error — {e}")
+            # A failed field leaves focus and the editing selection wherever it
+            # stopped, and the next field's keystrokes would land there. Blur so
+            # each entry starts from a known state.
+            try:
+                await _evaluate_value(
+                    tab, "(document.activeElement && document.activeElement.blur(), true)"
+                )
+            except Exception:
+                pass
     result = "Form fill results:\n" + "\n".join(results)
     result += await _maybe_snapshot(include_snapshot)
     return result
+
+
+@tool(title="Check or uncheck a box", open_world=True)
+async def set_checked(
+    uid: Uid,
+    checked: Annotated[
+        bool,
+        Field(description=(
+            "True to tick the box or select the radio, False to untick it. Radio "
+            "buttons cannot be unticked by the browser — select a different one "
+            "in the group instead."
+        )),
+    ] = True,
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Tick or untick a checkbox, or select a radio button, and verify it took.
+
+    Use this instead of fill for anything with a checked state. fill types over a
+    field's text, which a checkbox does not have — and its read-back compares
+    `value`, which a checkbox never changes, so a fill could report success while
+    nothing was selected.
+
+    Idempotent: asking for the state it is already in is reported and does not
+    click. Otherwise it delivers a real CDP click, on the element or, when the
+    input is visually hidden behind a styled label (the usual custom-control
+    pattern), on the label that controls it. The state is read back afterwards, so
+    a failure is an error rather than a success you cannot trust.
+    """
+    tab = await _active_tab()
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+        probe = await _call_function_on(
+            tab,
+            function_declaration=_PROBE_FIELD,
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        info = probe.value if probe and isinstance(probe.value, dict) else None
+        if not info or info.get("type") not in ("checkbox", "radio"):
+            found = (info or {}).get("type") or (info or {}).get("tag") or "unknown"
+            return (
+                f"Error: uid={uid} is not a checkbox or radio (it is {found}). "
+                "Use fill for text fields, select_option for a <select>, or click "
+                "for anything else."
+            )
+        if info.get("disabled"):
+            return f"Error: uid={uid} is disabled, so its state cannot be changed."
+
+        field_type = str(info["type"])
+        before = await _read_field(tab, remote_obj, field_type) == "true"
+        if before == checked:
+            return (
+                f"uid={uid} is already {'checked' if checked else 'unchecked'}; "
+                "nothing to do."
+            ) + await _maybe_snapshot(include_snapshot)
+        if field_type == "radio" and not checked:
+            return (
+                f"Error: a radio button cannot be unchecked directly. Call "
+                f"set_checked on another radio in the same group instead."
+            )
+
+        # A custom-styled control hides the real input and shows a label, so the
+        # input has no clickable point of its own — the label is what a person
+        # clicks, and clicking it toggles the input.
+        target = remote_obj
+        note = ""
+        point = await _clickable_point(tab, remote_obj)
+        if isinstance(point, str):
+            label = await _call_function_on(
+                tab,
+                function_declaration=(
+                    "function() { if (this.id) { const l = document.querySelector("
+                    "'label[for=' + CSS.escape(this.id) + ']'); if (l) return l; } "
+                    "return this.closest('label'); }"
+                ),
+                object_id=remote_obj.object_id,
+            )
+            if label is not None and getattr(label, "object_id", None):
+                label_point = await _clickable_point(tab, label)
+                if not isinstance(label_point, str):
+                    target, point, note = label, label_point, " (clicked its label)"
+        if isinstance(point, str):
+            return (
+                f"Error: cannot click uid={uid}: {point}. Dismiss whatever is in "
+                "the way, or scroll it into view, and try again."
+            )
+
+        await _cdp_click(tab, target, point[0], point[1], False)
+        after = await _read_field(tab, remote_obj, field_type) == "true"
+        if after != checked:
+            return (
+                f"Error: uid={uid} is still {'unchecked' if checked else 'checked'} "
+                "after the click. Something may be intercepting it, or the page "
+                "resets the control."
+            )
+        state = "checked" if checked else "unchecked"
+        return f"uid={uid} is now {state}{note}." + await _maybe_snapshot(include_snapshot)
+    except Exception as e:
+        return f"Error setting uid={uid}: {e}"
+
+
+@tool(title="Choose a select option", open_world=True)
+async def select_option(
+    uid: Uid,
+    option: Annotated[
+        str,
+        Field(description=(
+            "The option to choose. Matched against the value attribute first, then "
+            "the visible label, then — if it is a plain number — the position in "
+            "the list. A failure names every option the <select> actually has."
+        )),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Choose an option in a <select>, by value, visible label or index.
+
+    fill also works on a <select>, but only matches the value attribute, which is
+    not what a snapshot shows you — so it had to be guessed. This matches what you
+    can actually see, and when nothing matches it lists the real options instead of
+    only saying no.
+    """
+    tab = await _active_tab()
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+        probe = await _call_function_on(
+            tab,
+            function_declaration=_PROBE_FIELD,
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        info = probe.value if probe and isinstance(probe.value, dict) else None
+        if not info or info.get("tag") != "select":
+            found = (info or {}).get("tag") or "unknown"
+            return (
+                f"Error: uid={uid} is not a <select> (it is <{found}>). Use "
+                "set_checked for checkboxes and radios, or fill for text fields."
+            )
+        if info.get("disabled"):
+            return f"Error: uid={uid} is disabled, so no option can be chosen."
+
+        note = await _set_select_value(tab, remote_obj, option)
+        chosen = await _read_field(tab, remote_obj)
+        return (
+            f"uid={uid} is now set to {chosen!r}{note}."
+            + await _maybe_snapshot(include_snapshot)
+        )
+    except Exception as e:
+        return f"Error selecting in uid={uid}: {e}"
 
 
 @tool(title="Get console message", read_only=True)
@@ -2280,6 +3473,9 @@ async def get_network_request(
     listed while its body is already gone.
     """
     tab = await _active_tab()
+    # getResponseBody is a Network-domain command: without the domain enabled on
+    # *this* session Chrome holds no body to give back.
+    await _auto_enable_network_collection(tab)
     import nodriver.cdp.network as cdp_net
 
     if reqid is None:
@@ -2296,6 +3492,49 @@ async def get_network_request(
     lines.append(f"  URL: {req['url']}")
     lines.append(f"  Method: {req['method']}")
     lines.append(f"  Type: {req['type']}")
+
+    status = req.get("status")
+    if status is None and req.get("failed"):
+        lines.append(f"  Outcome: FAILED — {req.get('status_text') or 'network error'}")
+    elif status is None:
+        lines.append("  Outcome: still in flight (no response yet)")
+    else:
+        text = f" {req['status_text']}" if req.get("status_text") else ""
+        lines.append(f"  Status: {status}{text}")
+        if req.get("failed"):
+            lines.append(
+                "  Note: the response arrived but its body did not finish loading"
+                " — normal for a fetch() whose body is never read."
+            )
+    if req.get("redirect_to"):
+        lines.append(f"  Redirected to: {req['redirect_to']}")
+    if req.get("mime_type"):
+        lines.append(f"  Content type: {req['mime_type']}")
+    detail = _request_timing(req).strip()
+    if detail:
+        lines.append(f"  Transfer: {detail}")
+    headers = req.get("response_headers") or {}
+    if headers:
+        lines.append(f"  Response headers ({len(headers)}):")
+        for key in sorted(headers):
+            lines.append(f"    {key}: {headers[key][:200]}")
+
+    if req.get("type") == "WebSocket":
+        frames = req.get("frames") or []
+        if req.get("frames_dropped"):
+            lines.append(
+                f"  Frames: showing the last {len(frames)}; "
+                f"{req['frames_dropped']} older one(s) dropped."
+            )
+        else:
+            lines.append(f"  Frames ({len(frames)}):")
+        for frame in frames:
+            arrow = "->" if frame["dir"] == "sent" else "<-"
+            suffix = " …(truncated)" if frame.get("truncated") else ""
+            kind = "" if frame["kind"] == "text" else f" [{frame['kind']}]"
+            lines.append(f"    {arrow}{kind} {frame['data']}{suffix}")
+        # There is no response body for a socket, so stop before asking for one.
+        return "\n".join(lines)
 
     try:
         request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))
@@ -2358,13 +3597,30 @@ async def handle_dialog(
     """
     tab = await _active_tab()
     import nodriver.cdp.page as cdp_page
+
+    # A dialog blocks the renderer, so this must not be the call that discovers
+    # the Page domain was never enabled: Chrome reports a dialog only to a client
+    # that enabled it, and without that this answered "no dialog is showing"
+    # while being wedged by one.
+    await _auto_enable_dialog_tracking(tab)
+    pending = _open_dialogs.get(_target_key(tab))
     try:
         if action == "accept":
             await tab.send(cdp_page.handle_java_script_dialog(accept=True, prompt_text=prompt_text))
         else:
             await tab.send(cdp_page.handle_java_script_dialog(accept=False))
     except Exception as e:
+        if pending is None:
+            return (
+                "Error: no dialog is open on this page. If one opened before the "
+                "first navigation on this tab, it was not being tracked; the page "
+                f"may still be blocked by it. ({e})"
+            )
         return f"Error handling dialog (is one open?): {e}"
+    _open_dialogs.pop(_target_key(tab), None)
+    if pending:
+        detail = f' ({pending["type"]}: "{pending["message"][:120]}")' if pending.get("message") else ""
+        return f"Dialog {action}ed{detail}."
     return f"Dialog {action}ed."
 
 
@@ -2376,13 +3632,26 @@ async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
     reading what they reveal — pass include_snapshot=true to get the revealed
     content back in the same call.
 
-    Only moves the pointer; it does not scroll. If the element sits outside the
-    viewport, call scroll_to_selector first.
+    The element is scrolled into view and hit-tested first, the same way click
+    does it: a point that lands on a sticky header instead opens that header's
+    menu, not the one you asked for. If something covers the element, this says
+    what, rather than hovering the wrong thing.
     """
     tab = await _active_tab()
     try:
-        cx, cy = await _get_box_model(tab, uid)
-        await tab.mouse_move(cx, cy)
+        remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
+        try:
+            import nodriver.cdp.dom as cdp_dom
+            await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
+        except Exception:
+            pass
+        point = await _clickable_point(tab, remote_obj)
+        if isinstance(point, str):
+            return (
+                f"Error hovering uid={uid}: {point}, so the pointer would land on "
+                "that instead. Dismiss or scroll past whatever is in the way."
+            )
+        await _move_mouse(tab, point[0], point[1])
         result = f"Hovered over uid={uid}"
         result += await _maybe_snapshot(include_snapshot)
         return result
@@ -2570,7 +3839,10 @@ async def list_network_requests(
 
     lines = [f"Network requests ({len(filtered)} of {total}):"]
     for req in filtered:
-        lines.append(f"  [{req.get('seq', '?')}] {req['method']} {req['url'][:150]} ({req['type']})")
+        lines.append(
+            f"  [{req.get('seq', '?')}] {_request_outcome(req)} {req['method']} "
+            f"{req['url'][:150]} ({req['type']}){_request_timing(req)}"
+        )
     return "\n".join(lines)
 
 
@@ -2684,12 +3956,14 @@ async def navigate_page(
     if init_script:
         await tab.send(cdp_page.add_script_to_evaluate_on_new_document(source=init_script))
 
+    note = ""
+
     async def _navigate() -> None:
+        nonlocal note
         if type == "url":
             if not url:
                 raise ValueError("URL is required for type=url.")
-            await tab.get(url)
-            await tab
+            note = await _navigate_same_tab(tab, url)
         elif type == "back":
             await tab.back()
             await tab
@@ -2708,9 +3982,13 @@ async def navigate_page(
         await _await_with_timeout(_navigate(), timeout, f"Navigation ({type})")
         # Auto-enable network collection on navigated tab.
         await _auto_enable_network_collection(tab)
+        await _auto_enable_dialog_tracking(tab)
+        # Page.navigate does not touch nodriver's cached TargetInfo, and reading
+        # tab.target.url straight after it can still report the previous URL.
+        await _refresh_targets(await _get_browser())
         pages = await _format_pages()
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
-        return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{pages}"
+        return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{note}{pages}"
     except Exception as e:
         return f"Error: {e}"
     finally:
@@ -2800,6 +4078,9 @@ async def new_page(
 
         # Auto-enable network collection on new tab.
         await _auto_enable_network_collection(tab)
+        # And the Page domain, or a modal dialog on this tab could never be
+        # answered — handle_dialog would report that none is showing.
+        await _auto_enable_dialog_tracking(tab)
 
         device_results: list[str] = []
         if device:
@@ -2877,7 +4158,10 @@ async def performance_start_trace(
         "disabled-by-default-v8.cpu_profiler",
         "latencyInfo", "loading", "v8.execute", "v8",
     ]
-    await tab.send(cdp_tracing.start(categories=",".join(categories), transfer_mode="ReturnAsStream"))
+    # ReportEvents, not ReturnAsStream: stop_trace collects the trace from
+    # Tracing.dataCollected events, and ReturnAsStream never emits those — it
+    # hands back a stream handle instead, so every trace came back empty.
+    await tab.send(cdp_tracing.start(categories=",".join(categories), transfer_mode="ReportEvents"))
     _tracing_active = True
 
     if reload:
@@ -2940,10 +4224,14 @@ async def performance_stop_trace(
 
     result = f"Trace stopped. {len(trace_chunks)} events collected."
 
-    if file_path and trace_chunks:
-        with open(file_path, "w") as f:
-            json.dump(trace_chunks, f)
-        result += f" Saved to {file_path}"
+    if file_path:
+        if trace_chunks:
+            with open(file_path, "w") as f:
+                json.dump(trace_chunks, f)
+            result += f" Saved to {file_path}"
+        else:
+            # Silently not writing the file the caller asked for reads as success.
+            result += f" Nothing was written to {file_path} — the trace was empty."
 
     return result
 
@@ -2976,6 +4264,8 @@ async def press_key(
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
+
+    armed = await _arm_input_probe(tab)
 
     parts = key.split("+")
     target_key = parts[-1]
@@ -3020,6 +4310,7 @@ async def press_key(
         ))
 
     result = f"Pressed {key}"
+    result += await _input_delivery_note(tab, armed)
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -3320,6 +4611,15 @@ async def take_snapshot(
             "for very large pages you intend to search rather than read in full."
         )),
     ] = "",
+    include_frames: Annotated[
+        bool,
+        Field(description=(
+            "Also read the page's iframes and splice each one in under the element "
+            "that hosts it. On by default, because Chrome's accessibility tree stops "
+            "at a frame boundary and anything inside an iframe would otherwise be "
+            "invisible. Set false on a page with many frames to keep the output small."
+        )),
+    ] = True,
 ) -> str:
     """Read the page as compact text, with a uid for every element.
 
@@ -3332,9 +4632,16 @@ async def take_snapshot(
     indented by nesting — with Chrome-internal and purely presentational nodes
     filtered out unless `verbose` is set.
 
+    A URL on the same origin as the page is printed relative to it — the root node
+    carries the absolute one, so nothing is lost and a link-dense page costs
+    noticeably less to read.
+
     uids stay stable across snapshots for elements that did not change, but any
     page change can invalidate them. Whenever a tool reports "unknown uid", take
     a fresh snapshot and use the new uid. Output is capped at 200 000 characters.
+
+    Frames are included and marked, so an element inside an iframe gets a uid like
+    any other and click, fill and evaluate_script work on it unchanged.
 
     For plain page text without uids, get_page_content is cheaper; to find
     elements by CSS selector, use query_selector.
@@ -3342,8 +4649,49 @@ async def take_snapshot(
     global _snapshot_id
     tab = await _active_tab()
     import nodriver.cdp.accessibility as cdp_a11y
+    import nodriver.cdp.dom as cdp_dom
+    import nodriver.cdp.page as cdp_page
 
-    nodes = await tab.send(cdp_a11y.get_full_ax_tree())
+    nodes = list(await tab.send(cdp_a11y.get_full_ax_tree()))
+
+    # Chrome builds its AXObjectCache lazily, so a snapshot taken the instant a
+    # navigation returns yields exactly one node with no children — and the tool
+    # cannot tell that from a genuinely empty page. Give it a moment and ask again
+    # rather than reporting a blank document.
+    if len(nodes) <= 1:
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            retry = list(await tab.send(cdp_a11y.get_full_ax_tree()))
+            if len(retry) > 1:
+                nodes = retry
+                break
+
+    # Chrome's AX tree stops at every frame boundary, so an iframe used to appear
+    # as a childless node and everything inside it — payment fields, consent
+    # walls, embedded editors — was unreachable. getFullAXTree takes a frame_id,
+    # so each frame's tree is fetched and spliced under the node that owns it.
+    #
+    # uids need no special handling: this server disables site isolation, so a
+    # child frame's backendNodeIds resolve through the same session, and click,
+    # fill and evaluate_script work on them unchanged.
+    frame_roots: dict[str, list] = {}
+    if include_frames:
+        try:
+            for entry in (await _frame_list(tab))[1:]:
+                try:
+                    sub = list(await tab.send(
+                        cdp_a11y.get_full_ax_tree(frame_id=cdp_page.FrameId(entry["frame_id"]))
+                    ))
+                except Exception:
+                    continue
+                if not sub:
+                    continue
+                child_ids = {c for n in sub for c in (n.child_ids or [])}
+                roots = [n.node_id for n in sub if n.node_id not in child_ids]
+                nodes.extend(sub)
+                frame_roots[entry["frame_id"]] = roots
+        except Exception:
+            pass
 
     # Build a lookup: node_id -> AXNode
     node_map: dict[str, Any] = {}
@@ -3359,6 +4707,27 @@ async def take_snapshot(
             children_map[node.node_id] = list(node.child_ids)
             for cid in node.child_ids:
                 nodes_with_parent.add(cid)
+
+    # Attach each frame's tree to the <iframe> that owns it, so the result is one
+    # document rather than several disconnected ones. DOM.getFrameOwner gives the
+    # owning element's backendNodeId, which the parent tree already carries.
+    if frame_roots:
+        backend_to_ax: dict[Any, str] = {}
+        for node in nodes:
+            backend = getattr(node, "backend_dom_node_id", None)
+            if backend is not None:
+                backend_to_ax.setdefault(backend, node.node_id)
+        for frame_id, roots in frame_roots.items():
+            try:
+                owner = await tab.send(cdp_dom.get_frame_owner(cdp_page.FrameId(frame_id)))
+                backend_id = owner[0] if isinstance(owner, tuple) else owner
+                owner_ax = backend_to_ax.get(backend_id)
+            except Exception:
+                owner_ax = None
+            if owner_ax is None:
+                continue
+            children_map.setdefault(owner_ax, []).extend(roots)
+            nodes_with_parent.update(roots)
 
     for node in nodes:
         if node.node_id not in nodes_with_parent:
@@ -3421,6 +4790,17 @@ async def take_snapshot(
             if kid_role not in _SKIP_ROLES:
                 return None
         return str(node.name.value) if node.name and node.name.value else ""
+
+    # Same-origin links repeat the origin on every line, which measured 7-16% of
+    # the whole snapshot on real pages — the single largest remaining cost after
+    # the text folding above. Printing them relative to the document is lossless:
+    # the root node keeps the absolute URL, so any of them can be reconstructed.
+    try:
+        page_origin = str(await _evaluate_value(tab, "location.origin") or "")
+    except Exception:
+        page_origin = ""
+    if page_origin in ("null", "about:blank"):
+        page_origin = ""
 
     def _repeats_parent_name(node_id: str, parent_name: str) -> bool:
         """Whether a StaticText child only echoes its parent's accessible name.
@@ -3525,6 +4905,13 @@ async def take_snapshot(
                 if pval is True or pval == "true":
                     props.append(pname)
                 elif isinstance(pval, (str, int, float)) and pval != "":
+                    # depth > 0: the root keeps its absolute URL, which is what
+                    # makes the shortened ones reconstructible.
+                    if (
+                        pname == "url" and depth > 0 and page_origin
+                        and isinstance(pval, str) and pval.startswith(page_origin)
+                    ):
+                        pval = pval[len(page_origin):] or "/"
                     props.append(f'{pname}="{pval}"')
 
         uid = uid_map.get(node_id, "?")
@@ -3557,14 +4944,20 @@ async def take_snapshot(
         output_parts.append(_format_node(rid, 0))
     snapshot_text = "".join(output_parts)
 
-    # Truncate if extremely large
-    if len(snapshot_text) > 200_000:
-        snapshot_text = snapshot_text[:200_000] + "\n... (truncated)"
-
+    # file_path is the escape hatch for a page too large to put in the
+    # conversation, so capping what gets written would leave no way to read a
+    # big page at all. Only the inline path is capped.
     if file_path:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(snapshot_text)
         return f"Snapshot saved to {file_path} ({len(snapshot_text)} chars)."
+
+    if len(snapshot_text) > 200_000:
+        snapshot_text = (
+            snapshot_text[:200_000]
+            + f"\n... (truncated at 200000 of {len(snapshot_text)} chars"
+            " — pass file_path to get the whole tree)"
+        )
 
     return snapshot_text
 
@@ -3592,6 +4985,9 @@ async def type_text(
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
+
+    focus = await _focused_description(tab)
+    armed = await _arm_input_probe(tab)
     for char in text:
         await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
         await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
@@ -3610,8 +5006,11 @@ async def type_text(
         await tab.send(cdp_input.dispatch_key_event(**up))
 
     result = f"Typed {len(text)} characters"
+    if focus:
+        result += f" into {focus}"
     if submit_key:
         result += f", then pressed {submit_key}"
+    result += await _input_delivery_note(tab, armed)
     return result
 
 
@@ -3751,21 +5150,30 @@ async def wait_for(
     timeout_s = timeout / 1000
 
     start = time.time()
+    last_error = ""
     while time.time() - start < timeout_s:
         try:
             # Get page text content
-            page_text = await tab.evaluate("document.body ? document.body.innerText : ''")
+            page_text = await _evaluate_value(
+                tab, "(document.body || document.documentElement || {}).innerText || ''"
+            )
             if page_text:
                 for t in text:
                     if t in page_text:
                         # Found — return with snapshot
                         snapshot = await take_snapshot()
                         return f"Found text \"{t}\" on page.\n\n{snapshot}"
-        except Exception:
-            pass
+        except Exception as e:
+            # A crashed renderer, a detached context or an open JS dialog are all
+            # very different from "not there yet"; remember why so the timeout can
+            # say which it was instead of blaming the wait.
+            last_error = str(e)
         await asyncio.sleep(0.5)
 
-    return f"Timeout: None of the texts {text} appeared within {timeout}ms."
+    msg = f"Timeout: None of the texts {text} appeared within {timeout}ms."
+    if last_error:
+        msg += f" The page could not be read while waiting: {last_error}"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -3907,39 +5315,61 @@ async def load_session(
     browser = await _get_browser()
     import nodriver.cdp.network as cdp_net
 
-    # 1. Restore cookies
-    cookies_restored = 0
-    for c in session.get("cookies", []):
-        try:
-            kwargs: dict[str, Any] = {
-                "name": c["name"],
-                "value": c["value"],
-                "domain": c.get("domain", ""),
-                "path": c.get("path", "/"),
-                "secure": c.get("secure", False),
-                "http_only": c.get("httpOnly", False),
-            }
-            if c.get("expires"):
-                kwargs["expires"] = c["expires"]
-            if c.get("sameSite"):
-                from nodriver.cdp.network import CookieSameSite
-                kwargs["same_site"] = CookieSameSite(c["sameSite"])
-            await tab.send(cdp_net.set_cookie(**kwargs))
-            cookies_restored += 1
-        except Exception as e:
-            logger.warning("Failed to restore cookie %s: %s", c.get("name"), e)
+    # 1. Restore cookies.
+    #
+    # Every field goes through CookieParam.from_json rather than hand-built
+    # kwargs: cdp_net.set_cookie(expires=...) calls expires.to_json(), so a raw
+    # JSON float raised AttributeError for every single cookie — and because the
+    # counter only advanced on success, the failure surfaced as a cheerful
+    # "Cookies restored: 0" instead of an error.
+    import nodriver.cdp.storage as cdp_storage
 
-    # 2. Restore localStorage — navigate to the saved URL first so the origin matches
+    saved_cookies = session.get("cookies", [])
+    params: list[Any] = []
+    for c in saved_cookies:
+        entry = dict(c)
+        # getCookies reports a session cookie as expires == -1. Sending that back
+        # would set a cookie that expired in 1969; omitting the field is what
+        # actually produces a session cookie.
+        exp = entry.get("expires")
+        if not isinstance(exp, (int, float)) or exp <= 0:
+            entry.pop("expires", None)
+        try:
+            params.append(cdp_net.CookieParam.from_json(entry))
+        except Exception as e:
+            logger.warning("Skipping unusable cookie %s: %s", entry.get("name"), e)
+
+    cookie_error = ""
+    if params:
+        try:
+            await tab.send(cdp_storage.set_cookies(cookies=params))
+        except Exception as e:
+            cookie_error = str(e)
+            logger.warning("Failed to restore cookies: %s", e)
+
+    # Report what the browser actually holds, not how many calls did not raise.
+    cookies_restored = 0
+    try:
+        wanted = {(c.get("name"), c.get("domain")) for c in saved_cookies}
+        live = await tab.send(cdp_storage.get_cookies())
+        cookies_restored = sum(1 for c in (live or []) if (c.name, c.domain) in wanted)
+    except Exception as e:
+        logger.warning("Could not verify restored cookies: %s", e)
+        cookie_error = cookie_error or str(e)
+
+    # 2. Navigate to the saved origin, then restore localStorage there.
+    # The docstring promises this navigation unconditionally, and the reload in
+    # step 4 is only meaningful if we are on the origin the cookies belong to.
     ls_items = session.get("localStorage", {})
     ls_restored = 0
+    current_url = session.get("current_url", "")
+    if current_url and current_url != "about:blank":
+        try:
+            await tab.get(current_url)
+            await tab
+        except Exception:
+            pass
     if ls_items:
-        current_url = session.get("current_url", "")
-        if current_url and current_url != "about:blank":
-            try:
-                await tab.get(current_url)
-                await tab
-            except Exception:
-                pass
         try:
             await tab.set_local_storage(ls_items)
             ls_restored = len(ls_items)
@@ -3964,9 +5394,18 @@ async def load_session(
     except Exception:
         pass
 
+    saved_count = len(session.get("cookies", []))
+    cookie_line = f"  Cookies restored: {cookies_restored} of {saved_count} saved"
+    if cookies_restored < saved_count:
+        cookie_line += (
+            f"\n  Note: {saved_count - cookies_restored} cookie(s) did not survive"
+            " — expired tokens and cookies for other origins are dropped by Chrome."
+        )
+        if cookie_error:
+            cookie_line += f"\n  Error: {cookie_error}"
     return (
         f"Session '{session.get('name', '')}' loaded from {filepath}\n"
-        f"  Cookies restored: {cookies_restored}\n"
+        f"{cookie_line}\n"
         f"  localStorage items restored: {ls_restored}\n"
         f"  Pages re-opened: {pages_opened}"
     )
@@ -4038,6 +5477,17 @@ async def get_page_content(
             "to capture a large page without flooding the conversation."
         )),
     ] = "",
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Read inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Chrome's DOM queries never cross a "
+            "frame boundary, so anything inside an iframe is unreachable without "
+            "this. The frame is read through an isolated world, which shares the DOM "
+            "but not the page's own JavaScript variables. Empty string reads the main "
+            "document."
+        )),
+    ] = "",
 ) -> str:
     """Get the page's visible text, or its full HTML.
 
@@ -4053,10 +5503,28 @@ async def get_page_content(
     """
     tab = await _active_tab()
     if format == "html":
-        content = await tab.evaluate("document.documentElement.outerHTML")
+        content = await _evaluate_value(tab, "document.documentElement.outerHTML", frame=frame)
     else:
-        content = await tab.evaluate("document.body ? document.body.innerText : ''")
+        # A <frameset> page has no body, and document.body.innerText would be ''
+        # — indistinguishable from a blank page. Fall back to documentElement and
+        # say so when the text is empty but frames are present.
+        content = await _evaluate_value(
+            tab, "(document.body || document.documentElement || {}).innerText || ''",
+            frame=frame,
+        )
     content = content or ""
+    if format == "text" and not content.strip():
+        try:
+            frames = await _evaluate_value(
+                tab, "document.querySelectorAll('frame,iframe').length", frame=frame
+            )
+        except Exception:
+            frames = 0
+        if frames:
+            return (
+                f"(no text in the main document; this page is built from {frames} frame(s), "
+                "whose content is not included)"
+            )
     if file_path:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -4078,6 +5546,17 @@ async def query_selector(
     limit: Annotated[
         int, Field(gt=0, description="Maximum number of matching elements to return.")
     ] = 20,
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Read inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Chrome's DOM queries never cross a "
+            "frame boundary, so anything inside an iframe is unreachable without "
+            "this. The frame is read through an isolated world, which shares the DOM "
+            "but not the page's own JavaScript variables. Empty string reads the main "
+            "document."
+        )),
+    ] = "",
 ) -> str:
     """Find elements by CSS selector; list their tag, text, href, id and class.
 
@@ -4102,7 +5581,7 @@ async def query_selector(
         "})))" % (sel, int(limit))
     )
     try:
-        raw = await tab.evaluate(expr)
+        raw = await _evaluate_value(tab, expr, frame=frame)
         items = json.loads(raw) if raw else []
     except Exception as e:
         return f"Error querying '{selector}': {e}"
@@ -4210,7 +5689,7 @@ async def get_computed_styles(
 
     try:
         if expr is not None:
-            raw = await tab.evaluate(f"({body}).call({expr})", await_promise=False)
+            raw = await _evaluate_value(tab, f"({body}).call({expr})")
         else:
             remote = await _call_function_on(
                 tab,
@@ -4267,9 +5746,13 @@ async def scroll_to_selector(
         "el.scrollIntoView({block:'center', inline:'center'}); return true; })()" % sel
     )
     try:
-        ok = await tab.evaluate(expr)
+        ok = await _evaluate_value(tab, expr)
     except Exception as e:
-        return f"Error: {e}"
+        # Only call it a bad selector when it is one; a detached context or a
+        # crashed renderer arrives here too and deserves its own words.
+        if "SyntaxError" in str(e) or "not a valid selector" in str(e):
+            return f"Error: invalid selector '{selector}': {e}"
+        return f"Error scrolling to '{selector}': {e}"
     return f"Scrolled to '{selector}'." if ok else f"No element matches '{selector}'."
 
 
@@ -4315,6 +5798,10 @@ async def block_resources(
             patterns.extend(f"*.{ext}*" for ext in _RESOURCE_EXTS[key])
         elif key:
             unknown.append(t)
+    # setBlockedURLs is a Network-domain command and is silently ignored when the
+    # domain is not enabled on this session — which is how block_resources could
+    # report success while every image still loaded.
+    await _auto_enable_network_collection(tab)
     await tab.send(cdp_net.set_blocked_ur_ls(urls=patterns))
     if not valid:
         base = "Resource blocking disabled (all resources allowed)."
@@ -4361,14 +5848,22 @@ async def wait_for_selector(
         expr = "!!document.querySelector(%s)" % sel
     timeout_s = timeout / 1000
     start = time.time()
+    last_error = ""
     while time.time() - start < timeout_s:
         try:
-            if await tab.evaluate(expr):
+            if await _evaluate_value(tab, expr):
                 return f"Element '{selector}' found."
-        except Exception:
-            pass
+        except Exception as e:
+            # A selector that does not parse will never start parsing, so
+            # waiting out the timeout only hides the real problem.
+            if "SyntaxError" in str(e) or "not a valid selector" in str(e):
+                return f"Error: invalid selector '{selector}': {e}"
+            last_error = str(e)
         await asyncio.sleep(0.3)
-    return f"Timeout: '{selector}' did not appear within {timeout}ms."
+    msg = f"Timeout: '{selector}' did not appear within {timeout}ms."
+    if last_error:
+        msg += f" Last error while polling: {last_error}"
+    return msg
 
 
 @tool(title="Save page as PDF")

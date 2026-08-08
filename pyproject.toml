@@ -1,6 +1,6 @@
 [project]
 name = "nodriver-mcp"
-version = "2.0.1"
+version = "2.1.0"
 description = "Undetected Chrome automation MCP server powered by nodriver — a stealth, anti-bot-resistant alternative to chrome-devtools-mcp for Claude, Cursor and other AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -31,6 +31,12 @@ dependencies = [
     "pillow>=12.1.1",
     "tomli-w>=1.0.0",
 ]
+
+[project.optional-dependencies]
+# cf_verify locates the Cloudflare checkbox visually, which needs opencv. It is
+# optional because everything else in the server works without it, and it is a
+# large dependency to impose on people who never touch a challenge page.
+cf = ["opencv-python>=4.10"]
 
 [project.urls]
 Homepage = "https://github.com/andresolbach/nodriver-mcp-server"

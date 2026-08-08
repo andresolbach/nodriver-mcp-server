@@ -1,5 +1,389 @@
 # Changelog
 
+## 2.1.0 — tools that reported success while doing nothing
+
+An independent audit drove this server through 25 agents and 2151 tool calls:
+first as a black box, then through the source, then trying to refute its own
+findings. The stealth core came out well — four search engines with no captcha,
+Reddit's JS challenge solved mid-navigation, Cloudflare cleared on the first
+load, and one site out of eight that simply blocked it. Everything below is the
+layer on top of that, where the recurring defect was not a missing feature but a
+tool answering "done" when nothing had happened.
+
+### Navigation no longer churns the CDP session
+
+`navigate_page` went through nodriver's `Tab.get()`, which delegates to
+`Browser.get()` — and that navigates the *first* page target rather than the tab
+it was called on, then calls `connection.attach()` again. Every navigation minted
+a brand new CDP session for the same target and never detached the old one, so
+each domain this server had enabled belonged to a stranded session while commands
+went to a session where nothing was ever enabled. nodriver's event dispatcher
+matches on event type without looking at `sessionId`, so events kept arriving and
+everything *looked* healthy.
+
+Same-tab navigation now sends `Page.navigate` directly and waits for the new
+document to be usable. `Tab.back`, `forward` and `reload` were already sending on
+the right connection and are untouched. Measured: the session id is now identical
+before and after a navigation, `performance_stop_trace` stopped answering
+"Tracing is not started", and `reset_emulation` and `disable_console_collection`
+take effect after a navigation instead of writing into an orphan.
+
+Two things fall out of it that nodriver was discarding. `Page.navigate` returns
+`errorText`, so a domain that does not resolve is now an error instead of a
+success on the previous page; and it returns `isDownload`, so a URL that turns
+out to be a download says so rather than reporting a navigation that did not
+happen. An HTTP error *status* is deliberately not treated as a failure — a 404
+that comes with a body is a page, and reading it is usually the point. A 404 with
+an empty body is the one case Chrome refuses outright, and the response says so.
+
+### Response bodies work now, which was a second cause
+
+Removing the session churn was not enough: `Network.enable` was sent with no
+buffer sizes, so Chrome retained no resource bodies whatsoever and
+`Network.getResponseBody` answered `-32000 No resource with given identifier
+found` for every request, including one issued a second earlier. DevTools passes
+these sizes; this now passes 50 MB total and 10 MB per resource. Measured: 0 of 3
+bodies retrievable before, the full JSON after.
+
+The same call was also guarded on `id(tab)`, which does not change when the CDP
+session under it does, so the guard reliably skipped the one call that mattered.
+It is keyed on `(target, session)` now, with the event handler still registered
+once per target so nothing is recorded twice. That is also why `block_resources`
+could report success while every image loaded: `setBlockedURLs` is a
+Network-domain command and is ignored when the domain is not enabled on the
+session it is sent to.
+
+### Fixed
+
+- **`load_session` restored nothing, and reported it as a number rather than an
+  error.** It passed the raw JSON float from `expires` into
+  `cdp.network.set_cookie`, whose generator calls `expires.to_json()` — a float
+  has no `to_json`, so every cookie raised `AttributeError` into a
+  `logger.warning` on stderr that no MCP client sees. `save_session` keeps CDP's
+  `-1` sentinel for session cookies and `-1` is truthy, so 100% of cookies took
+  the failing branch. The counter only advanced on success, which is how the
+  advertised "arrive already logged in" round trip came back as
+  `Cookies restored: 0` on a normal, non-error result — an agent following it
+  scraped the logged-out view of a site and could not tell. Cookies now go
+  through `CookieParam` and a bulk `Storage.setCookies`, and the count reported is
+  read back from the browser instead of counting calls that did not raise.
+- **Clicks and keystrokes were dropped whenever another window covered Chrome.**
+  The browser launched without `--disable-backgrounding-occluded-windows`,
+  `--disable-renderer-backgrounding` and `--disable-background-timer-throttling`,
+  which Puppeteer and Playwright both pass by default. Chrome treats an occluded
+  window as hidden: timers fall to about 1 Hz, `requestAnimationFrame` stops and
+  input delivery becomes unreliable — while every tool still returns "Clicked
+  uid=…". Three agents measured zero events reaching the page, and that state is
+  guaranteed the moment two agents each own a browser. Also passes
+  `--window-size=1280,900`, because `outerWidth`/`outerHeight` reading 0 is itself
+  a signal.
+- **`evaluate_script` returned CDP's wire format instead of JSON.** nodriver's
+  `Tab.evaluate` asks for "deep" serialization, so `{"a": 1}` came back as
+  `[["a", {"type": "number", "value": 1}]]` — several times the tokens, and a
+  decoder every caller had to write. Primitives were unaffected, so the shape
+  changed silently with the return value.
+- **An unparseable CSS selector was reported as a match.** That same
+  `Tab.evaluate` *returns* the `ExceptionDetails` object on a JS error instead of
+  raising, and the object is truthy, so `wait_for_selector` answered "Element
+  found." on its first poll and `scroll_to_selector` claimed to have scrolled;
+  `query_selector` leaked a Python `TypeError` out of `json.loads`. All three now
+  share one evaluate helper that raises on a JS error, and a selector that cannot
+  parse says so instead of timing out.
+- **`isolated_context` could never have worked.** nodriver initialises
+  `Browser.connection` to `None` and never assigns it, so the documented "hold
+  several logins to one site at once" path raised
+  `'NoneType' object has no attribute 'send'` every time. `Browser` subclasses
+  `Connection`, so it sends CDP itself. Also dropped `for_tab=True`, which asks
+  for a target `browser.tabs` filters out, and taught the target wait to refresh
+  nodriver's inventory instead of only ever timing out.
+- **Uncaught exceptions were invisible.** Only `Runtime.consoleAPICalled` was
+  subscribed, so a page throwing an uncaught `TypeError` reported "0 messages" —
+  from the tool whose only job is to say what went wrong. `Runtime.exceptionThrown`
+  is captured too, with its URL and line.
+- **Console collection duplicated every message when toggled.**
+  `remove_handler(event_type, callback)` takes both arguments; passing only the
+  type raised `TypeError` into a bare `except`, so the handler was never removed
+  and each re-enable added another one.
+- **Performance traces were always empty.** `Tracing.start` asked for
+  `ReturnAsStream` while `stop_trace` only listens for `Tracing.dataCollected`,
+  which that transfer mode never emits. It uses `ReportEvents`, and says so when a
+  trace is empty rather than quietly not writing the file it was given. Measured
+  on one page: 0 events before, 18 655 after.
+- **`take_snapshot`'s 200 000-character cap applied to `file_path` too**, so the
+  escape hatch for a page too large to read inline was capped at the same size and
+  a big page could not be read in full by any means. The cap is inline only now,
+  and names what it truncated and how to get the rest.
+- **The device presets shipped a malformed `Accept-Language`.** Chrome generates
+  q-values itself, so `"en-US,en;q=0.9"` went out as `en-US,en;q=0.9;q=0.9` and
+  landed in `navigator.languages` as `["en-US", "en;q=0.9"]` — a one-header
+  signature on a server whose whole point is not standing out.
+- **`get_page_content` returned an empty string for a frameset**, which is
+  indistinguishable from a blank page. It falls back to `documentElement` and,
+  when there is still no text, names the frames it can see.
+- **`wait_for` swallowed every error and could only ever time out.** A crashed
+  renderer, a detached execution context and an open JS dialog all looked like
+  "not there yet". The timeout now carries the last error it hit.
+
+### The network log says what happened
+
+Only `Network.requestWillBeSent` was ever subscribed, so nothing from the
+response side was collected. A 500, a 404, a redirect, a transport failure and a
+request still in flight all rendered as the same line — in the one tool whose job
+is telling you which request went wrong.
+
+`responseReceived`, `loadingFinished` and `loadingFailed` are collected too, so
+each entry now carries its status, status text, content type, response headers,
+transfer size, duration and whether it came from cache. `list_network_requests`
+leads with the outcome (`500`, `302->`, `FAILED(net::ERR_...)`, or `pending` for a
+request that has genuinely not answered yet) and `get_network_request` lists the
+response headers.
+
+A redirect arrives as a second `requestWillBeSent` for the same request id, so a
+chain used to look like unrelated repeated requests; the hop is recorded against
+the entry that caused it. A response that arrived outranks a later transport
+error, because Chrome aborts the body of a `fetch()` nobody reads — reporting that
+as FAILED hid the 500 the caller was looking for.
+
+### Frames are no longer a blind spot
+
+`take_snapshot` called `getFullAXTree` with no `frame_id`, which stops at every
+frame boundary, and `document.querySelector` never crosses one — so a payment
+field, a consent wall, an embedded editor or a CAPTCHA widget did not exist as far
+as this server was concerned. `get_page_content` returned `""` for a frameset,
+which is indistinguishable from a blank page.
+
+- **`list_frames`** shows the frame tree with each frame's index, URL and name.
+- `take_snapshot` reads every frame and splices its tree in under the element that
+  hosts it, so the result is one document and an element inside an iframe gets a
+  uid like any other. `include_frames=false` opts out on frame-heavy pages.
+- `get_page_content`, `query_selector` and `evaluate_script` take a `frame`
+  argument. They run in an isolated world, which shares the frame's DOM but not
+  its own JavaScript variables — finding the main world's context id needs
+  `Runtime.enable`, the one domain this server keeps off because attaching it is
+  detectable.
+- Trusted input reaches into frames. A click is delivered by viewport coordinate
+  while the hit test necessarily runs in the element's own document, so for
+  anything inside an iframe the point was frame-relative and the click landed
+  elsewhere — reporting success for it. The offset is measured as the difference
+  between `DOM.getBoxModel` (top-level coordinates) and the element's own
+  `getBoundingClientRect`, which is zero in the main frame, so one code path
+  serves both and nesting depth does not matter.
+
+No uid scheme change was needed: this server disables site isolation, so a child
+frame's backendNodeIds already resolve through the same session.
+
+Also: a snapshot taken the instant a navigation returns used to come back with
+only the root node, because Chrome builds its accessibility cache lazily and the
+tool could not tell that from a genuinely empty page. It now waits briefly and
+asks again.
+
+### WebSockets are visible
+
+`WebSocket` was an offered value of `resource_types` that could never match,
+because nothing subscribed to any `Network.webSocket*` event. A live socket
+produced no entries at all, so on a real-time site the actual data channel was
+the one thing the server could not see — and the only workaround, an
+`init_script` shim replacing `window.WebSocket`, de-natives the API and
+undermines the stealth this server exists for.
+
+Sockets are recorded with their handshake status and response headers, and their
+frames with direction, text-or-binary opcode and payload. `list_network_requests`
+shows the sent/received counts; `get_network_request` prints the frames. Payloads
+are capped at 2000 characters and each socket keeps its last 200 frames, with the
+number dropped reported rather than silently forgotten.
+
+### A dialog can no longer wedge a tab
+
+A modal `alert`/`confirm`/`prompt` blocks the renderer, so every later call into
+the page hangs until it is answered — and `handle_dialog` was the one call that
+could not answer it. Chrome reports a dialog only to a client that enabled the
+Page domain, and `Page.enable` was sent from `navigate_page` alone, so a tab
+reached through `new_page` answered "No dialog is showing" while being blocked by
+one, with no way out but closing it.
+
+The Page domain is enabled with the rest of a tab's setup now, dialogs are
+tracked as they open and close, `handle_dialog` reports the dialog's own text,
+and the input-delivery warning names an open dialog as the cause instead of
+listing it as a possibility. `Page.enable` is not `Runtime.enable`: it does not
+carry the attached-debugger signal this server deliberately keeps off, and
+navigate_page has always sent it.
+
+### hover and drag were left behind by the click rewrite
+
+1.9.0 gave `click` scrolling and hit-testing, measured against a real page where
+43 of 54 visible links had a centre point that hit something else. `hover` and
+`drag` were still aiming at the raw box centre.
+
+- `hover` scrolls and hit-tests like `click`, and says what is in the way instead
+  of hovering it. It also stops walking the pointer from the viewport origin:
+  nodriver's `Tab.mouse_move` interpolates from (0, 0) every time, firing
+  mouseMoved along the whole diagonal — opening every menu on that line — and
+  then sends a `mouseReleased`, a stray mouseup that drag handles and sliders act
+  on. The pointer now moves from where it actually is, and releases nothing.
+- `drag` hit-tests both ends and holds the button down across the move, which is
+  what mouse-driven sortables listen for and what nodriver's `mouse_drag` left
+  out. Its description no longer claims native HTML5 drag-and-drop: that is a
+  separate protocol a synthetic mouse does not trigger, and saying so beats a
+  silent no-op.
+
+### The stealth claim finally has tests
+
+The product claim is "undetected", and nothing guarded it: the suite checked
+schemas and prose, so a regression in the one property the whole server exists
+for would have shipped in silence. Five checks now run against a real Chrome —
+`navigator.webdriver`, ChromeDriver's `cdc_` properties, an empty plugin list,
+real outer window dimensions, well-formed `navigator.languages`, and that the
+input-delivery probe leaves nothing on the page. They are the cheap, deterministic
+ones a detection script runs first, not a substitute for a real anti-bot service,
+whose verdict lives on someone else's server and cannot be a unit test.
+
+They caught something immediately. **An emulated user agent disagreed with its own
+client hints**: Chrome fills `navigator.userAgentData` from the real build and
+cannot be talked out of it, so a preset pinned to Chrome 150 announced 150 in the
+UA string while its hints said 151. Comparing the two is one line of JavaScript.
+The presets now take the running browser's version, because anything the browser
+will not lie about has to be matched rather than contradicted.
+
+Also fixed on the way: `click`, `hover` and `drag` on a uid that lands on a text
+node — which snapshots hand out routinely — raised
+`this.getBoundingClientRect is not a function`. They promote it to its element,
+which `fill` has always done.
+
+### Smaller things
+
+- **`cf_verify` could never run.** opencv was not a dependency, not even an
+  optional one, so the flagship anti-bot tool always failed with an error from
+  inside nodriver. It is an extra now (`pip install nodriver-mcp[cf]`), the tool
+  says so when it is missing, it reports plainly when the page has no challenge
+  to solve, and it no longer writes its working files into the client's working
+  directory — which for an stdio server is wherever the client happened to start.
+- **An unknown argument is refused instead of dropped.** Pydantic ignores extra
+  fields, so a misspelled argument vanished and the tool ran with its defaults:
+  `block_resources(resource_types=…)` — the plausible spelling — answered
+  "Resource blocking disabled", a success message for a call that asked for the
+  opposite. The router now names the argument it did not understand and lists the
+  ones the tool takes.
+
+### A smaller snapshot, without losing anything
+
+take_snapshot is the most-called tool in the server, so its size is paid at every
+single agent step. Measuring where the bulk actually sits gave a different answer
+than expected: the `StaticText` duplication a previous analysis measured at 39% of
+the output is already folded away and now accounts for 4%, while **repeating the
+page's own origin on every same-origin link is 7-16%** — the largest remaining
+cost by a wide margin.
+
+Same-origin URLs are printed relative to the document. The root node keeps its
+absolute URL, so every shortened one is reconstructible, and a URL on another
+origin is never touched — it is not derivable from the root, and following it is
+the point. Measured: Hacker News 33 852 -> 28 342 characters (-16%),
+books.toscrape.com -13%, a long Wikipedia article -8%.
+
+### Input tools say whether the page received anything
+
+A CDP `Input.*` acknowledgement proves only that the browser queued the event. An
+occluded window, an open JavaScript dialog or a busy renderer swallow it, and
+`click`, `click_at`, `press_key` and `type_text` all built their success string
+from their own arguments regardless. Three agents in the audit measured zero
+events reaching the page while every call reported success; that is the failure
+mode that cost the most, because the agent continues and breaks somewhere
+unrelated several steps later.
+
+`click`, `press_key` and `type_text` now count the input events the page actually
+receives and say so when the answer is none. The counter lives in an isolated
+world, so the page's own `window` keeps no trace of it — a global there would
+itself be a detection signal — and listeners registered from an isolated world do
+see real DOM events, which is what makes the check possible without leaving marks.
+
+`type_text` also names the element it typed into (`Typed 3 characters into
+input#email`), because typing into the wrong field, or into a page with nothing
+focused, used to look exactly like success.
+
+Silence is not treated as failure: when the probe cannot be installed or read, or
+when the element is inside a frame — where events do not reach the top document —
+the response says the delivery was not verified rather than claiming it failed.
+A warning on a working click would be worse than the silence it replaces.
+
+### Forms know what kind of control they are talking to
+
+`_fill_element` branched on `tagName` and never read `input.type` — `this.type`
+appeared once in 5199 lines, and the string `checked` did not appear at all. So
+checkbox, radio, file, date, month, week, time, colour and range all took the
+path written for `<input type=text>`: select the contents, type over them, then
+compare `el.value`.
+
+That produced the worst failures in the audit, because the verification agreed.
+A checkbox has no text, so the keystrokes went to whatever had focus — in a
+`fill_form`, the field filled just before it — while `el.value` on a checkbox
+never changes, so the read-back passed and `fill` reported success having edited
+a different field. A radio reported "filled" while nothing was selected. A native
+date input reported an *error* for a value that had landed, because the typed
+locale string never equals the `YYYY-MM-DD` the element holds.
+
+- `fill` now probes tag, type, readOnly and disabled in one call, and refuses the
+  controls it cannot fill by naming the one that can: `set_checked` for checkbox
+  and radio, `upload_file` for a file input. Date-like and colour and range inputs
+  are assigned and given input+change events, and the response discloses that no
+  keystrokes were involved — the same honesty `click` applies to its synthetic
+  fallback. The read-back is per type: `.checked` for a checked state,
+  `selectedOptions` for a `<select>`, the wire format for a date.
+- **`set_checked(uid, checked)`** ticks, unticks and verifies. It is idempotent,
+  clicks the controlling `<label>` when the real input is hidden behind a styled
+  one, and says plainly that a radio cannot be unchecked by the browser.
+- **`select_option(uid, option)`** matches the value attribute, then the visible
+  label, then the index — a snapshot shows the label, not the value, so matching
+  only the value meant guessing. When nothing matches it lists every option the
+  `<select>` actually has instead of only saying no.
+- A field that fails inside `fill_form` now blurs before the next one, so a
+  failure cannot leave focus somewhere the following keystrokes land.
+
+### The browser cap stopped being a one-way ratchet
+
+Twelve agents that each opened a browser and dutifully called `close_browser`
+wedged the server for everything arriving after them. `close_browser` keeps the
+name on purpose — its profile and flags have to survive the relaunch — but
+nothing ever gave the name back, and the cap counts registrations rather than
+Chromes. Seven of the audit's eighteen agents never got a browser at all.
+
+- Idle browsers holding no Chrome are collected after
+  `NODRIVER_BROWSER_IDLE_TTL_S` (default 900s, `0` disables), by a sweep that also
+  runs once before the cap refuses. A browser still running Chrome is never
+  reclaimed, and neither is one whose idle time cannot be determined — reclaiming
+  is destructive, so "cannot tell" has to mean "leave it alone".
+- `close_browser` no longer routes through get-or-create. Closing a name that was
+  never opened answered with the *creation* cap error — a cleanup call failing
+  exactly when cleanup matters — and spawned a whole subprocess to discover there
+  was nothing to close, so a typo in `browser` burned a slot permanently.
+- `list_browsers` stops advertising room it does not have. It reported
+  `open == max` beside a fixed hint reading "pass a new name, nothing needs to be
+  created first". It now reports `slots_free`, names what is reclaimable, and
+  gathers its status calls instead of awaiting them one after another — eleven
+  unresponsive workers cost eleven timeouts in a row, in the one call an operator
+  makes when the pool is unhealthy.
+- `NODRIVER_MAX_BROWSERS` makes the ceiling configurable. A 128 GB workstation and
+  an 8 GB CI box should not be stuck with the same number.
+- `close_browser` now says that it keeps the name and its slot, and names
+  `shutdown_browser` as the call that releases both. Ten of the audit's agents
+  picked the wrong teardown, which is what turned a documented design into an
+  outage.
+
+### Tests
+
+Fifteen new regression tests, every one of which fails against the previous
+release: six on the registry's bookkeeping with a stub worker (including one that
+would hang forever if the reclaim sweep waited on another name's lock), eight
+that need a real Chrome — the session round trip, the JSON shape, the unparseable
+selector, response-body retrieval, resource blocking across a navigation, a trace
+across a navigation and a navigation that genuinely fails — and one pure data
+check that no device preset ships its own q-values.
+
+The existing suite is a schema-and-drift contract and would have caught none of
+the defects above; it asserts that the prose and the signatures agree, which is
+worth having and is not the same thing as asserting that a tool does what it
+says. Every defect in this release was of the second kind.
+
+Tool count: 61 -> 64 (set_checked, select_option, list_frames).
+
 ## 2.0.1 — the landing page did not mention the headline feature
 
 Documentation only; the server is unchanged from 2.0.0.

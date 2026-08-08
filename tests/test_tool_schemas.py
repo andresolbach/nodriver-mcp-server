@@ -36,9 +36,9 @@ def _params(tool) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_tool_count(tools):
-    # 59 browser tools + browser_status, which the routing layer consumes and
+    # 62 browser tools + browser_status, which the routing layer consumes and
     # hides from clients.
-    assert len(tools) == 60
+    assert len(tools) == 63
 
 
 def test_tool_names_are_unique(tools):
@@ -52,6 +52,7 @@ def test_no_tool_was_renamed_by_accident(by_name):
         "block_resources", "browser_status", "bypass_insecure_warning",
         "cf_verify", "clear_cookies",
         "click", "click_at", "close_browser", "close_page", "create_profile",
+        "select_option", "set_checked", "list_frames",
         "delete_profile", "disable_console_collection", "drag", "emulate",
         "emulate_device", "enable_console_collection", "evaluate_script", "fill",
         "fill_form", "get_console_message", "get_cookies", "get_local_storage",
@@ -212,3 +213,21 @@ def test_numeric_bounds_are_declared(by_name):
     assert _params(by_name["take_screenshot"])["quality"]["maximum"] == 100
     assert _params(by_name["select_page"])["page_id"]["minimum"] == 0
     assert _params(by_name["wait_for"])["text"]["minItems"] == 1
+
+
+def test_device_presets_do_not_ship_their_own_q_values():
+    """Regression: every mobile request carried a malformed Accept-Language.
+
+    Chrome generates the q-values itself from a bare language list, so a preset
+    supplying "en-US,en;q=0.9" produced "en-US,en;q=0.9;q=0.9" on the wire and
+    ["en-US", "en;q=0.9"] in navigator.languages. On a server whose entire point
+    is not standing out, that is a one-header signature.
+    """
+    from nodriver_mcp.server import _DEVICE_PRESETS
+
+    for name, preset in _DEVICE_PRESETS.items():
+        value = preset.get("accept_language", "")
+        assert ";" not in value, (
+            f"{name} ships q-values Chrome will duplicate: {value!r}"
+        )
+        assert value, f"{name} has no accept_language"
