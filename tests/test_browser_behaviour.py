@@ -144,3 +144,98 @@ def test_save_session_stores_cookies_from_every_tab():
                 Path(match.group(1).strip()).unlink(missing_ok=True)
 
     _run(scenario)
+
+
+def test_load_session_restores_the_cookies_it_saved():
+    """Regression: the advertised round trip restored nothing, and said so cheerfully.
+
+    load_session passed the raw JSON float from `expires` into
+    cdp.network.set_cookie, whose generator calls `expires.to_json()`. A float
+    has no to_json, so every cookie raised AttributeError into a logger.warning
+    on stderr that no MCP client ever sees, and the counter — incremented only
+    on the success path — reported "Cookies restored: 0" as a normal result.
+
+    save_session keeps CDP's -1 sentinel for session cookies, and -1 is truthy,
+    so 100% of cookies took the failing branch. An agent following the
+    documented "arrive already logged in" path silently scraped the logged-out
+    view of every site.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+        await _call("set_cookie", name="restored", value="XYZ", domain="example.com")
+
+        saved = await _call("save_session", name="pytest-load-roundtrip")
+        match = re.search(r"saved to (.+\.json)", saved)
+        assert match, f"could not find the session path in:\n{saved}"
+        path = Path(match.group(1).strip())
+
+        try:
+            # A temp profile discards its cookie jar, which is what makes this a
+            # real round trip rather than a no-op.
+            await _call("close_browser")
+            await _call("new_page", url="https://example.com")
+            assert "restored=XYZ" not in await _call("get_cookies"), (
+                "the cookie survived close_browser, so this proves nothing"
+            )
+
+            loaded = await _call("load_session", filename=path.name)
+            assert "Cookies restored: 0" not in loaded, loaded
+
+            jar = await _call("get_cookies")
+            assert "restored=XYZ" in jar, (
+                f"load_session reported success but the jar is empty:\n{loaded}\n{jar}"
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+    _run(scenario)
+
+
+def test_evaluate_script_returns_plain_json_for_objects():
+    """Regression: it returned CDP's deep-serialization wire format.
+
+    nodriver's Tab.evaluate asks for "deep" serialization, so {"a": 1} came back
+    as [["a", {"type": "number", "value": 1}]] — several times the tokens, not
+    what the tool's own description promises, and something every caller had to
+    write a decoder for. Primitives were unaffected, so the shape silently
+    changed with the return value.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+
+        out = await _call("evaluate_script", function='() => ({a: 1, b: "two", c: [1, 2]})')
+        assert '"type"' not in out, f"still CDP wire format:\n{out}"
+        assert '"a": 1' in out or '"a":1' in out, out
+        assert '"b": "two"' in out or '"b":"two"' in out, out
+
+        # Primitives kept working throughout; make sure that did not regress.
+        assert "42" in await _call("evaluate_script", function="() => 40 + 2")
+
+    _run(scenario)
+
+
+def test_a_selector_that_cannot_parse_is_reported_not_treated_as_a_hit():
+    """Regression: an invalid selector was reported as a successful match.
+
+    nodriver's Tab.evaluate *returns* the ExceptionDetails object on a JS error
+    instead of raising, and that object is truthy — so `if await tab.evaluate(...)`
+    in wait_for_selector answered "Element found." on the first poll for a
+    selector Chrome had refused to parse.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://example.com")
+
+        found = await _call("wait_for_selector", selector=">>>bogus[[[", timeout=2000)
+        assert "found" not in found.lower(), f"invalid selector reported as a hit:\n{found}"
+
+        scrolled = await _call("scroll_to_selector", selector=">>>bogus[[[")
+        assert "Scrolled to" not in scrolled, scrolled
+
+        # A valid selector that matches nothing is a different answer entirely.
+        real = await _call("wait_for_selector", selector="div.definitely-absent", timeout=1500)
+        assert "Timeout" in real, real
+
+    _run(scenario)

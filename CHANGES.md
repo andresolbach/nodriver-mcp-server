@@ -1,5 +1,143 @@
 # Changelog
 
+## 2.1.0 — tools that reported success while doing nothing
+
+An independent audit drove this server through 25 agents and 2151 tool calls:
+first as a black box, then through the source, then trying to refute its own
+findings. The stealth core came out well — four search engines with no captcha,
+Reddit's JS challenge solved mid-navigation, Cloudflare cleared on the first
+load, and one site out of eight that simply blocked it. Everything below is the
+layer on top of that, where the recurring defect was not a missing feature but a
+tool answering "done" when nothing had happened.
+
+### One upstream call explained six of them
+
+`navigate_page` goes through nodriver's `Tab.get()`, and `Browser.get()` calls
+`connection.attach()` again after every navigation: a new CDP session on the same
+target, with the old one never detached. Commands then go to the new session,
+while events keep arriving over the old one — and nodriver's dispatcher matches
+on event type without looking at `sessionId`, so collection keeps working and
+everything *looks* healthy.
+
+That is why `get_network_request` could not return a response body for any
+request (100% `-32000 No resource with given identifier found`), why
+`block_resources` blocked nothing, why `reset_emulation` and
+`disable_console_collection` had no effect after the first navigation, and why a
+long scrape accumulates one stranded inspector session per navigation. The
+navigation path is not rewritten in this release; the repairs below are the ones
+that stand on their own, and the session churn is the next piece of work.
+
+### Fixed
+
+- **`load_session` restored nothing, and reported it as a number rather than an
+  error.** It passed the raw JSON float from `expires` into
+  `cdp.network.set_cookie`, whose generator calls `expires.to_json()` — a float
+  has no `to_json`, so every cookie raised `AttributeError` into a
+  `logger.warning` on stderr that no MCP client sees. `save_session` keeps CDP's
+  `-1` sentinel for session cookies and `-1` is truthy, so 100% of cookies took
+  the failing branch. The counter only advanced on success, which is how the
+  advertised "arrive already logged in" round trip came back as
+  `Cookies restored: 0` on a normal, non-error result — an agent following it
+  scraped the logged-out view of a site and could not tell. Cookies now go
+  through `CookieParam` and a bulk `Storage.setCookies`, and the count reported is
+  read back from the browser instead of counting calls that did not raise.
+- **Clicks and keystrokes were dropped whenever another window covered Chrome.**
+  The browser launched without `--disable-backgrounding-occluded-windows`,
+  `--disable-renderer-backgrounding` and `--disable-background-timer-throttling`,
+  which Puppeteer and Playwright both pass by default. Chrome treats an occluded
+  window as hidden: timers fall to about 1 Hz, `requestAnimationFrame` stops and
+  input delivery becomes unreliable — while every tool still returns "Clicked
+  uid=…". Three agents measured zero events reaching the page, and that state is
+  guaranteed the moment two agents each own a browser. Also passes
+  `--window-size=1280,900`, because `outerWidth`/`outerHeight` reading 0 is itself
+  a signal.
+- **`evaluate_script` returned CDP's wire format instead of JSON.** nodriver's
+  `Tab.evaluate` asks for "deep" serialization, so `{"a": 1}` came back as
+  `[["a", {"type": "number", "value": 1}]]` — several times the tokens, and a
+  decoder every caller had to write. Primitives were unaffected, so the shape
+  changed silently with the return value.
+- **An unparseable CSS selector was reported as a match.** That same
+  `Tab.evaluate` *returns* the `ExceptionDetails` object on a JS error instead of
+  raising, and the object is truthy, so `wait_for_selector` answered "Element
+  found." on its first poll and `scroll_to_selector` claimed to have scrolled;
+  `query_selector` leaked a Python `TypeError` out of `json.loads`. All three now
+  share one evaluate helper that raises on a JS error, and a selector that cannot
+  parse says so instead of timing out.
+- **`isolated_context` could never have worked.** nodriver initialises
+  `Browser.connection` to `None` and never assigns it, so the documented "hold
+  several logins to one site at once" path raised
+  `'NoneType' object has no attribute 'send'` every time. `Browser` subclasses
+  `Connection`, so it sends CDP itself. Also dropped `for_tab=True`, which asks
+  for a target `browser.tabs` filters out, and taught the target wait to refresh
+  nodriver's inventory instead of only ever timing out.
+- **Uncaught exceptions were invisible.** Only `Runtime.consoleAPICalled` was
+  subscribed, so a page throwing an uncaught `TypeError` reported "0 messages" —
+  from the tool whose only job is to say what went wrong. `Runtime.exceptionThrown`
+  is captured too, with its URL and line.
+- **Console collection duplicated every message when toggled.**
+  `remove_handler(event_type, callback)` takes both arguments; passing only the
+  type raised `TypeError` into a bare `except`, so the handler was never removed
+  and each re-enable added another one.
+- **Performance traces were always empty.** `Tracing.start` asked for
+  `ReturnAsStream` while `stop_trace` only listens for `Tracing.dataCollected`,
+  which that transfer mode never emits. It uses `ReportEvents`, and says so when a
+  trace is empty rather than quietly not writing the file it was given.
+- **`take_snapshot`'s 200 000-character cap applied to `file_path` too**, so the
+  escape hatch for a page too large to read inline was capped at the same size and
+  a big page could not be read in full by any means. The cap is inline only now,
+  and names what it truncated and how to get the rest.
+- **The device presets shipped a malformed `Accept-Language`.** Chrome generates
+  q-values itself, so `"en-US,en;q=0.9"` went out as `en-US,en;q=0.9;q=0.9` and
+  landed in `navigator.languages` as `["en-US", "en;q=0.9"]` — a one-header
+  signature on a server whose whole point is not standing out.
+- **`get_page_content` returned an empty string for a frameset**, which is
+  indistinguishable from a blank page. It falls back to `documentElement` and,
+  when there is still no text, names the frames it can see.
+- **`wait_for` swallowed every error and could only ever time out.** A crashed
+  renderer, a detached execution context and an open JS dialog all looked like
+  "not there yet". The timeout now carries the last error it hit.
+
+### The browser cap stopped being a one-way ratchet
+
+Twelve agents that each opened a browser and dutifully called `close_browser`
+wedged the server for everything arriving after them. `close_browser` keeps the
+name on purpose — its profile and flags have to survive the relaunch — but
+nothing ever gave the name back, and the cap counts registrations rather than
+Chromes. Seven of the audit's eighteen agents never got a browser at all.
+
+- Idle browsers holding no Chrome are collected after
+  `NODRIVER_BROWSER_IDLE_TTL_S` (default 900s, `0` disables), by a sweep that also
+  runs once before the cap refuses. A browser still running Chrome is never
+  reclaimed, and neither is one whose idle time cannot be determined — reclaiming
+  is destructive, so "cannot tell" has to mean "leave it alone".
+- `close_browser` no longer routes through get-or-create. Closing a name that was
+  never opened answered with the *creation* cap error — a cleanup call failing
+  exactly when cleanup matters — and spawned a whole subprocess to discover there
+  was nothing to close, so a typo in `browser` burned a slot permanently.
+- `list_browsers` stops advertising room it does not have. It reported
+  `open == max` beside a fixed hint reading "pass a new name, nothing needs to be
+  created first". It now reports `slots_free`, names what is reclaimable, and
+  gathers its status calls instead of awaiting them one after another — eleven
+  unresponsive workers cost eleven timeouts in a row, in the one call an operator
+  makes when the pool is unhealthy.
+- `NODRIVER_MAX_BROWSERS` makes the ceiling configurable. A 128 GB workstation and
+  an 8 GB CI box should not be stuck with the same number.
+- `close_browser` now says that it keeps the name and its slot, and names
+  `shutdown_browser` as the call that releases both. Ten of the audit's agents
+  picked the wrong teardown, which is what turned a documented design into an
+  outage.
+
+### Tests
+
+Ten new regression tests, each of which fails against the previous release: five
+on the registry's bookkeeping with a stub worker, four that need a real Chrome
+(the session round trip, the JSON shape and the unparseable selector), and one
+pure data check that no device preset ships its own q-values. The existing suite
+is a schema-and-drift contract and would have caught none of the defects above,
+which is the point of the new browser-level ones.
+
+Tool count: 61 -> 61.
+
 ## 2.0.1 — the landing page did not mention the headline feature
 
 Documentation only; the server is unchanged from 2.0.0.

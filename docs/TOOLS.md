@@ -380,7 +380,12 @@ flags without switching profiles.
 
 On an ephemeral temp profile (the default) this discards cookies, logins and
 localStorage — save_session first if you need them back. Persistent profiles
-created with create_profile keep everything.  
+created with create_profile keep everything.
+
+It keeps the browser itself. The name, its selected profile and its launch
+flags survive for the next relaunch, so the name goes on counting against the
+12-browser limit. When an agent is finished for good, call shutdown_browser
+instead: it also releases the name.  
 <sub>destructive</sub>
 
 | Parameter | Type | Required | Description |

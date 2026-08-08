@@ -232,6 +232,19 @@ async def _get_browser() -> uc.Browser:
             browser_args: list[str] = [f"--disable-features={','.join(disabled_features)}"]
             if not extensions_on:
                 browser_args.append("--disable-extensions")
+            # Chrome treats a window another window covers as hidden: timers drop
+            # to ~1/s, rAF stops, and input delivery to the renderer becomes
+            # unreliable — while every tool still reports success. That is
+            # guaranteed the moment two agents each own a browser, and it is why
+            # Puppeteer and Playwright both pass these three by default.
+            # --window-size also fixes outerWidth/outerHeight reading 0, which is
+            # itself a fingerprint signal on a server whose point is not standing out.
+            browser_args += [
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--window-size=1280,900",
+            ]
             browser_args.extend(_extra_browser_args)
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
@@ -454,6 +467,7 @@ _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
 _network_collection_enabled_tabs: set[int] = set()  # track which tabs have network collection enabled
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
+_console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 _selected_target_id: str | None = None  # target_id chosen via select_page(); honored by _active_tab()
 _request_counter: int = 0  # monotonic id assigned to each collected network request
@@ -468,7 +482,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
         ),
         "platform": "Android",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         "metadata": {
             "platform": "Android",
             "platform_version": "14",
@@ -486,7 +500,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"
         ),
         "platform": "Android",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         "metadata": {
             "platform": "Android",
             "platform_version": "14",
@@ -505,7 +519,7 @@ _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
             "(KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
         ),
         "platform": "iOS",
-        "accept_language": "en-US,en;q=0.9",
+        "accept_language": "en-US,en",
         # Safari does not send Sec-CH-UA client hints; omit UA-CH metadata.
         "metadata": None,
     },
@@ -646,9 +660,43 @@ async def _enable_console_collection(tab: uc.Tab) -> bool:
         except Exception:
             pass
 
+    async def _on_exception(event):
+        """Capture uncaught errors and unhandled promise rejections.
+
+        Runtime.consoleAPICalled only fires for explicit console.* calls, so
+        without this an uncaught TypeError — the thing you actually want when a
+        page is broken — was reported as "0 messages".
+        """
+        global _console_counter
+        try:
+            det = getattr(event, "exception_details", None)
+            exc = getattr(det, "exception", None)
+            text = (
+                getattr(exc, "description", None)
+                or getattr(exc, "value", None)
+                or getattr(det, "text", None)
+                or "Uncaught exception"
+            )
+            url = getattr(det, "url", "") or ""
+            line = getattr(det, "line_number", None)
+            where = f" ({url}:{line})" if url else ""
+            _console_messages.append({
+                "seq": _console_counter,
+                "type": "error",
+                "text": f"{text}{where}",
+                "timestamp": str(getattr(event, "timestamp", "")),
+            })
+            _console_counter += 1
+            if len(_console_messages) > 1000:
+                _console_messages.pop(0)
+        except Exception:
+            pass
+
     try:
         await tab.send(cdp_runtime.enable())
         tab.add_handler(cdp_runtime.ConsoleAPICalled, _on_console)
+        tab.add_handler(cdp_runtime.ExceptionThrown, _on_exception)
+        _console_handlers[tab_id] = (_on_console, _on_exception)
         _console_collection_enabled_tabs.add(tab_id)
         return True
     except Exception:
@@ -663,10 +711,17 @@ async def _disable_console_collection(tab: uc.Tab) -> bool:
 
     import nodriver.cdp.runtime as cdp_runtime
 
-    try:
-        tab.remove_handler(cdp_runtime.ConsoleAPICalled)
-    except Exception:
-        pass
+    # remove_handler(event_type, callback) — callback is required. Passing only
+    # the type raised TypeError into a bare except, so the handler was never
+    # removed and every re-enable added another one, duplicating every message.
+    handlers = _console_handlers.pop(tab_id, ())
+    for event_type, cb in zip(
+        (cdp_runtime.ConsoleAPICalled, cdp_runtime.ExceptionThrown), handlers
+    ):
+        try:
+            tab.remove_handler(event_type, cb)
+        except Exception:
+            pass
 
     try:
         await tab.send(cdp_runtime.disable())
@@ -991,6 +1046,12 @@ async def _wait_for_target(browser: uc.Browser, target_id: Any, timeout_ms: int)
             if tab.target_id == target_id:
                 tab._browser = browser
                 return tab
+        # A target created through CDP directly is not in nodriver's inventory
+        # until something refreshes it; without this the loop can only time out.
+        try:
+            await browser.update_targets()
+        except Exception:
+            pass
         await asyncio.sleep(0.1)
 
     raise TimeoutError(f"New page did not appear within {int(timeout_s * 1000)}ms")
@@ -1241,21 +1302,24 @@ async def _open_new_tab(
         ctx = _named_browser_contexts.get(isolated_context)
         if ctx is None:
             ctx = await _await_with_timeout(
-                browser.connection.send(
-                    cdp_target.create_browser_context(dispose_on_detach=False)
-                ),
+                # Browser subclasses Connection, so it sends CDP itself.
+                # browser.connection is initialised to None by nodriver and never
+                # assigned, so reaching through it raises AttributeError every time.
+                browser.send(cdp_target.create_browser_context(dispose_on_detach=False)),
                 timeout,
                 f"Create isolated context '{isolated_context}'",
             )
             _named_browser_contexts[isolated_context] = ctx
 
         target_id = await _await_with_timeout(
-            browser.connection.send(
+            browser.send(
                 cdp_target.create_target(
                     url=url,
                     browser_context_id=ctx,
                     background=background,
-                    for_tab=True,
+                    # for_tab=True asks for a target of type "tab", which
+                    # browser.tabs filters out — _wait_for_target would then
+                    # never find it and always time out.
                 )
             ),
             timeout,
@@ -1801,6 +1865,11 @@ async def close_browser() -> str:
     On an ephemeral temp profile (the default) this discards cookies, logins and
     localStorage — save_session first if you need them back. Persistent profiles
     created with create_profile keep everything.
+
+    It keeps the browser itself. The name, its selected profile and its launch
+    flags survive for the next relaunch, so the name goes on counting against the
+    12-browser limit. When an agent is finished for good, call shutdown_browser
+    instead: it also releases the name.
     """
     attached = _connect_target() is not None
     running = await _stop_browser()
@@ -1812,7 +1881,9 @@ async def close_browser() -> str:
             if running else "Was not attached to a browser."
         )
     return (
-        "Browser closed. It will relaunch on the next action."
+        "Browser closed. It will relaunch on the next action. The browser keeps "
+        "its name and its slot against the 12-browser limit — use shutdown_browser "
+        "to release those too."
         if running else "No browser was running."
     )
 
@@ -1961,6 +2032,38 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
+async def _evaluate_value(tab: Any, expression: str, await_promise: bool = False) -> Any:
+    """Evaluate an expression and return its value as plain JSON.
+
+    nodriver's Tab.evaluate cannot be used where the result matters. It asks for
+    "deep" serialization, so an object comes back as CDP's wire format —
+    [["a", {"type": "number", "value": 1}], ...] instead of {"a": 1} — which is
+    several times the tokens and not what any caller wants. Worse, on a JS error
+    it *returns* the ExceptionDetails object instead of raising, and that object
+    is truthy, so `if await tab.evaluate(...)` treats a broken selector as a hit.
+
+    This asks for the value directly and raises on a JS error, so both problems
+    disappear at every call site that uses it.
+    """
+    import nodriver.cdp.runtime as cdp_runtime
+
+    remote, errors = await tab.send(
+        cdp_runtime.evaluate(
+            expression=expression,
+            user_gesture=True,
+            await_promise=await_promise,
+            return_by_value=True,
+            allow_unsafe_eval_blocked_by_csp=True,
+        )
+    )
+    if errors:
+        text = getattr(errors, "text", None) or "JavaScript error"
+        exc = getattr(errors, "exception", None)
+        detail = getattr(exc, "description", None) or getattr(exc, "value", None)
+        raise RuntimeError(f"{text}: {detail}" if detail else text)
+    return remote.value if remote is not None else None
+
+
 @tool(title="Evaluate JavaScript", open_world=True)
 async def evaluate_script(
     function: Annotated[
@@ -2066,7 +2169,7 @@ async def evaluate_script(
             expr = function.strip()
             if expr.startswith("(") or expr.startswith("function") or expr.startswith("async"):
                 expr = f"({expr})()"
-            result = await tab.evaluate(expr, await_promise=True)
+            result = await _evaluate_value(tab, expr, await_promise=True)
             return _deliver(result)
     except Exception as e:
         return f"Error: {e}"
@@ -2877,7 +2980,10 @@ async def performance_start_trace(
         "disabled-by-default-v8.cpu_profiler",
         "latencyInfo", "loading", "v8.execute", "v8",
     ]
-    await tab.send(cdp_tracing.start(categories=",".join(categories), transfer_mode="ReturnAsStream"))
+    # ReportEvents, not ReturnAsStream: stop_trace collects the trace from
+    # Tracing.dataCollected events, and ReturnAsStream never emits those — it
+    # hands back a stream handle instead, so every trace came back empty.
+    await tab.send(cdp_tracing.start(categories=",".join(categories), transfer_mode="ReportEvents"))
     _tracing_active = True
 
     if reload:
@@ -2940,10 +3046,14 @@ async def performance_stop_trace(
 
     result = f"Trace stopped. {len(trace_chunks)} events collected."
 
-    if file_path and trace_chunks:
-        with open(file_path, "w") as f:
-            json.dump(trace_chunks, f)
-        result += f" Saved to {file_path}"
+    if file_path:
+        if trace_chunks:
+            with open(file_path, "w") as f:
+                json.dump(trace_chunks, f)
+            result += f" Saved to {file_path}"
+        else:
+            # Silently not writing the file the caller asked for reads as success.
+            result += f" Nothing was written to {file_path} — the trace was empty."
 
     return result
 
@@ -3557,14 +3667,20 @@ async def take_snapshot(
         output_parts.append(_format_node(rid, 0))
     snapshot_text = "".join(output_parts)
 
-    # Truncate if extremely large
-    if len(snapshot_text) > 200_000:
-        snapshot_text = snapshot_text[:200_000] + "\n... (truncated)"
-
+    # file_path is the escape hatch for a page too large to put in the
+    # conversation, so capping what gets written would leave no way to read a
+    # big page at all. Only the inline path is capped.
     if file_path:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(snapshot_text)
         return f"Snapshot saved to {file_path} ({len(snapshot_text)} chars)."
+
+    if len(snapshot_text) > 200_000:
+        snapshot_text = (
+            snapshot_text[:200_000]
+            + f"\n... (truncated at 200000 of {len(snapshot_text)} chars"
+            " — pass file_path to get the whole tree)"
+        )
 
     return snapshot_text
 
@@ -3751,21 +3867,30 @@ async def wait_for(
     timeout_s = timeout / 1000
 
     start = time.time()
+    last_error = ""
     while time.time() - start < timeout_s:
         try:
             # Get page text content
-            page_text = await tab.evaluate("document.body ? document.body.innerText : ''")
+            page_text = await _evaluate_value(
+                tab, "(document.body || document.documentElement || {}).innerText || ''"
+            )
             if page_text:
                 for t in text:
                     if t in page_text:
                         # Found — return with snapshot
                         snapshot = await take_snapshot()
                         return f"Found text \"{t}\" on page.\n\n{snapshot}"
-        except Exception:
-            pass
+        except Exception as e:
+            # A crashed renderer, a detached context or an open JS dialog are all
+            # very different from "not there yet"; remember why so the timeout can
+            # say which it was instead of blaming the wait.
+            last_error = str(e)
         await asyncio.sleep(0.5)
 
-    return f"Timeout: None of the texts {text} appeared within {timeout}ms."
+    msg = f"Timeout: None of the texts {text} appeared within {timeout}ms."
+    if last_error:
+        msg += f" The page could not be read while waiting: {last_error}"
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -3907,39 +4032,61 @@ async def load_session(
     browser = await _get_browser()
     import nodriver.cdp.network as cdp_net
 
-    # 1. Restore cookies
-    cookies_restored = 0
-    for c in session.get("cookies", []):
-        try:
-            kwargs: dict[str, Any] = {
-                "name": c["name"],
-                "value": c["value"],
-                "domain": c.get("domain", ""),
-                "path": c.get("path", "/"),
-                "secure": c.get("secure", False),
-                "http_only": c.get("httpOnly", False),
-            }
-            if c.get("expires"):
-                kwargs["expires"] = c["expires"]
-            if c.get("sameSite"):
-                from nodriver.cdp.network import CookieSameSite
-                kwargs["same_site"] = CookieSameSite(c["sameSite"])
-            await tab.send(cdp_net.set_cookie(**kwargs))
-            cookies_restored += 1
-        except Exception as e:
-            logger.warning("Failed to restore cookie %s: %s", c.get("name"), e)
+    # 1. Restore cookies.
+    #
+    # Every field goes through CookieParam.from_json rather than hand-built
+    # kwargs: cdp_net.set_cookie(expires=...) calls expires.to_json(), so a raw
+    # JSON float raised AttributeError for every single cookie — and because the
+    # counter only advanced on success, the failure surfaced as a cheerful
+    # "Cookies restored: 0" instead of an error.
+    import nodriver.cdp.storage as cdp_storage
 
-    # 2. Restore localStorage — navigate to the saved URL first so the origin matches
+    saved_cookies = session.get("cookies", [])
+    params: list[Any] = []
+    for c in saved_cookies:
+        entry = dict(c)
+        # getCookies reports a session cookie as expires == -1. Sending that back
+        # would set a cookie that expired in 1969; omitting the field is what
+        # actually produces a session cookie.
+        exp = entry.get("expires")
+        if not isinstance(exp, (int, float)) or exp <= 0:
+            entry.pop("expires", None)
+        try:
+            params.append(cdp_net.CookieParam.from_json(entry))
+        except Exception as e:
+            logger.warning("Skipping unusable cookie %s: %s", entry.get("name"), e)
+
+    cookie_error = ""
+    if params:
+        try:
+            await tab.send(cdp_storage.set_cookies(cookies=params))
+        except Exception as e:
+            cookie_error = str(e)
+            logger.warning("Failed to restore cookies: %s", e)
+
+    # Report what the browser actually holds, not how many calls did not raise.
+    cookies_restored = 0
+    try:
+        wanted = {(c.get("name"), c.get("domain")) for c in saved_cookies}
+        live = await tab.send(cdp_storage.get_cookies())
+        cookies_restored = sum(1 for c in (live or []) if (c.name, c.domain) in wanted)
+    except Exception as e:
+        logger.warning("Could not verify restored cookies: %s", e)
+        cookie_error = cookie_error or str(e)
+
+    # 2. Navigate to the saved origin, then restore localStorage there.
+    # The docstring promises this navigation unconditionally, and the reload in
+    # step 4 is only meaningful if we are on the origin the cookies belong to.
     ls_items = session.get("localStorage", {})
     ls_restored = 0
+    current_url = session.get("current_url", "")
+    if current_url and current_url != "about:blank":
+        try:
+            await tab.get(current_url)
+            await tab
+        except Exception:
+            pass
     if ls_items:
-        current_url = session.get("current_url", "")
-        if current_url and current_url != "about:blank":
-            try:
-                await tab.get(current_url)
-                await tab
-            except Exception:
-                pass
         try:
             await tab.set_local_storage(ls_items)
             ls_restored = len(ls_items)
@@ -3964,9 +4111,18 @@ async def load_session(
     except Exception:
         pass
 
+    saved_count = len(session.get("cookies", []))
+    cookie_line = f"  Cookies restored: {cookies_restored} of {saved_count} saved"
+    if cookies_restored < saved_count:
+        cookie_line += (
+            f"\n  Note: {saved_count - cookies_restored} cookie(s) did not survive"
+            " — expired tokens and cookies for other origins are dropped by Chrome."
+        )
+        if cookie_error:
+            cookie_line += f"\n  Error: {cookie_error}"
     return (
         f"Session '{session.get('name', '')}' loaded from {filepath}\n"
-        f"  Cookies restored: {cookies_restored}\n"
+        f"{cookie_line}\n"
         f"  localStorage items restored: {ls_restored}\n"
         f"  Pages re-opened: {pages_opened}"
     )
@@ -4053,10 +4209,27 @@ async def get_page_content(
     """
     tab = await _active_tab()
     if format == "html":
-        content = await tab.evaluate("document.documentElement.outerHTML")
+        content = await _evaluate_value(tab, "document.documentElement.outerHTML")
     else:
-        content = await tab.evaluate("document.body ? document.body.innerText : ''")
+        # A <frameset> page has no body, and document.body.innerText would be ''
+        # — indistinguishable from a blank page. Fall back to documentElement and
+        # say so when the text is empty but frames are present.
+        content = await _evaluate_value(
+            tab, "(document.body || document.documentElement || {}).innerText || ''"
+        )
     content = content or ""
+    if format == "text" and not content.strip():
+        try:
+            frames = await _evaluate_value(
+                tab, "document.querySelectorAll('frame,iframe').length"
+            )
+        except Exception:
+            frames = 0
+        if frames:
+            return (
+                f"(no text in the main document; this page is built from {frames} frame(s), "
+                "whose content is not included)"
+            )
     if file_path:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -4102,7 +4275,7 @@ async def query_selector(
         "})))" % (sel, int(limit))
     )
     try:
-        raw = await tab.evaluate(expr)
+        raw = await _evaluate_value(tab, expr)
         items = json.loads(raw) if raw else []
     except Exception as e:
         return f"Error querying '{selector}': {e}"
@@ -4210,7 +4383,7 @@ async def get_computed_styles(
 
     try:
         if expr is not None:
-            raw = await tab.evaluate(f"({body}).call({expr})", await_promise=False)
+            raw = await _evaluate_value(tab, f"({body}).call({expr})")
         else:
             remote = await _call_function_on(
                 tab,
@@ -4267,9 +4440,13 @@ async def scroll_to_selector(
         "el.scrollIntoView({block:'center', inline:'center'}); return true; })()" % sel
     )
     try:
-        ok = await tab.evaluate(expr)
+        ok = await _evaluate_value(tab, expr)
     except Exception as e:
-        return f"Error: {e}"
+        # Only call it a bad selector when it is one; a detached context or a
+        # crashed renderer arrives here too and deserves its own words.
+        if "SyntaxError" in str(e) or "not a valid selector" in str(e):
+            return f"Error: invalid selector '{selector}': {e}"
+        return f"Error scrolling to '{selector}': {e}"
     return f"Scrolled to '{selector}'." if ok else f"No element matches '{selector}'."
 
 
@@ -4361,14 +4538,22 @@ async def wait_for_selector(
         expr = "!!document.querySelector(%s)" % sel
     timeout_s = timeout / 1000
     start = time.time()
+    last_error = ""
     while time.time() - start < timeout_s:
         try:
-            if await tab.evaluate(expr):
+            if await _evaluate_value(tab, expr):
                 return f"Element '{selector}' found."
-        except Exception:
-            pass
+        except Exception as e:
+            # A selector that does not parse will never start parsing, so
+            # waiting out the timeout only hides the real problem.
+            if "SyntaxError" in str(e) or "not a valid selector" in str(e):
+                return f"Error: invalid selector '{selector}': {e}"
+            last_error = str(e)
         await asyncio.sleep(0.3)
-    return f"Timeout: '{selector}' did not appear within {timeout}ms."
+    msg = f"Timeout: '{selector}' did not appear within {timeout}ms."
+    if last_error:
+        msg += f" Last error while polling: {last_error}"
+    return msg
 
 
 @tool(title="Save page as PDF")

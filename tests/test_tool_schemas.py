@@ -212,3 +212,21 @@ def test_numeric_bounds_are_declared(by_name):
     assert _params(by_name["take_screenshot"])["quality"]["maximum"] == 100
     assert _params(by_name["select_page"])["page_id"]["minimum"] == 0
     assert _params(by_name["wait_for"])["text"]["minItems"] == 1
+
+
+def test_device_presets_do_not_ship_their_own_q_values():
+    """Regression: every mobile request carried a malformed Accept-Language.
+
+    Chrome generates the q-values itself from a bare language list, so a preset
+    supplying "en-US,en;q=0.9" produced "en-US,en;q=0.9;q=0.9" on the wire and
+    ["en-US", "en;q=0.9"] in navigator.languages. On a server whose entire point
+    is not standing out, that is a one-header signature.
+    """
+    from nodriver_mcp.server import _DEVICE_PRESETS
+
+    for name, preset in _DEVICE_PRESETS.items():
+        value = preset.get("accept_language", "")
+        assert ";" not in value, (
+            f"{name} ships q-values Chrome will duplicate: {value!r}"
+        )
+        assert value, f"{name} has no accept_language"

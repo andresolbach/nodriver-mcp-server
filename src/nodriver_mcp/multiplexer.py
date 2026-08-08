@@ -66,7 +66,23 @@ _PING_TIMEOUT_S = 10.0
 
 # Guard rail against an agent looping on new names until the machine dies. Each
 # extra browser is a Python process plus a full Chrome. Counts the default.
-_MAX_BROWSERS = 12
+# A 128 GB workstation and an 8 GB CI box should not be stuck with one number.
+def _env_int(var: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(var, "") or default))
+    except ValueError:
+        logger.warning("%s is not an integer; using %d", var, default)
+        return default
+
+
+_MAX_BROWSERS = _env_int("NODRIVER_MAX_BROWSERS", 12, 2)
+
+# close_browser keeps a browser's name, profile and flags on purpose, but nothing
+# ever handed the name back, so twelve well-behaved agents that each opened and
+# dutifully closed a browser wedged the server permanently. A name with no Chrome
+# behind it and no calls for this long is collected. Set 0 to disable.
+_IDLE_TTL_S = _env_int("NODRIVER_BROWSER_IDLE_TTL_S", 900, 0)
+_REAP_INTERVAL_S = 60.0
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 
@@ -133,6 +149,7 @@ class _Worker:
         self.error: BaseException | None = None
         self.task: asyncio.Task[None] | None = None
         self.started_at = time.time()
+        self.last_used = time.time()
         self.calls = 0
         self.last_tool: str | None = None
         # Set when a shutdown is requested, including one that arrives while
@@ -242,6 +259,82 @@ async def _responsive(worker: _Worker) -> bool:
         return False
 
 
+def _live_count() -> int:
+    """Browsers counting against the cap, including the default."""
+    return 1 + sum(1 for w in _workers.values() if not w.retired)
+
+
+def _entries_by_name(entries: list[dict[str, Any] | None]) -> dict[str, dict[str, Any]]:
+    return {e["browser"]: e for e in entries if e and "browser" in e}
+
+
+def _reclaimable(worker: _Worker, status: dict[str, Any] | None) -> bool:
+    """A registered name holding no Chrome and idle long enough to collect.
+
+    close_browser deliberately keeps the name so its profile and flags survive,
+    but nothing ever gave the name back, so a pool of well-behaved agents that
+    each opened and dutifully closed a browser ratcheted the server to its cap
+    and stayed there.
+    """
+    if worker.retired:
+        return False
+    # Never collect something whose age is unknown: reaping is a destructive act,
+    # and "I cannot tell how idle this is" must mean "leave it alone".
+    last_used = getattr(worker, "last_used", None)
+    if last_used is None or time.time() - last_used < _IDLE_TTL_S:
+        return False
+    if status is None:
+        return not worker.alive
+    return status.get("chrome_running") is False or status.get("worker") in {
+        "stopped", "unresponsive"
+    }
+
+
+async def _reap_idle(reason: str) -> list[str]:
+    """Retire idle, Chrome-less browsers. Returns the names collected."""
+    names = [n for n, w in _workers.items() if not w.retired]
+    if not names:
+        return []
+    statuses = _entries_by_name(list(await asyncio.gather(*(_status(n) for n in names))))
+    collected: list[str] = []
+    for name in names:
+        worker = _workers.get(name)
+        if worker is None or not _reclaimable(worker, statuses.get(name)):
+            continue
+        lock = await _name_lock(name)
+        # Never WAIT for another name's lock. This runs from _ensure_worker while
+        # that call already holds its own name's lock, so two concurrent spawns
+        # each trying to reap the other would deadlock. A locked name is being
+        # spawned or shut down right now, which is reason enough to leave it.
+        if lock.locked():
+            continue
+        async with lock:
+            worker = _workers.get(name)
+            # Re-check under the lock: a call may have arrived since the status.
+            if worker is None or not _reclaimable(worker, statuses.get(name)):
+                continue
+            _workers.pop(name, None)
+            await worker.shutdown()
+            collected.append(name)
+    if collected:
+        logger.info("reaped idle browsers (%s): %s", reason, ", ".join(collected))
+    return collected
+
+
+async def _reaper() -> None:
+    """Collect idle, Chrome-less browsers so the cap stops being a one-way ratchet."""
+    if _IDLE_TTL_S <= 0:
+        return
+    while True:
+        try:
+            await asyncio.sleep(_REAP_INTERVAL_S)
+            await _reap_idle("idle sweep")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a sweep failure must never end the server
+            logger.warning("reaper sweep failed: %r", e)
+
+
 async def _ensure_worker(name: str) -> _Worker:
     """The worker for this name, spawning it on first use.
 
@@ -262,13 +355,19 @@ async def _ensure_worker(name: str) -> _Worker:
             await worker.shutdown()  # dead or unresponsive; replace it
             _workers.pop(name, None)
 
-        live = sum(1 for w in _workers.values() if not w.retired) + 1  # + default
+        if _live_count() >= _MAX_BROWSERS:
+            # Try to make room before refusing: a name whose Chrome is already
+            # gone is holding a slot for nothing.
+            await _reap_idle("at capacity")
+
+        live = _live_count()
         if live >= _MAX_BROWSERS:
             open_names = ", ".join([DEFAULT_BROWSER, *sorted(_workers)])
             raise RuntimeError(
                 f"Refusing to open more than {_MAX_BROWSERS} browsers at once "
-                f"({live} are open: {open_names}). Close one with "
-                "shutdown_browser first, or reuse an existing name."
+                f"({live} are open: {open_names}), and none could be reclaimed. "
+                f"Release one with shutdown_browser(browser=<name>) — note that "
+                "close_browser keeps its name and its slot — or reuse an existing name."
             )
 
         worker = _Worker(name)
@@ -347,6 +446,9 @@ async def _call_worker(
     assert worker.session is not None
     worker.calls += 1
     worker.last_tool = name
+    # Only real work counts. _status() must not keep a browser looking busy, or
+    # the reaper would never collect anything an operator is watching.
+    worker.last_used = time.time()
     try:
         return await worker.session.call_tool(
             name, arguments, read_timeout_seconds=timedelta(seconds=_CALL_TIMEOUT_S)
@@ -409,6 +511,14 @@ _SHUTDOWN_BROWSER = types.Tool(
         title="Shut down a browser", destructiveHint=True, idempotentHint=True
     ),
 )
+
+
+# Teardown must never bring a browser into existence. Every other tool keeps the
+# documented create-on-first-use behaviour — "a name that does not exist yet
+# creates one on the spot" is the feature, and read-only tools are part of it.
+# Cleanup is the exception because it has to work precisely when the server is at
+# capacity, which is the one moment the creation path refuses.
+_NO_ALLOC: frozenset[str] = frozenset({"close_browser"})
 
 
 def _decorate(tool: types.Tool) -> types.Tool:
@@ -527,14 +637,35 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
 
     if name == "list_browsers":
         names = [DEFAULT_BROWSER, *sorted(_workers)]
-        entries = [await _status(n) for n in names]
+        # Gathered, not awaited one at a time: eleven wedged workers used to cost
+        # eleven status timeouts in a row — exactly the state you call this in.
+        entries = list(await asyncio.gather(*(_status(n) for n in names)))
+        # One definition of "live", shared with the cap at _ensure_worker, so the
+        # number reported and the number enforced cannot drift apart.
+        live = _live_count()
+        reclaimable = sorted(
+            n for n, w in _workers.items()
+            if not w.retired and _reclaimable(w, _entries_by_name(entries).get(n))
+        )
         report = {
             "browsers": [e for e in entries if e is not None],
-            "open": 1 + sum(1 for w in _workers.values() if w.alive),
+            "open": live,
             "max": _MAX_BROWSERS,
+            "slots_free": max(0, _MAX_BROWSERS - live),
             "hint": (
                 "Pass browser=<new name> to any tool to open another independent "
                 "browser. Nothing needs to be created first."
+                if live < _MAX_BROWSERS
+                else (
+                    "At capacity. "
+                    + (
+                        f"Reclaimable now (no Chrome running): {', '.join(reclaimable)}. "
+                        "They are collected automatically, or free one immediately with "
+                        "shutdown_browser(browser=<name>)."
+                        if reclaimable
+                        else "Release your own with shutdown_browser(browser=<your name>)."
+                    )
+                )
             ),
         }
         return types.CallToolResult(
@@ -574,6 +705,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
     if target == DEFAULT_BROWSER:
         return await _call_local(name, args)
 
+    # Tearing down is not the same as allocating. close_browser used to run
+    # through the same get-or-create path as new_page, so closing a name that was
+    # never opened answered with the *creation* cap error — a cleanup call that
+    # fails exactly when cleanup matters — and spawned a whole subprocess, which
+    # then held a slot for the life of the server, whenever the name was a typo.
+    if name in _NO_ALLOC and target not in _workers:
+        return types.CallToolResult(content=[types.TextContent(
+            type="text",
+            text=f"No browser named {target!r} is open; nothing to close.",
+        )])
+
     try:
         worker = await _ensure_worker(target)
     except RuntimeError as e:
@@ -583,6 +725,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
 
 async def _serve() -> None:
     async with stdio_server() as (read, write):
+        reaper = asyncio.create_task(_reaper(), name="nodriver-browser-reaper")
         try:
             await app.run(
                 read,
@@ -598,6 +741,11 @@ async def _serve() -> None:
                 ),
             )
         finally:
+            reaper.cancel()
+            try:
+                await reaper
+            except (asyncio.CancelledError, Exception):
+                pass
             await _shutdown_everything()
 
 
