@@ -57,7 +57,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
     ("Sessions", ["save_session", "load_session", "list_sessions"]),
     ("Profiles & browser", [
         "list_profiles", "create_profile", "use_profile", "use_temp_profile",
-        "use_running_browser", "delete_profile", "set_browser_flags",
+        "use_running_browser", "delete_profile", "set_browser_flags", "set_proxy",
         "manage_extensions",
     ]),
     ("Anti-detection helpers", ["cf_verify", "bypass_insecure_warning"]),

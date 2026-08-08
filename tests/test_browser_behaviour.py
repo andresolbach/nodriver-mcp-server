@@ -843,3 +843,67 @@ def test_drag_holds_the_button_down_across_the_move():
         )
 
     _run(scenario)
+
+
+def test_an_authenticating_proxy_is_answered():
+    """Regression: a proxy that asks for credentials could not be used at all.
+
+    Chrome ignores credentials in a --proxy-server URL, and an authenticating
+    proxy then stops it at a native dialog that no page and no other CDP command
+    can dismiss — the page simply never loads and nothing says why. Fetch's
+    authRequired is the only way to answer it.
+
+    The proxy here is real and really challenges, because a mock that never asks
+    would not exercise the part that was broken.
+    """
+    # A sibling module, not a package: tests/ has no __init__.py, and pytest puts
+    # the test directory on sys.path itself.
+    from authproxy import PASSWORD, USERNAME, AuthProxy
+
+    with AuthProxy() as proxy:
+
+        async def scenario():
+            await _call(
+                "set_proxy", server=proxy.address, username=USERNAME, password=PASSWORD
+            )
+            # http, not https: a CONNECT tunnel would need a real upstream.
+            await _call("new_page", url="http://proxied.test/")
+            content = await _call("get_page_content")
+
+            assert "fetched through the proxy" in content, (
+                f"the page did not come through the proxy:\n{content[:300]}"
+            )
+            assert proxy.challenges > 0, "the proxy never challenged — auth was untested"
+            assert proxy.authenticated > 0, "the challenge was never answered"
+
+        try:
+            _run(scenario)
+        finally:
+            asyncio.run(_call("set_proxy", server="", restart=False))
+
+
+def test_a_proxy_without_credentials_needs_no_fetch_domain():
+    """Fetch pauses every request, so it must stay off unless a proxy asks.
+
+    Paying a round trip per request for a proxy that never challenges would be a
+    silent tax on every page load.
+    """
+    from nodriver_mcp import server
+
+    async def scenario():
+        await _call("set_proxy", server="http://127.0.0.1:9", restart=False)
+        assert server._proxy_config["server"] == "http://127.0.0.1:9"
+        assert not server._proxy_config["username"]
+
+        await _call("set_proxy", server="127.0.0.1:9", restart=False)
+        # A bare host:port is a proxy too; it just has no scheme yet.
+        assert server._proxy_config["server"] == "http://127.0.0.1:9"
+
+        status = await _call("set_proxy")
+        assert "127.0.0.1:9" in status and "no credentials" in status
+
+        cleared = await _call("set_proxy", server="", restart=False)
+        assert "removed" in cleared
+        assert server._proxy_config == {}
+
+    asyncio.run(scenario())
