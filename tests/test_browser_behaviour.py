@@ -856,7 +856,9 @@ def test_an_authenticating_proxy_is_answered():
     The proxy here is real and really challenges, because a mock that never asks
     would not exercise the part that was broken.
     """
-    from tests.authproxy import PASSWORD, USERNAME, AuthProxy
+    # A sibling module, not a package: tests/ has no __init__.py, and pytest puts
+    # the test directory on sys.path itself.
+    from authproxy import PASSWORD, USERNAME, AuthProxy
 
     with AuthProxy() as proxy:
 
