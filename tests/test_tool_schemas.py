@@ -36,9 +36,9 @@ def _params(tool) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_tool_count(tools):
-    # 59 browser tools + browser_status, which the routing layer consumes and
+    # 61 browser tools + browser_status, which the routing layer consumes and
     # hides from clients.
-    assert len(tools) == 60
+    assert len(tools) == 62
 
 
 def test_tool_names_are_unique(tools):
@@ -52,6 +52,7 @@ def test_no_tool_was_renamed_by_accident(by_name):
         "block_resources", "browser_status", "bypass_insecure_warning",
         "cf_verify", "clear_cookies",
         "click", "click_at", "close_browser", "close_page", "create_profile",
+        "select_option", "set_checked",
         "delete_profile", "disable_console_collection", "drag", "emulate",
         "emulate_device", "enable_console_collection", "evaluate_script", "fill",
         "fill_form", "get_console_message", "get_cookies", "get_local_storage",

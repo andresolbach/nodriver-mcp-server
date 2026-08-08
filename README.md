@@ -13,7 +13,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
 ![MCP compatible](https://img.shields.io/badge/MCP-compatible-purple.svg)
-![Tools: 61](https://img.shields.io/badge/tools-61-orange.svg)
+![Tools: 63](https://img.shields.io/badge/tools-63-orange.svg)
 ![Stars](https://img.shields.io/github/stars/andresolbach/nodriver-mcp-server?style=social)
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
@@ -35,7 +35,7 @@ None of that is your script being wrong. It is anti-bot detection — Cloudflare
 
 [`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` reads `false` rather than `true`, and a session looks like a person using Chrome.
 
-This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (61 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
+This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (63 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
 
 **What it will not do**, so you can judge before installing: it does not solve image or text captchas for you, it cannot defeat every protection on every site, and it will not rescue a scraper that hammers a server. If a site blocks you for *what you do* rather than *what you are*, no driver fixes that. `cf_verify` handles the common Cloudflare checkbox challenge; it is not a captcha-solving service.
 
@@ -63,7 +63,7 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 - 🕵️ **Undetected by design** — `navigator.webdriver` reads `false`, exactly as in a browser a person is using, and there are no CDP or WebDriver artifacts to find.
 - ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
 - 👥 **Several isolated browsers at once** — pass `browser: "agent-a"` to any tool and that name gets its own Chrome, in its own process, with its own cookies, tabs and uids. Parallel agents stop stealing each other's selected tab. Omit it and nothing changes: the default browser runs in the server process, exactly as before. [How it works](#several-agents-several-browsers)
-- 🧩 **61 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
+- 🧩 **63 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 🧠 **Schemas written for the agent, not just the compiler** — every parameter carries a description, fixed-value options are real enums, and each tool declares read-only/destructive hints. See [why this matters](#built-for-the-agent-that-calls-it).
 - 📄 **Compact accessibility-tree snapshots** (`take_snapshot`) — searchable page text with a uid per element. Measured on the Hacker News front page: **34 KB against 106 KB unfiltered, 68% smaller, with every link, URL and text preserved.** That saving lands on every single agent step.
 - 🔗 **Attach to a browser you are already signed into** (`use_running_browser`) — drive your real Chrome profile over its debugging port instead of rebuilding logins in a fresh one.
@@ -244,7 +244,7 @@ While attached, this server **never closes a browser it did not start**: `close_
 
 > ⚠️ **That profile becomes part of the agent's reach.** Whatever it is signed into — mail, bank, company systems — is reachable from here, because a cookie jar is all or nothing. Point this at a profile you are willing to expose, not your everyday one.
 
-## Tools (61)
+## Tools (63)
 
 Network collection is enabled automatically on each tab. Console collection is opt-in: call `enable_console_collection` when you want `list_console_messages` / `get_console_message` to start collecting events. This keeps `Runtime.enable()` disabled by default for sites that detect attached debuggers.
 
@@ -255,7 +255,7 @@ For mobile-only sites, pass `device` directly to `new_page(...)` or `navigate_pa
 | Category | Tools |
 |----------|-------|
 | **Several browsers (2)** | `list_browsers` · `shutdown_browser` |
-| **Input automation (10)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
+| **Input automation (12)** | `click` · `click_at` · `hover` · `fill` · `fill_form` · `set_checked` · `select_option` · `type_text` · `press_key` · `drag` · `upload_file` · `handle_dialog` |
 | **Navigation (10)** | `navigate_page` · `new_page` · `close_page` · `close_browser` · `list_pages` · `select_page` · `wait_for` · `wait_for_selector` · `scroll_page` · `scroll_to_selector` |
 | **Snapshots & debugging (11)** | `take_screenshot` · `take_snapshot` · `get_page_content` · `query_selector` · `evaluate_script` · `get_computed_styles` · `save_pdf` · `enable_console_collection` · `disable_console_collection` · `list_console_messages` · `get_console_message` |
 | **Network monitoring (3)** | `list_network_requests` · `get_network_request` · `block_resources` |
@@ -274,7 +274,7 @@ An MCP tool is only as good as what the model can see of it. Most servers hand o
 
 Here, the schema does that work:
 
-- **Every parameter has a description in the schema itself** — not buried in a prose blob the client may never show. All 61 tools, all parameters, no exceptions (there's a test for it).
+- **Every parameter has a description in the schema itself** — not buried in a prose blob the client may never show. All 63 tools, all parameters, no exceptions (there's a test for it).
 - **Fixed-value parameters are real enums.** `navigate_page(type=…)` advertises exactly `url`, `back`, `forward`, `reload`. A wrong value is rejected by validation before it ever reaches Chrome, instead of returning an error the agent has to interpret.
 - **Numeric and array bounds are declared** — `quality` is 0–100, `wait_for(text=…)` requires at least one entry.
 - **Structured parameters are typed.** `fill_form` publishes `{uid, value}` rather than an opaque `list[dict]`.
@@ -292,8 +292,8 @@ Here, the schema does that work:
 | Install method | npx | uvx / pip |
 | Language | TypeScript / Node.js | Python |
 | Parallel browsers | one | up to 12, isolated |
-| Tool coverage | 29 tools | 61 tools |
-| Per-parameter schema docs | partial | ✅ all 61 tools |
+| Tool coverage | 29 tools | 63 tools |
+| Per-parameter schema docs | partial | ✅ all 63 tools |
 | Tool behaviour hints | ❌ | ✅ read-only / destructive |
 
 Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).

@@ -124,6 +124,39 @@ session it is sent to.
   renderer, a detached execution context and an open JS dialog all looked like
   "not there yet". The timeout now carries the last error it hit.
 
+### Forms know what kind of control they are talking to
+
+`_fill_element` branched on `tagName` and never read `input.type` — `this.type`
+appeared once in 5199 lines, and the string `checked` did not appear at all. So
+checkbox, radio, file, date, month, week, time, colour and range all took the
+path written for `<input type=text>`: select the contents, type over them, then
+compare `el.value`.
+
+That produced the worst failures in the audit, because the verification agreed.
+A checkbox has no text, so the keystrokes went to whatever had focus — in a
+`fill_form`, the field filled just before it — while `el.value` on a checkbox
+never changes, so the read-back passed and `fill` reported success having edited
+a different field. A radio reported "filled" while nothing was selected. A native
+date input reported an *error* for a value that had landed, because the typed
+locale string never equals the `YYYY-MM-DD` the element holds.
+
+- `fill` now probes tag, type, readOnly and disabled in one call, and refuses the
+  controls it cannot fill by naming the one that can: `set_checked` for checkbox
+  and radio, `upload_file` for a file input. Date-like and colour and range inputs
+  are assigned and given input+change events, and the response discloses that no
+  keystrokes were involved — the same honesty `click` applies to its synthetic
+  fallback. The read-back is per type: `.checked` for a checked state,
+  `selectedOptions` for a `<select>`, the wire format for a date.
+- **`set_checked(uid, checked)`** ticks, unticks and verifies. It is idempotent,
+  clicks the controlling `<label>` when the real input is hidden behind a styled
+  one, and says plainly that a radio cannot be unchecked by the browser.
+- **`select_option(uid, option)`** matches the value attribute, then the visible
+  label, then the index — a snapshot shows the label, not the value, so matching
+  only the value meant guessing. When nothing matches it lists every option the
+  `<select>` actually has instead of only saying no.
+- A field that fails inside `fill_form` now blurs before the next one, so a
+  failure cannot leave focus somewhere the following keystrokes land.
+
 ### The browser cap stopped being a one-way ratchet
 
 Twelve agents that each opened a browser and dutifully called `close_browser`
@@ -169,7 +202,7 @@ the defects above; it asserts that the prose and the signatures agree, which is
 worth having and is not the same thing as asserting that a tool does what it
 says. Every defect in this release was of the second kind.
 
-Tool count: 61 -> 61.
+Tool count: 61 -> 63 (set_checked, select_option).
 
 ## 2.0.1 — the landing page did not mention the headline feature
 

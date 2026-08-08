@@ -365,3 +365,127 @@ def test_one_request_is_recorded_once():
             assert hits == 1, f"{path} recorded {hits} times:\n{listing}"
 
     _run(scenario)
+
+
+# aria-labels so the snapshot names each control, which is how a uid is found.
+_FORM_PAGE = (
+    "data:text/html,<form>"
+    "<input id=t type=text aria-label=TextField>"
+    "<input id=cb type=checkbox aria-label=BoxField>"
+    "<input id=r1 type=radio name=g value=one aria-label=RadioOne>"
+    "<input id=r2 type=radio name=g value=two aria-label=RadioTwo>"
+    "<input id=d type=date aria-label=DateField>"
+    "<select id=s aria-label=PickField>"
+    "<option value=v1>First label</option><option value=v2>Second label</option>"
+    "</select></form>"
+)
+
+
+async def _uid(snapshot: str, pattern: str) -> str:
+    match = re.search(pattern, snapshot)
+    assert match, f"{pattern!r} not found in snapshot:\n{snapshot}"
+    return match.group(1)
+
+
+async def _prop(expr: str) -> str:
+    return await _call("evaluate_script", function=f"() => String({expr})")
+
+
+def test_fill_refuses_a_checkbox_and_names_the_right_tool():
+    """Regression: fill ran its select-and-type path on checkboxes and radios.
+
+    A checkbox holds no text, so the keystrokes went to whatever had focus — the
+    previously filled field, in a fill_form — while the read-back compared
+    `el.value`, which a checkbox never changes. So it reported success having done
+    something else entirely, somewhere else.
+    """
+
+    async def scenario():
+        await _call("new_page", url=_FORM_PAGE)
+        snap = await _call("take_snapshot")
+
+        out = await _call("fill", uid=await _uid(snap, r'uid=(\S+) checkbox'), value="yes")
+        assert "Error" in out and "set_checked" in out, f"fill accepted a checkbox:\n{out}"
+        assert "false" in (await _prop("document.getElementById('cb').checked")).lower()
+
+        radio = await _uid(snap, r'uid=(\S+) radio "RadioOne"')
+        out = await _call("fill", uid=radio, value="one")
+        assert "Error" in out and "set_checked" in out, f"fill accepted a radio:\n{out}"
+        assert "false" in (await _prop("document.getElementById('r1').checked")).lower()
+
+    _run(scenario)
+
+
+def test_set_checked_ticks_unticks_and_is_idempotent():
+    """The tool fill could never be, because a checked state is not a value."""
+
+    async def scenario():
+        await _call("new_page", url=_FORM_PAGE)
+        snap = await _call("take_snapshot")
+        box = await _uid(snap, r'uid=(\S+) checkbox')
+
+        assert "now checked" in await _call("set_checked", uid=box, checked=True)
+        assert "true" in (await _prop("document.getElementById('cb').checked")).lower()
+
+        again = await _call("set_checked", uid=box, checked=True)
+        assert "already checked" in again, f"not idempotent:\n{again}"
+
+        assert "now unchecked" in await _call("set_checked", uid=box, checked=False)
+        assert "false" in (await _prop("document.getElementById('cb').checked")).lower()
+
+        radio = await _uid(snap, r'uid=(\S+) radio "RadioTwo"')
+        assert "now checked" in await _call("set_checked", uid=radio, checked=True)
+        assert "true" in (await _prop("document.getElementById('r2').checked")).lower()
+        # A radio cannot be cleared by the browser; say so instead of failing oddly.
+        cleared = await _call("set_checked", uid=radio, checked=False)
+        assert "cannot be unchecked" in cleared, cleared
+
+    _run(scenario)
+
+
+def test_select_option_matches_a_label_and_lists_the_real_options():
+    """fill matched only the value attribute, which a snapshot never shows — so it
+    had to be guessed, and the failure did not say what was on offer."""
+
+    async def scenario():
+        await _call("new_page", url=_FORM_PAGE)
+        snap = await _call("take_snapshot")
+        combo = await _uid(snap, r'uid=(\S+) combobox')
+
+        by_label = await _call("select_option", uid=combo, option="Second label")
+        assert "v2" in by_label, by_label
+        assert "v2" in await _prop("document.getElementById('s').value")
+
+        assert "v1" in await _call("select_option", uid=combo, option="v1")
+
+        missing = await _call("select_option", uid=combo, option="nope")
+        assert "First label" in missing and "Second label" in missing, (
+            f"the failure did not name the real options:\n{missing}"
+        )
+
+    _run(scenario)
+
+
+def test_a_native_date_input_is_set_and_reported_honestly():
+    """Regression: it returned an error for a value that had landed.
+
+    The select-and-type path typed a locale string while `el.value` holds the wire
+    format, so the read-back never matched — the one shape of failure worse than
+    silence is a false alarm on a success.
+    """
+
+    async def scenario():
+        await _call("new_page", url=_FORM_PAGE)
+        snap = await _call("take_snapshot")
+        date_uid = await _uid(snap, r'uid=(\S+) Date')
+
+        out = await _call("fill", uid=date_uid, value="2026-08-08")
+        assert "Error" not in out, f"a date fill that works must not report an error:\n{out}"
+        assert "2026-08-08" in await _prop("document.getElementById('d').value")
+        # The value was assigned rather than typed, and that is disclosed.
+        assert "rather than typed" in out, f"the scripted path was not disclosed:\n{out}"
+
+        bad = await _call("fill", uid=date_uid, value="08/08/2026")
+        assert "Error" in bad and "YYYY-MM-DD" in bad, f"wrong format accepted:\n{bad}"
+
+    _run(scenario)

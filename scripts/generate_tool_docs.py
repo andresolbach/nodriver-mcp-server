@@ -28,7 +28,8 @@ from nodriver_mcp.server import mcp  # noqa: E402
 CATEGORIES: list[tuple[str, list[str]]] = [
     ("Several browsers", [_LIST_BROWSERS.name, _SHUTDOWN_BROWSER.name]),
     ("Input automation", [
-        "click", "click_at", "hover", "fill", "fill_form", "type_text",
+        "click", "click_at", "hover", "fill", "fill_form", "set_checked",
+        "select_option", "type_text",
         "press_key", "drag", "upload_file", "handle_dialog",
     ]),
     ("Navigation & pages", [

@@ -861,22 +861,114 @@ _SELECT_CONTENTS = (
 )
 
 
-async def _read_field(tab: uc.Tab, remote_obj: Any) -> str:
-    """Current text of an input, textarea, select or contenteditable."""
+_PROBE_FIELD = (
+    "function() {"
+    " if (!this || !this.tagName) return null;"
+    " const tag = this.tagName.toLowerCase();"
+    " return {"
+    "   tag: this.isContentEditable ? 'contenteditable' : tag,"
+    "   type: (this.getAttribute && this.getAttribute('type') || this.type || '').toLowerCase(),"
+    "   readOnly: !!this.readOnly, disabled: !!this.disabled,"
+    " }; }"
+)
+
+# Typing into these is locale-dependent and does not survive a read-back: a date
+# input shows "08/08/2026" while its value is "2026-08-08", so the select-and-type
+# path reported an error for a fill that had in fact worked. They are set through
+# a scripted assignment plus input+change, and the response says so, the same way
+# click discloses its synthetic fallback.
+_SCRIPTED_VALUE_TYPES = {
+    "date", "month", "week", "time", "datetime-local", "color", "range",
+}
+# Not value-bearing at all — filling them silently did something else entirely.
+_NOT_FILLABLE = {
+    "checkbox": "set_checked",
+    "radio": "set_checked",
+    "file": "upload_file",
+    "button": None,
+    "submit": None,
+    "reset": None,
+    "image": None,
+}
+
+
+async def _read_field(tab: uc.Tab, remote_obj: Any, field_type: str = "") -> str:
+    """Current value of an input, textarea, select or contenteditable.
+
+    Type-aware, because `el.value` is the wrong property for several of them: a
+    checkbox's value is its submit value and never changes when it is ticked, so
+    comparing it made the check vacuous — fill reported success for a radio that
+    was never selected.
+    """
+    if field_type in ("checkbox", "radio"):
+        expr = "function() { return this.checked ? 'true' : 'false'; }"
+    else:
+        expr = "function() { return this.isContentEditable ? this.innerText : (this.value ?? ''); }"
     obj = await _call_function_on(
-        tab,
-        function_declaration=(
-            "function() { return this.isContentEditable ? this.innerText : (this.value ?? ''); }"
-        ),
-        object_id=remote_obj.object_id,
-        return_by_value=True,
+        tab, function_declaration=expr, object_id=remote_obj.object_id, return_by_value=True
     )
     if obj is None or obj.value is None:
         return ""
     return str(obj.value)
 
 
-async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
+async def _select_options(tab: uc.Tab, remote_obj: Any) -> list[dict]:
+    """Every option of a <select>, so a failure can name the real choices."""
+    obj = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function() { return [...(this.options || [])].map((o, i) => "
+            "({index: i, value: o.value, label: (o.label || o.textContent || '').trim()})); }"
+        ),
+        object_id=remote_obj.object_id,
+        return_by_value=True,
+    )
+    return list(obj.value) if obj and isinstance(obj.value, list) else []
+
+
+async def _set_select_value(tab: uc.Tab, remote_obj: Any, wanted: str) -> str:
+    """Choose a <select> option by value, then by visible label, then by index.
+
+    Matching only the value attribute meant an agent had to guess it, and the
+    failure said nothing about what was actually on offer.
+    """
+    import nodriver.cdp.runtime as cdp_runtime
+
+    result = await _call_function_on(
+        tab,
+        function_declaration=(
+            "function(want) {"
+            " const opts = [...(this.options || [])];"
+            " let opt = opts.find(o => o.value === want);"
+            " let how = 'value';"
+            " if (!opt) { opt = opts.find(o => (o.label || o.textContent || '').trim() === want);"
+            "             how = 'label'; }"
+            " if (!opt && /^\\d+$/.test(want) && opts[+want]) { opt = opts[+want]; how = 'index'; }"
+            " if (!opt) return {ok: false};"
+            " this.value = opt.value;"
+            " this.dispatchEvent(new Event('input', {bubbles: true}));"
+            " this.dispatchEvent(new Event('change', {bubbles: true}));"
+            " return {ok: this.value === opt.value, how: how, value: opt.value,"
+            "         label: (opt.label || opt.textContent || '').trim()}; }"
+        ),
+        object_id=remote_obj.object_id,
+        arguments=[cdp_runtime.CallArgument(value=wanted)],
+        return_by_value=True,
+    )
+    info = result.value if result and isinstance(result.value, dict) else {}
+    if not info.get("ok"):
+        options = await _select_options(tab, remote_obj)
+        shown = ", ".join(f"{o['value']!r} ({o['label']})" for o in options[:15]) or "(none)"
+        more = f" and {len(options) - 15} more" if len(options) > 15 else ""
+        raise RuntimeError(
+            f"no option matching {wanted!r} in this <select>. Available: {shown}{more}."
+        )
+    if info.get("how") == "value":
+        return ""
+    return f" (matched the option by {info['how']}: value={info['value']!r})"
+
+
+async def _fill_element(tab: uc.Tab, uid: str, value: str) -> str:
     """Fill one input, textarea, select or contenteditable by uid.
 
     Clearing a field before typing (``value = ''`` plus an input event) makes a
@@ -904,41 +996,66 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     if element is not None and getattr(element, "object_id", None):
         remote_obj = element
 
-    tag_obj = await _call_function_on(
+    probe = await _call_function_on(
         tab,
-        function_declaration=(
-            "function() { if (!this || !this.tagName) return ''; "
-            "return this.isContentEditable ? 'contenteditable' : this.tagName.toLowerCase(); }"
-        ),
+        function_declaration=_PROBE_FIELD,
         object_id=remote_obj.object_id,
         return_by_value=True,
     )
-    tag = tag_obj.value if tag_obj else ""
-    if not tag:
+    info = probe.value if probe and isinstance(probe.value, dict) else None
+    if not info:
         raise RuntimeError(
             f"uid={uid} is not an element that can be filled. Take a fresh "
             "take_snapshot and use the uid of the input, textarea, select or "
             "editable element itself."
         )
+    tag = str(info.get("tag") or "")
+    field_type = str(info.get("type") or "")
+
+    if info.get("disabled"):
+        raise RuntimeError(
+            f"uid={uid} is disabled, so nothing can be entered into it. The page "
+            "usually enables it in response to another field."
+        )
+
+    # A checkbox is not a text field. The select-and-type path used to run on one
+    # anyway, which typed the value into whatever had focus — the previously
+    # filled field in a fill_form — while the read-back compared el.value, which
+    # a checkbox never changes, so it reported success.
+    if tag == "input" and field_type in _NOT_FILLABLE:
+        better = _NOT_FILLABLE[field_type]
+        hint = f" Use {better} instead." if better else ""
+        raise RuntimeError(
+            f"uid={uid} is an <input type={field_type}>, which holds no text.{hint}"
+        )
 
     if tag == "select":
+        return await _set_select_value(tab, remote_obj, value)
+
+    if tag == "input" and field_type in _SCRIPTED_VALUE_TYPES:
         await _call_function_on(
             tab,
             function_declaration=(
-                "function(val) { this.value = val; "
-                "this.dispatchEvent(new Event('change', {bubbles: true})); }"
+                "function(val) { this.focus(); this.value = val;"
+                " this.dispatchEvent(new Event('input', {bubbles: true}));"
+                " this.dispatchEvent(new Event('change', {bubbles: true})); }"
             ),
             object_id=remote_obj.object_id,
             arguments=[cdp_runtime.CallArgument(value=value)],
             return_by_value=True,
         )
         await tab
-        if await _read_field(tab, remote_obj) != value:
+        got = await _read_field(tab, remote_obj, field_type)
+        if got != value:
             raise RuntimeError(
-                f"no option with value {value!r} in this <select>. "
-                "Use the option's value attribute, not its visible label."
+                f"the {field_type} input did not accept {value!r}; it now holds "
+                f"{got!r}. These inputs need their wire format, not what is "
+                "displayed — a date wants YYYY-MM-DD, a time HH:MM, a colour #rrggbb."
             )
-        return
+        return (
+            f" (set as a value on the {field_type} input rather than typed; the page"
+            " saw input and change events, but no keystrokes)"
+        )
 
     await _call_function_on(
         tab,
@@ -954,8 +1071,8 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     def _matches(got: str) -> bool:
         return got.strip() == value.strip() if tag == "contenteditable" else got == value
 
-    if _matches(await _read_field(tab, remote_obj)):
-        return
+    if _matches(await _read_field(tab, remote_obj, field_type)):
+        return ""
 
     # Synthesised key events were dropped. Insert the text as a single edit,
     # which rich-text and some framework-managed fields accept instead.
@@ -968,13 +1085,15 @@ async def _fill_element(tab: uc.Tab, uid: str, value: str) -> None:
     await tab.send(cdp_input.insert_text(value))
     await tab
 
-    got = await _read_field(tab, remote_obj)
+    got = await _read_field(tab, remote_obj, field_type)
     if not _matches(got):
+        extra = " It is marked read-only." if info.get("readOnly") else ""
         raise RuntimeError(
-            f"the field did not accept the value; it now holds {got!r}. "
+            f"the field did not accept the value; it now holds {got!r}.{extra} "
             "It may be read-only or disabled, covered by an overlay, or it "
             "rewrites what is typed (a masked or formatted input)."
         )
+    return ""
 
 
 async def _double_click(tab: uc.Tab, x: float, y: float) -> None:
@@ -2295,8 +2414,8 @@ async def fill(
     """
     tab = await _active_tab()
     try:
-        await _fill_element(tab, uid, value)
-        result = f"Filled uid={uid} with \"{value}\""
+        note = await _fill_element(tab, uid, value)
+        result = f"Filled uid={uid} with \"{value}\"{note}"
         result += await _maybe_snapshot(include_snapshot)
         return result
     except Exception as e:
@@ -2345,13 +2464,170 @@ async def fill_form(
         uid = elem_spec.uid
         value = elem_spec.value
         try:
-            await _fill_element(tab, uid, value)
-            results.append(f"  uid={uid}: filled")
+            note = await _fill_element(tab, uid, value)
+            results.append(f"  uid={uid}: filled{note}")
         except Exception as e:
             results.append(f"  uid={uid}: error — {e}")
+            # A failed field leaves focus and the editing selection wherever it
+            # stopped, and the next field's keystrokes would land there. Blur so
+            # each entry starts from a known state.
+            try:
+                await _evaluate_value(
+                    tab, "(document.activeElement && document.activeElement.blur(), true)"
+                )
+            except Exception:
+                pass
     result = "Form fill results:\n" + "\n".join(results)
     result += await _maybe_snapshot(include_snapshot)
     return result
+
+
+@tool(title="Check or uncheck a box", open_world=True)
+async def set_checked(
+    uid: Uid,
+    checked: Annotated[
+        bool,
+        Field(description=(
+            "True to tick the box or select the radio, False to untick it. Radio "
+            "buttons cannot be unticked by the browser — select a different one "
+            "in the group instead."
+        )),
+    ] = True,
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Tick or untick a checkbox, or select a radio button, and verify it took.
+
+    Use this instead of fill for anything with a checked state. fill types over a
+    field's text, which a checkbox does not have — and its read-back compares
+    `value`, which a checkbox never changes, so a fill could report success while
+    nothing was selected.
+
+    Idempotent: asking for the state it is already in is reported and does not
+    click. Otherwise it delivers a real CDP click, on the element or, when the
+    input is visually hidden behind a styled label (the usual custom-control
+    pattern), on the label that controls it. The state is read back afterwards, so
+    a failure is an error rather than a success you cannot trust.
+    """
+    tab = await _active_tab()
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+        probe = await _call_function_on(
+            tab,
+            function_declaration=_PROBE_FIELD,
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        info = probe.value if probe and isinstance(probe.value, dict) else None
+        if not info or info.get("type") not in ("checkbox", "radio"):
+            found = (info or {}).get("type") or (info or {}).get("tag") or "unknown"
+            return (
+                f"Error: uid={uid} is not a checkbox or radio (it is {found}). "
+                "Use fill for text fields, select_option for a <select>, or click "
+                "for anything else."
+            )
+        if info.get("disabled"):
+            return f"Error: uid={uid} is disabled, so its state cannot be changed."
+
+        field_type = str(info["type"])
+        before = await _read_field(tab, remote_obj, field_type) == "true"
+        if before == checked:
+            return (
+                f"uid={uid} is already {'checked' if checked else 'unchecked'}; "
+                "nothing to do."
+            ) + await _maybe_snapshot(include_snapshot)
+        if field_type == "radio" and not checked:
+            return (
+                f"Error: a radio button cannot be unchecked directly. Call "
+                f"set_checked on another radio in the same group instead."
+            )
+
+        # A custom-styled control hides the real input and shows a label, so the
+        # input has no clickable point of its own — the label is what a person
+        # clicks, and clicking it toggles the input.
+        target = remote_obj
+        note = ""
+        point = await _clickable_point(tab, remote_obj)
+        if isinstance(point, str):
+            label = await _call_function_on(
+                tab,
+                function_declaration=(
+                    "function() { if (this.id) { const l = document.querySelector("
+                    "'label[for=' + CSS.escape(this.id) + ']'); if (l) return l; } "
+                    "return this.closest('label'); }"
+                ),
+                object_id=remote_obj.object_id,
+            )
+            if label is not None and getattr(label, "object_id", None):
+                label_point = await _clickable_point(tab, label)
+                if not isinstance(label_point, str):
+                    target, point, note = label, label_point, " (clicked its label)"
+        if isinstance(point, str):
+            return (
+                f"Error: cannot click uid={uid}: {point}. Dismiss whatever is in "
+                "the way, or scroll it into view, and try again."
+            )
+
+        await _cdp_click(tab, target, point[0], point[1], False)
+        after = await _read_field(tab, remote_obj, field_type) == "true"
+        if after != checked:
+            return (
+                f"Error: uid={uid} is still {'unchecked' if checked else 'checked'} "
+                "after the click. Something may be intercepting it, or the page "
+                "resets the control."
+            )
+        state = "checked" if checked else "unchecked"
+        return f"uid={uid} is now {state}{note}." + await _maybe_snapshot(include_snapshot)
+    except Exception as e:
+        return f"Error setting uid={uid}: {e}"
+
+
+@tool(title="Choose a select option", open_world=True)
+async def select_option(
+    uid: Uid,
+    option: Annotated[
+        str,
+        Field(description=(
+            "The option to choose. Matched against the value attribute first, then "
+            "the visible label, then — if it is a plain number — the position in "
+            "the list. A failure names every option the <select> actually has."
+        )),
+    ],
+    include_snapshot: IncludeSnapshot = False,
+) -> str:
+    """Choose an option in a <select>, by value, visible label or index.
+
+    fill also works on a <select>, but only matches the value attribute, which is
+    not what a snapshot shows you — so it had to be guessed. This matches what you
+    can actually see, and when nothing matches it lists the real options instead of
+    only saying no.
+    """
+    tab = await _active_tab()
+    try:
+        remote_obj = await _resolve_uid(tab, uid)
+        probe = await _call_function_on(
+            tab,
+            function_declaration=_PROBE_FIELD,
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        info = probe.value if probe and isinstance(probe.value, dict) else None
+        if not info or info.get("tag") != "select":
+            found = (info or {}).get("tag") or "unknown"
+            return (
+                f"Error: uid={uid} is not a <select> (it is <{found}>). Use "
+                "set_checked for checkboxes and radios, or fill for text fields."
+            )
+        if info.get("disabled"):
+            return f"Error: uid={uid} is disabled, so no option can be chosen."
+
+        note = await _set_select_value(tab, remote_obj, option)
+        chosen = await _read_field(tab, remote_obj)
+        return (
+            f"uid={uid} is now set to {chosen!r}{note}."
+            + await _maybe_snapshot(include_snapshot)
+        )
+    except Exception as e:
+        return f"Error selecting in uid={uid}: {e}"
 
 
 @tool(title="Get console message", read_only=True)
