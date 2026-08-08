@@ -192,6 +192,31 @@ shows the sent/received counts; `get_network_request` prints the frames. Payload
 are capped at 2000 characters and each socket keeps its last 200 frames, with the
 number dropped reported rather than silently forgotten.
 
+### Input tools say whether the page received anything
+
+A CDP `Input.*` acknowledgement proves only that the browser queued the event. An
+occluded window, an open JavaScript dialog or a busy renderer swallow it, and
+`click`, `click_at`, `press_key` and `type_text` all built their success string
+from their own arguments regardless. Three agents in the audit measured zero
+events reaching the page while every call reported success; that is the failure
+mode that cost the most, because the agent continues and breaks somewhere
+unrelated several steps later.
+
+`click`, `press_key` and `type_text` now count the input events the page actually
+receives and say so when the answer is none. The counter lives in an isolated
+world, so the page's own `window` keeps no trace of it — a global there would
+itself be a detection signal — and listeners registered from an isolated world do
+see real DOM events, which is what makes the check possible without leaving marks.
+
+`type_text` also names the element it typed into (`Typed 3 characters into
+input#email`), because typing into the wrong field, or into a page with nothing
+focused, used to look exactly like success.
+
+Silence is not treated as failure: when the probe cannot be installed or read, or
+when the element is inside a frame — where events do not reach the top document —
+the response says the delivery was not verified rather than claiming it failed.
+A warning on a working click would be worse than the silence it replaces.
+
 ### Forms know what kind of control they are talking to
 
 `_fill_element` branched on `tagName` and never read `input.type` — `this.type`

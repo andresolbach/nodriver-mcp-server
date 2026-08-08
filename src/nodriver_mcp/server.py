@@ -2090,6 +2090,102 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
     return str(data.get("reason", "something else is in the way"))
 
 
+_PROBE_ARM = (
+    "() => { globalThis.__ndInput = 0;"
+    " if (!globalThis.__ndArmed) {"
+    "   globalThis.__ndArmed = true;"
+    "   const bump = () => { globalThis.__ndInput = (globalThis.__ndInput || 0) + 1; };"
+    "   document.addEventListener('pointerdown', bump, true);"
+    "   document.addEventListener('keydown', bump, true);"
+    " } return true; }"
+)
+
+
+async def _arm_input_probe(tab: uc.Tab) -> bool:
+    """Start counting input events the page receives, invisibly to the page.
+
+    The counter lives in an isolated world, so `window` keeps no trace of it — a
+    global on the page would itself be a detection signal on a server whose whole
+    point is not standing out. Listeners registered from an isolated world do see
+    real DOM events, which is what makes this possible at all.
+    """
+    try:
+        await _evaluate_value(tab, f"({_PROBE_ARM})()", frame="0")
+        return True
+    except Exception:
+        return False
+
+
+async def _read_input_probe(tab: uc.Tab) -> int | None:
+    """How many input events arrived since arming, or None if it could not be read."""
+    try:
+        value = await _evaluate_value(tab, "globalThis.__ndInput ?? null", frame="0")
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+async def _input_delivery_note(tab: uc.Tab, armed: bool) -> str:
+    """A warning when keystrokes were acknowledged but nothing received them.
+
+    A CDP Input ack proves only that the browser queued the event. An occluded
+    window, an open JavaScript dialog or a wedged renderer swallow it, and every
+    tool here used to report success regardless.
+    """
+    if not armed:
+        return ""
+    if await _read_input_probe(tab) != 0:
+        return ""
+    return (
+        " — WARNING: no key event reached the page. The window may be occluded by"
+        " another window, a JavaScript dialog may be open, or nothing focusable"
+        " has focus. The page is not known to have changed."
+    )
+
+
+async def _focused_description(tab: uc.Tab) -> str:
+    """A short label for whatever currently has focus, e.g. 'input#email'.
+
+    type_text types into the focused element and used to say only how many
+    characters it sent, so typing into the wrong field — or into a page with
+    nothing focused — looked identical to success.
+    """
+    try:
+        return str(await _evaluate_value(tab, (
+            "(() => { const el = document.activeElement;"
+            " if (!el || el === document.body) return '';"
+            " const id = el.id ? '#' + el.id : '';"
+            " const name = el.getAttribute && el.getAttribute('name');"
+            " return el.tagName.toLowerCase() + id + (!id && name ? '[name=' + name + ']' : ''); })()"
+        )) or "")
+    except Exception:
+        return ""
+
+
+async def _element_in_frame(tab: uc.Tab, remote_obj: Any) -> bool:
+    """Whether this element lives in a child frame rather than the main document.
+
+    Only consulted when a delivery probe saw nothing: events inside an iframe do
+    not reach the top document, so silence there is expected and must not be
+    reported as a failed click.
+    """
+    try:
+        rect = await _call_function_on(
+            tab,
+            function_declaration=(
+                "function() { const r = this.getBoundingClientRect();"
+                " return JSON.stringify([r.left, r.top]); }"
+            ),
+            object_id=remote_obj.object_id,
+            return_by_value=True,
+        )
+        local = json.loads(rect.value) if rect and rect.value else [0, 0]
+        dx, dy = await _frame_offset(tab, remote_obj, float(local[0]), float(local[1]))
+        return abs(dx) > 1 or abs(dy) > 1
+    except Exception:
+        return False
+
+
 async def _frame_offset(tab: uc.Tab, remote_obj: Any, rx: float, ry: float) -> tuple[float, float]:
     """How far this element's own coordinate space is from the top-level viewport.
 
@@ -2216,6 +2312,7 @@ async def click(
     # can take the renderer down, and a page that leaves the CDP call hanging
     # or erroring. Every step is bounded so a wedged page cannot hang the call.
     fallback_reason = ""
+    delivered: int | None = None
     if _target_key(tab) in _touch_emulated_targets:
         fallback_reason = "touch-emulated target"
     else:
@@ -2239,11 +2336,14 @@ async def click(
                 )
             fallback_reason = point
         else:
+            armed = await _arm_input_probe(tab)
             try:
                 await asyncio.wait_for(
                     _cdp_click(tab, remote_obj, point[0], point[1], dbl_click),
                     timeout=_CLICK_TIMEOUT_S,
                 )
+                if armed:
+                    delivered = await _read_input_probe(tab)
             except asyncio.TimeoutError:
                 fallback_reason = f"CDP input timed out after {_CLICK_TIMEOUT_S:g}s"
             except Exception as e:
@@ -2265,6 +2365,21 @@ async def click(
     result = f"Clicked uid={uid}"
     if fallback_reason:
         result += f" (scripted click, page sees isTrusted=false — {fallback_reason})"
+    elif delivered == 0:
+        # The CDP call was acknowledged, which only proves the browser queued the
+        # event. Reporting a click nothing received is the failure mode that costs
+        # an agent the most: it continues, and breaks somewhere unrelated later.
+        if await _element_in_frame(tab, remote_obj):
+            result += (
+                " (delivery not verified: the element is inside a frame, and events"
+                " there do not reach the top document)"
+            )
+        else:
+            result += (
+                " — WARNING: no input event reached the page. The window may be"
+                " occluded by another window, a JavaScript dialog may be open, or the"
+                " renderer may be busy. Nothing on the page is known to have changed."
+            )
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -3903,6 +4018,8 @@ async def press_key(
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
 
+    armed = await _arm_input_probe(tab)
+
     parts = key.split("+")
     target_key = parts[-1]
     modifier_names = [p for p in parts[:-1] if p in _MODIFIER_KEYS]
@@ -3946,6 +4063,7 @@ async def press_key(
         ))
 
     result = f"Pressed {key}"
+    result += await _input_delivery_note(tab, armed)
     result += await _maybe_snapshot(include_snapshot)
     return result
 
@@ -4598,6 +4716,9 @@ async def type_text(
     """
     tab = await _active_tab()
     import nodriver.cdp.input_ as cdp_input
+
+    focus = await _focused_description(tab)
+    armed = await _arm_input_probe(tab)
     for char in text:
         await tab.send(cdp_input.dispatch_key_event(type_="keyDown", text=char))
         await tab.send(cdp_input.dispatch_key_event(type_="keyUp", text=char))
@@ -4616,8 +4737,11 @@ async def type_text(
         await tab.send(cdp_input.dispatch_key_event(**up))
 
     result = f"Typed {len(text)} characters"
+    if focus:
+        result += f" into {focus}"
     if submit_key:
         result += f", then pressed {submit_key}"
+    result += await _input_delivery_note(tab, armed)
     return result
 
 

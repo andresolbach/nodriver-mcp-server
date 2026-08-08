@@ -658,3 +658,38 @@ def test_trusted_input_reaches_an_element_inside_a_frame():
         assert "Clicked" in await _call("click", uid=heading)
 
     _run(scenario)
+
+
+def test_a_delivered_click_and_keystroke_are_not_warned_about():
+    """The delivery check must not cry wolf.
+
+    A warning on every working click would be worse than the silence it replaces,
+    so the happy path is what needs guarding: the note appears only when no input
+    event reached the page, and type_text names the element it typed into so
+    typing at nothing is distinguishable from typing at the right field.
+    """
+
+    async def scenario():
+        await _call(
+            "new_page",
+            url=("data:text/html,<input id=email aria-label=EmailField>"
+                 "<button aria-label=GoButton style='padding:30px'>Go</button>"),
+        )
+        snap = await _call("take_snapshot")
+
+        clicked = await _call("click", uid=re.search(r'uid=(\S+) button "GoButton"', snap).group(1))
+        assert "Clicked" in clicked
+        assert "WARNING" not in clicked, f"a delivered click was warned about:\n{clicked}"
+
+        await _call("click", uid=re.search(r'uid=(\S+) textbox "EmailField"', snap).group(1))
+        typed = await _call("type_text", text="abc")
+        assert "WARNING" not in typed, f"delivered keystrokes were warned about:\n{typed}"
+        assert "input#email" in typed, f"the focus target was not reported:\n{typed}"
+        assert "abc" in await _call(
+            "evaluate_script", function="() => document.getElementById('email').value"
+        )
+
+        pressed = await _call("press_key", key="Tab")
+        assert "WARNING" not in pressed, f"a delivered key was warned about:\n{pressed}"
+
+    _run(scenario)
