@@ -6598,6 +6598,13 @@ async def use_running_browser(
     then this tool attaches to it. Every tool then acts on that browser and its
     real tabs.
 
+    `--user-data-dir` is not optional, and it must not be Chrome's own default
+    directory. Since Chrome 136 the port is refused there — Chrome starts
+    normally, says nothing, and nothing ever listens, which is a confusing way
+    to fail. So the everyday profile cannot be reached by adding the flag to
+    it; it has to be a directory of its own, and a copy of an existing profile
+    is accepted (`--profile-directory` then picks which profile inside it).
+
     SECURITY: that profile becomes part of the agent's reach. Whatever it is
     signed into — mail, bank, company systems — is reachable from here, because
     a cookie jar is all or nothing. Point this at a profile you are willing to
@@ -6615,7 +6622,15 @@ async def use_running_browser(
     except Exception as e:
         _connect_host = _connect_port = None
         _connect_disabled = True
-        raise ToolFailure(f"{e}")
+        # The bare connection error is true and useless: the common cause is a
+        # Chrome that is running, was given the flag, and still opened no port.
+        raise ToolFailure(
+            f"Could not attach to the browser at {host}:{port}: {e}\n"
+            "If Chrome is running and was started with --remote-debugging-port, the "
+            "usual cause is --user-data-dir: since Chrome 136 the port is refused when "
+            "it is Chrome's own default directory, and nothing reports that. Start "
+            "Chrome with a directory of its own."
+        )
     pages = await _format_pages()
     return (
         f"Attached to the browser running at {host}:{port}. "

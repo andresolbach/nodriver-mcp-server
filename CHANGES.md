@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.3.1 — why attaching to your own browser did not work
+
+`use_running_browser` promised the one thing Chrome no longer allows. Its
+documentation said to start Chrome with `--remote-debugging-port` on the profile
+holding your real logins — but since Chrome 136 the port is refused whenever
+`--user-data-dir` is Chrome's own default directory. Measured on 151: the browser
+starts, reports nothing, writes nothing to a log, and no port ever opens. The
+attach then failed with `Connect call failed ('127.0.0.1', 9222)`, which sends you
+checking the port number, the only part that was right.
+
+The port and the flag were never the problem, so the message now says so, and the
+docstring says which directory works: one of its own, which a copy of an existing
+profile satisfies. The underlying error is still included — it is the only part
+that can point at a cause other than the one guessed here.
+
+The attach mechanism itself was re-checked end to end against a Chrome started
+outside the server: attaching, driving its tabs, and detaching, after which that
+browser stays open with its tab intact, because it is not ours to close.
+
+Tool count: 65 -> 65.
+
 ## 2.3.0 — a failed call now says so
 
 MCP has an `isError` flag on a tool result, and this server never set it. Around
