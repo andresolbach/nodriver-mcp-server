@@ -226,6 +226,29 @@ navigate_page has always sent it.
   separate protocol a synthetic mouse does not trigger, and saying so beats a
   silent no-op.
 
+### The stealth claim finally has tests
+
+The product claim is "undetected", and nothing guarded it: the suite checked
+schemas and prose, so a regression in the one property the whole server exists
+for would have shipped in silence. Five checks now run against a real Chrome —
+`navigator.webdriver`, ChromeDriver's `cdc_` properties, an empty plugin list,
+real outer window dimensions, well-formed `navigator.languages`, and that the
+input-delivery probe leaves nothing on the page. They are the cheap, deterministic
+ones a detection script runs first, not a substitute for a real anti-bot service,
+whose verdict lives on someone else's server and cannot be a unit test.
+
+They caught something immediately. **An emulated user agent disagreed with its own
+client hints**: Chrome fills `navigator.userAgentData` from the real build and
+cannot be talked out of it, so a preset pinned to Chrome 150 announced 150 in the
+UA string while its hints said 151. Comparing the two is one line of JavaScript.
+The presets now take the running browser's version, because anything the browser
+will not lie about has to be matched rather than contradicted.
+
+Also fixed on the way: `click`, `hover` and `drag` on a uid that lands on a text
+node — which snapshots hand out routinely — raised
+`this.getBoundingClientRect is not a function`. They promote it to its element,
+which `fill` has always done.
+
 ### Smaller things
 
 - **`cf_verify` could never run.** opencv was not a dependency, not even an
