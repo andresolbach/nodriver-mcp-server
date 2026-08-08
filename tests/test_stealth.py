@@ -20,6 +20,8 @@ import re
 
 import pytest
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from nodriver_mcp.server import mcp
 
 pytestmark = pytest.mark.slow
@@ -30,7 +32,12 @@ _BLANK = "data:text/html,<title>probe</title><p>probe</p>"
 
 
 async def _call(tool, /, **arguments) -> str:
-    result = await mcp.call_tool(tool, arguments)
+    try:
+        result = await mcp.call_tool(tool, arguments)
+    except ToolError as e:
+        # A failing tool raises now, so that the routing layer can mark the
+        # result isError. The text is the same; these tests still assert on it.
+        return str(e)
     if isinstance(result, tuple):
         result = result[0]
     if isinstance(result, dict):

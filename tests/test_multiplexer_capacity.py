@@ -247,3 +247,36 @@ def test_a_correct_call_is_untouched():
             assert not result.isError, mux._text(result)
 
     asyncio.run(scenario())
+
+
+def test_a_failing_tool_is_marked_as_an_error():
+    """Regression: a tool that failed returned its message as an ordinary result.
+
+    MCP has `isError` for exactly this, and without it a failure was
+    indistinguishable from page data — a client could not tell "the element is
+    covered, nothing was clicked" from the text of a page that happens to say so.
+    The message still reaches the model in full; the flag is what was missing.
+    """
+
+    async def scenario():
+        # A uid that was never issued: an honest "I could not", not a bad argument.
+        result = await mux.call_tool("click", {"uid": "999_999"})
+        text = mux._text(result)
+
+        assert result.isError, f"a failed click was reported as success:\n{text}"
+        # And the reason still has to be readable, not swallowed by the flag.
+        assert "unknown uid" in text, text
+        assert "snapshot" in text, text
+
+    asyncio.run(scenario())
+
+
+def test_a_succeeding_tool_is_not_marked_as_an_error():
+    """The flag has to mean something: setting it on ordinary results would make
+    it noise, and page text containing the word "Error" must never trip it."""
+
+    async def scenario():
+        result = await mux.call_tool("list_browsers", {})
+        assert not result.isError, mux._text(result)
+
+    asyncio.run(scenario())

@@ -69,7 +69,11 @@ def test_cf_verify_says_what_is_missing_instead_of_failing_obscurely(monkeypatch
     with nothing an agent could act on.
     """
     monkeypatch.setattr(server.importlib.util, "find_spec", lambda name: None)
-    out = asyncio.run(server.cf_verify())
+    # It raises now rather than returning the text, so the routing layer can mark
+    # the result isError — the message is the same either way.
+    with pytest.raises(server.ToolFailure) as excinfo:
+        asyncio.run(server.cf_verify())
+    out = str(excinfo.value)
 
     assert "opencv" in out
     assert "nodriver-mcp[cf]" in out, "the message must name the way to install it"

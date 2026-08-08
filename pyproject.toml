@@ -1,6 +1,6 @@
 [project]
 name = "nodriver-mcp"
-version = "2.2.0"
+version = "2.3.0"
 description = "Undetected Chrome automation MCP server powered by nodriver — a stealth, anti-bot-resistant alternative to chrome-devtools-mcp for Claude, Cursor and other AI agents"
 readme = "README.md"
 requires-python = ">=3.12"
