@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -1661,6 +1662,28 @@ async def _apply_emulation(
     return results
 
 
+async def _match_real_chrome_version(tab: uc.Tab, user_agent: str) -> str:
+    """Put the running browser's Chrome version into a preset's user agent.
+
+    The presets ship a fixed version, but Chrome fills navigator.userAgentData
+    from the real build — so a preset written against Chrome 150 announced
+    "Chrome/150" in the UA string while its own client hints said 151. Comparing
+    the two is one line of JavaScript and a reliable tell, on a server whose whole
+    point is not standing out. Anything the browser cannot be talked out of has to
+    be matched rather than contradicted.
+    """
+    if "Chrome/" not in user_agent:
+        return user_agent  # Safari-shaped presets carry no Chrome token
+    try:
+        real = str(await _evaluate_value(tab, "navigator.userAgent") or "")
+        match = re.search(r"Chrome/(\d+\.\d+\.\d+\.\d+)", real)
+        if not match:
+            return user_agent
+        return re.sub(r"Chrome/\d+\.\d+\.\d+\.\d+", f"Chrome/{match.group(1)}", user_agent)
+    except Exception:
+        return user_agent
+
+
 async def _apply_device_preset(tab: uc.Tab, device: str) -> list[str]:
     """Apply a named device preset to a tab."""
     resolved = _resolve_device_preset(device)
@@ -1669,9 +1692,10 @@ async def _apply_device_preset(tab: uc.Tab, device: str) -> list[str]:
         raise ValueError(f"Unknown device preset '{device}'. Supported presets: {supported}")
 
     metadata = _build_user_agent_metadata(resolved["metadata"]) if resolved.get("metadata") else None
+    user_agent = await _match_real_chrome_version(tab, resolved["user_agent"])
     results = await _apply_emulation(
         tab,
-        user_agent=resolved["user_agent"],
+        user_agent=user_agent,
         user_agent_platform=resolved["platform"],
         user_agent_metadata=metadata,
         accept_language=resolved.get("accept_language", ""),
@@ -2133,6 +2157,29 @@ async def cf_verify() -> str:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+async def _as_element(tab: uc.Tab, remote_obj: Any) -> Any:
+    """The element for this object, promoting a text node to its parent.
+
+    A snapshot uid can land on a StaticText node, and everything that measures or
+    clicks needs an element — without this the caller got
+    "this.getBoundingClientRect is not a function", which says nothing about the
+    real problem. _fill_element has always done this; the pointer tools had not.
+    """
+    try:
+        promoted = await _call_function_on(
+            tab,
+            function_declaration=(
+                "function() { return this.nodeType === 3 ? this.parentElement : this; }"
+            ),
+            object_id=remote_obj.object_id,
+        )
+        if promoted is not None and getattr(promoted, "object_id", None):
+            return promoted
+    except Exception:
+        pass
+    return remote_obj
+
+
 async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] | str:
     """A viewport point that really lands on this element, or what is covering it.
 
@@ -2438,7 +2485,7 @@ async def click(
     if uid not in _uid_to_backend_node_id:
         return f"Error clicking uid={uid}: unknown uid. Take a new snapshot first."
     try:
-        remote_obj = await _resolve_uid(tab, uid)
+        remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
     except ValueError as e:
         return f"Error clicking uid={uid}: {e}"
 
@@ -2716,7 +2763,7 @@ async def drag(
     try:
         points = []
         for uid in (from_uid, to_uid):
-            remote_obj = await _resolve_uid(tab, uid)
+            remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
             try:
                 import nodriver.cdp.dom as cdp_dom
                 await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
@@ -3592,7 +3639,7 @@ async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
     """
     tab = await _active_tab()
     try:
-        remote_obj = await _resolve_uid(tab, uid)
+        remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
         try:
             import nodriver.cdp.dom as cdp_dom
             await tab.send(cdp_dom.scroll_into_view_if_needed(object_id=remote_obj.object_id))
