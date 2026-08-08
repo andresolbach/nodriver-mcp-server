@@ -248,8 +248,14 @@ async def _get_browser() -> uc.Browser:
                 "--window-size=1280,900",
             ]
             browser_args.extend(_extra_browser_args)
+            # set_proxy wins over the environment: it is the explicit, current
+            # instruction, and the env var is a deployment default.
+            proxy = _proxy_config.get("server") or proxy
             if proxy:
                 browser_args.append(f"--proxy-server={proxy}")
+                bypass = _proxy_config.get("bypass")
+                if bypass:
+                    browser_args.append(f"--proxy-bypass-list={bypass}")
                 logger.info("Proxy configured: %s", proxy)
             # Start on about:blank rather than the New Tab page: the NTP fires
             # its own Google requests, which pollute list_network_requests and
@@ -277,6 +283,16 @@ async def _get_browser() -> uc.Browser:
                 "Browser started (headless=%s, profile=%s)",
                 headless, _selected_profile_name or "temp",
             )
+
+            # Arm proxy authentication before anything can navigate. Arming it
+            # per tab is too late for that tab's first request: the challenge
+            # arrives, nothing answers it, and Chrome shows its own "problem with
+            # the proxy server" page instead of the site.
+            if _proxy_config.get("username"):
+                try:
+                    await _auto_enable_proxy_auth(_browser.main_tab)
+                except Exception as e:  # noqa: BLE001 - a proxy is not worth failing the start
+                    logger.warning("could not arm proxy auth at startup: %r", e)
 
             # Record ownership of a throwaway profile, so that if this process
             # is killed before it can clean up, the next start knows the
@@ -474,6 +490,9 @@ _dialog_tracked_sessions: set[tuple] = set()  # (target_id, session_id) with Pag
 _dialog_handler_tabs: set[int] = set()  # id(tab) of tabs whose dialog handlers are installed
 _open_dialogs: dict[Any, dict] = {}  # target key -> the dialog currently blocking it
 _pointer_positions: dict[Any, tuple[float, float]] = {}  # target key -> last pointer position
+_proxy_config: dict[str, str] = {}  # server/username/password/bypass, set by set_proxy
+_proxy_auth_sessions: set[tuple] = set()  # (target_id, session_id) with Fetch auth handling
+_proxy_auth_tabs: set[int] = set()  # id(tab) of tabs whose Fetch handlers are installed
 # cf_verify has to change the process working directory; serialise it so two
 # calls cannot swap it under each other.
 _CF_LOCK = asyncio.Lock()
@@ -894,6 +913,61 @@ def _request_timing(req: dict) -> str:
     if req.get("from_cache"):
         parts.append("cached")
     return " " + " ".join(parts) if parts else ""
+
+
+async def _auto_enable_proxy_auth(tab: uc.Tab) -> None:
+    """Answer the proxy's authentication challenge on this tab.
+
+    Chrome cannot take proxy credentials on the command line — it ignores them in
+    a --proxy-server URL — and an authenticating proxy otherwise stops the browser
+    at a native dialog no page and no CDP command can dismiss. The page simply
+    never loads, and nothing says why. Fetch is the only domain that can answer
+    it, via authRequired.
+
+    Only enabled when credentials are actually configured: Fetch pauses every
+    request, which costs a round trip each, and there is no reason to pay that for
+    a proxy that does not ask.
+    """
+    import nodriver.cdp.fetch as cdp_fetch
+
+    if not (_proxy_config.get("server") and _proxy_config.get("username")):
+        return
+    target = getattr(tab, "target_id", None)
+    if target in _proxy_auth_sessions:
+        return
+    # Unlike the network collector, this must NOT wait for a session to exist.
+    # A freshly started browser's main tab has none until something sends to it,
+    # and waiting means the first navigation's proxy challenge arrives before
+    # anything can answer it — which is the whole failure being fixed. Sending
+    # attaches the tab, so this both arms and establishes the session.
+
+    async def _on_auth(event: cdp_fetch.AuthRequired):
+        try:
+            await tab.send(cdp_fetch.continue_with_auth(
+                request_id=event.request_id,
+                auth_challenge_response=cdp_fetch.AuthChallengeResponse(
+                    response="ProvideCredentials",
+                    username=_proxy_config.get("username", ""),
+                    password=_proxy_config.get("password", ""),
+                ),
+            ))
+        except Exception as e:  # noqa: BLE001 - a failed answer must not wedge the tab
+            logger.warning("proxy auth failed: %r", e)
+
+    async def _on_paused(event: cdp_fetch.RequestPaused):
+        # Enabling Fetch means every request waits for us to let it through.
+        try:
+            await tab.send(cdp_fetch.continue_request(request_id=event.request_id))
+        except Exception:
+            pass
+
+    try:
+        await tab.send(cdp_fetch.enable(handle_auth_requests=True))
+        _proxy_auth_sessions.add(getattr(tab, "target_id", None))
+        tab.add_handler(cdp_fetch.AuthRequired, _on_auth)
+        tab.add_handler(cdp_fetch.RequestPaused, _on_paused)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not enable proxy auth handling: %r", e)
 
 
 async def _auto_enable_dialog_tracking(tab: uc.Tab) -> None:
@@ -3983,6 +4057,7 @@ async def navigate_page(
         # Auto-enable network collection on navigated tab.
         await _auto_enable_network_collection(tab)
         await _auto_enable_dialog_tracking(tab)
+        await _auto_enable_proxy_auth(tab)
         # Page.navigate does not touch nodriver's cached TargetInfo, and reading
         # tab.target.url straight after it can still report the previous URL.
         await _refresh_targets(await _get_browser())
@@ -4062,11 +4137,17 @@ async def new_page(
     try:
         if reuse_tab is not None:
             tab = reuse_tab
+            # Arm before the first request, not after: a proxy challenge on this
+            # navigation has to be answerable, and nothing can answer one that has
+            # already been refused.
+            await _auto_enable_proxy_auth(tab)
             if not _is_blank_url(initial_url):
+                # _navigate_same_tab, not tab.get: the latter re-attaches and
+                # mints a new CDP session, stranding every domain enabled on this
+                # tab — the same churn navigate_page was moved off.
                 await _await_with_timeout(
-                    tab.get(initial_url), timeout, f"Navigate to {initial_url}"
+                    _navigate_same_tab(tab, initial_url), timeout, f"Navigate to {initial_url}"
                 )
-                await _await_with_timeout(tab, timeout, "Wait for page")
         else:
             tab = await _open_new_tab(
                 browser,
@@ -4081,6 +4162,7 @@ async def new_page(
         # And the Page domain, or a modal dialog on this tab could never be
         # answered — handle_dialog would report that none is showing.
         await _auto_enable_dialog_tracking(tab)
+        await _auto_enable_proxy_auth(tab)
 
         device_results: list[str] = []
         if device:
@@ -6105,6 +6187,103 @@ def _scan_profile_extensions(profile_dir: str) -> list[dict]:
             "version": manifest.get("version", versions[-1]),
         })
     return found
+
+
+@tool(title="Route traffic through a proxy", destructive=True)
+async def set_proxy(
+    server: Annotated[
+        str | None,
+        Field(description=(
+            'Proxy to route through, e.g. "http://198.51.100.7:8080" or '
+            '"socks5://198.51.100.7:1080". A bare "host:port" is treated as http. '
+            'Pass "" to remove the proxy; omit it to leave the current one alone.'
+        )),
+    ] = None,
+    username: Annotated[
+        str,
+        Field(description=(
+            "Username, for a proxy that demands authentication. Chrome ignores "
+            "credentials embedded in the proxy URL, so they have to be given here."
+        )),
+    ] = "",
+    password: Annotated[
+        str, Field(description="Password that goes with `username`.")
+    ] = "",
+    bypass: Annotated[
+        str,
+        Field(description=(
+            'Hosts to reach directly, Chrome\'s own syntax, e.g. '
+            '"localhost;127.0.0.1;*.internal". Empty string sends everything '
+            "through the proxy."
+        )),
+    ] = "",
+    restart: Annotated[
+        bool,
+        Field(description=(
+            "Restart Chrome now so the proxy takes effect, closing all open pages. "
+            "Default true; false defers it to the next browser start."
+        )),
+    ] = True,
+) -> str:
+    """Send this browser's traffic through a proxy, with credentials if it wants them.
+
+    The proxy itself is a launch flag, so it needs a browser restart — which on an
+    ephemeral profile also drops its cookies. Authentication is handled live: an
+    authenticating proxy stops Chrome at a native dialog that no page and no other
+    CDP command can dismiss, so the page just never loads and nothing says why.
+
+    Answering it means enabling the Fetch domain, which pauses every request for a
+    round trip, so that only happens when a username is actually set. A proxy that
+    does not ask for credentials costs nothing extra.
+
+    Call with no arguments to see what is configured. The password is never echoed
+    back. Values set here override the NODRIVER_PROXY environment variable.
+    """
+    global _proxy_config
+    # None means "not given" and "" means "remove": without that distinction there
+    # is no way to ask for the current setting without also clearing it.
+    if server is None and not username and not password and not bypass:
+        current = _proxy_config.get("server") or os.environ.get("NODRIVER_PROXY", "")
+        if not current:
+            return (
+                "No proxy configured. Pass server= to set one, and username/password "
+                "if it authenticates."
+            )
+        source = "set_proxy" if _proxy_config.get("server") else "NODRIVER_PROXY"
+        auth = "with credentials" if _proxy_config.get("username") else "no credentials"
+        bypass_note = f", bypass={_proxy_config['bypass']}" if _proxy_config.get("bypass") else ""
+        return f"Proxy: {current} ({auth}, from {source}){bypass_note}"
+
+    if server and "://" not in server:
+        server = f"http://{server}"
+    if password and not username:
+        return "Error: a password without a username. Pass both, or neither."
+
+    _proxy_config = (
+        {"server": server, "username": username, "password": password, "bypass": bypass}
+        if server else {}
+    )
+    # A new proxy means new sessions have to be re-armed, and a removed one means
+    # the old handlers must not linger.
+    _proxy_auth_sessions.clear()
+    _proxy_auth_tabs.clear()
+
+    if not server:
+        msg = "Proxy removed; traffic goes direct."
+    else:
+        auth = "with credentials" if username else "no credentials"
+        msg = f"Proxy set to {server} ({auth})."
+        if bypass:
+            msg += f" Bypassing: {bypass}."
+    if restart:
+        was = await _stop_browser()
+        msg += " Browser " + (
+            "stopped; it relaunches with this on the next action."
+            if was else "will start with this on the next action."
+        )
+    else:
+        msg += " Not applied yet — it takes effect the next time Chrome starts."
+    return msg
 
 
 @tool(title="Manage Chrome extensions", destructive=True)

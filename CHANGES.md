@@ -1,5 +1,38 @@
 # Changelog
 
+## 2.2.0 — a proxy you can actually authenticate to
+
+`set_proxy` routes a browser through a proxy, with credentials when it wants
+them. Until now there was no proxy tool at all: `--proxy-server` could be smuggled
+in through `set_browser_flags(extra_args=…)`, but only for a proxy that does not
+authenticate. Chrome ignores credentials embedded in a `--proxy-server` URL, so an
+authenticating proxy stopped it at a native dialog that no page and no other CDP
+command can dismiss — the page never loaded and nothing said why. Nearly every
+commercial proxy authenticates, so that was most of them.
+
+Credentials are answered live through `Fetch.authRequired`. That domain pauses
+every request for a round trip, so it is only enabled when a username is actually
+set: a proxy that never challenges costs nothing extra. `bypass` takes Chrome's
+own syntax for hosts to reach directly, and the password is never echoed back.
+
+Getting there turned up a leftover from 2.1.0: `new_page` reusing the empty
+startup tab still navigated through nodriver's `Tab.get()`, which re-attaches and
+mints a new CDP session. `navigate_page` was moved off that in 2.1.0; this path
+was missed, so anything enabled on the tab before its first navigation — proxy
+auth included — was stranded on a session nobody was talking to. It uses the same
+direct navigation now.
+
+### On the test that found it
+
+The proxy fixture is a real HTTP proxy that really challenges, because a mock
+that never asks would not exercise the part that was broken. It also has to be
+threaded: Chrome opens several connections to a proxy at once, and a
+single-threaded one makes it give up with `ERR_PROXY_CONNECTION_FAILED` — which
+looks exactly like a broken proxy implementation and cost this change several
+wrong diagnoses before the fixture itself turned out to be at fault.
+
+Tool count: 64 -> 65.
+
 ## 2.1.0 — tools that reported success while doing nothing
 
 An independent audit drove this server through 25 agents and 2151 tool calls:
