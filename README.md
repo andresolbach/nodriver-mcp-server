@@ -273,7 +273,7 @@ An MCP tool is only as good as what the model can see of it. Most servers hand o
 
 Here, the schema does that work:
 
-- **Every parameter has a description in the schema itself** — not buried in a prose blob the client may never show. All 57 tools, all parameters, no exceptions (there's a test for it).
+- **Every parameter has a description in the schema itself** — not buried in a prose blob the client may never show. All 61 tools, all parameters, no exceptions (there's a test for it).
 - **Fixed-value parameters are real enums.** `navigate_page(type=…)` advertises exactly `url`, `back`, `forward`, `reload`. A wrong value is rejected by validation before it ever reaches Chrome, instead of returning an error the agent has to interpret.
 - **Numeric and array bounds are declared** — `quality` is 0–100, `wait_for(text=…)` requires at least one entry.
 - **Structured parameters are typed.** `fill_form` publishes `{uid, value}` rather than an opaque `list[dict]`.

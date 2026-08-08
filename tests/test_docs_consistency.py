@@ -52,6 +52,26 @@ def test_readme_badge_matches(tool_names):
     assert int(badge.group(1)) == len(tool_names)
 
 
+def test_no_sentence_claims_a_stale_tool_count(tool_names):
+    """The count written as "N tools", which the check above cannot see.
+
+    That form drifted unnoticed for three releases — the README still said "All
+    57 tools" at 2.0.0 — because the pattern above only matches "Tools: N".
+    A line may name a different number when it is comparing against another
+    project, which in practice means it also states our own count.
+    """
+    count = len(tool_names)
+    wrong = []
+    for line in README.splitlines():
+        others = [int(n) for n in re.findall(r"\b(\d{2})\s+tools\b", line)]
+        if not others or all(n == count for n in others):
+            continue
+        if count in others:
+            continue  # a comparison row, stating ours alongside someone else's
+        wrong.append(line.strip()[:100])
+    assert wrong == [], f"lines claiming a tool count that is not {count}: {wrong}"
+
+
 def test_readme_tool_table_lists_every_tool(tool_names):
     """Every registered tool must appear in the README table, and vice versa."""
     documented = set(re.findall(r"`([a-z_]+)`", README))
