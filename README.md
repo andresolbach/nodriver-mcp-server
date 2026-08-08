@@ -61,13 +61,16 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 ## Features
 
 - 🕵️ **Undetected by design** — `navigator.webdriver` reads `false`, exactly as in a browser a person is using, and there are no CDP or WebDriver artifacts to find.
-- ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`).
+- ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`, needs the `[cf]` extra).
+- 🖼️ **Frames are not a blind spot** — `list_frames` plus a `frame` argument on the readers, and `take_snapshot` splices each iframe's tree in under the element hosting it, so a payment field or consent wall inside one gets a uid and can be clicked and filled like anything else.
+- 🔍 **A network log that says what happened** — status, response headers, timing, transfer size, redirect hops and failures, plus WebSocket frames in both directions. A 500, a 404, a redirect and a DNS failure are different lines, not the same one.
 - 👥 **Several isolated browsers at once** — pass `browser: "agent-a"` to any tool and that name gets its own Chrome, in its own process, with its own cookies, tabs and uids. Parallel agents stop stealing each other's selected tab. Omit it and nothing changes: the default browser runs in the server process, exactly as before. [How it works](#several-agents-several-browsers)
 - 🧩 **64 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
 - 🧠 **Schemas written for the agent, not just the compiler** — every parameter carries a description, fixed-value options are real enums, and each tool declares read-only/destructive hints. See [why this matters](#built-for-the-agent-that-calls-it).
-- 📄 **Compact accessibility-tree snapshots** (`take_snapshot`) — searchable page text with a uid per element. Measured on the Hacker News front page: **34 KB against 106 KB unfiltered, 68% smaller, with every link, URL and text preserved.** That saving lands on every single agent step.
+- 📄 **Compact accessibility-tree snapshots** (`take_snapshot`) — searchable page text with a uid per element. Measured on the Hacker News front page: **27 KB against 97 KB unfiltered, 72% smaller, with every link, URL and text preserved.** Same-origin URLs are printed relative to the page, which is lossless because the root node keeps the absolute one. That saving lands on every single agent step.
 - 🔗 **Attach to a browser you are already signed into** (`use_running_browser`) — drive your real Chrome profile over its debugging port instead of rebuilding logins in a fresh one.
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
+- ✅ **Actions that verify themselves** — `fill` reads the value back, `set_checked` reads the checked state back, and `click`, `press_key` and `type_text` report when no input event reached the page. A tool that cannot confirm what it did says so instead of reporting success.
 - 💾 **Session save/restore** — persist logins across runs.
 - 🧬 **Ephemeral by default, run many at once** — each session gets its own temp Chrome profile (auto-deleted), so Claude Desktop, Claude Code and VS Code can all drive nodriver **simultaneously without colliding**. Named **persistent profiles** are available on demand for reusable logins.
 - ⚡ **One-command setup** for 15+ MCP clients.
