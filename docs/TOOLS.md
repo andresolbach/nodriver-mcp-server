@@ -536,6 +536,10 @@ The output is the accessibility tree — roles, names, values and states,
 indented by nesting — with Chrome-internal and purely presentational nodes
 filtered out unless `verbose` is set.
 
+A URL on the same origin as the page is printed relative to it — the root node
+carries the absolute one, so nothing is lost and a link-dense page costs
+noticeably less to read.
+
 uids stay stable across snapshots for elements that did not change, but any
 page change can invalidate them. Whenever a tool reports "unknown uid", take
 a fresh snapshot and use the new uid. Output is capped at 200 000 characters.

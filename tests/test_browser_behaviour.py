@@ -693,3 +693,49 @@ def test_a_delivered_click_and_keystroke_are_not_warned_about():
         assert "WARNING" not in pressed, f"a delivered key was warned about:\n{pressed}"
 
     _run(scenario)
+
+
+def test_same_origin_urls_are_printed_relative_to_the_page():
+    """take_snapshot is the most-called tool, so its size is paid on every step.
+
+    Measured on real pages, repeating the origin on every same-origin link was
+    7-16% of the whole snapshot — the largest remaining cost after text folding.
+    Printing them relative is lossless because the root node keeps the absolute
+    URL, and an external link must still be shown in full or it cannot be
+    followed.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://books.toscrape.com/")
+        snap = await _call("take_snapshot")
+        lines = snap.splitlines()
+
+        # The root states the origin once, in full.
+        assert re.search(r'RootWebArea.*url="https://books\.toscrape\.com/', lines[0]), lines[0]
+        # Same-origin links are relative...
+        assert re.search(r'link "Home" url="/index\.html"', snap), (
+            f"same-origin link was not shortened:\n{snap[:600]}"
+        )
+        # ...and no non-root line repeats the origin.
+        for line in lines[1:]:
+            assert "url=\"https://books.toscrape.com" not in line, (
+                f"origin still repeated:\n{line}"
+            )
+
+    _run(scenario)
+
+
+def test_an_external_url_is_still_shown_in_full():
+    """Shortening must never touch a URL on another origin: it is not
+    reconstructible from the root, and following it is the whole point."""
+
+    async def scenario():
+        await _call(
+            "new_page",
+            url=("data:text/html,<a href='https://example.org/deep/path'>Out</a>"
+                 "<a href='/local'>In</a>"),
+        )
+        snap = await _call("take_snapshot")
+        assert "https://example.org/deep/path" in snap, f"external URL was mangled:\n{snap}"
+
+    _run(scenario)

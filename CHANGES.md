@@ -192,6 +192,21 @@ shows the sent/received counts; `get_network_request` prints the frames. Payload
 are capped at 2000 characters and each socket keeps its last 200 frames, with the
 number dropped reported rather than silently forgotten.
 
+### A smaller snapshot, without losing anything
+
+take_snapshot is the most-called tool in the server, so its size is paid at every
+single agent step. Measuring where the bulk actually sits gave a different answer
+than expected: the `StaticText` duplication a previous analysis measured at 39% of
+the output is already folded away and now accounts for 4%, while **repeating the
+page's own origin on every same-origin link is 7-16%** — the largest remaining
+cost by a wide margin.
+
+Same-origin URLs are printed relative to the document. The root node keeps its
+absolute URL, so every shortened one is reconstructible, and a URL on another
+origin is never touched — it is not derivable from the root, and following it is
+the point. Measured: Hacker News 33 852 -> 28 342 characters (-16%),
+books.toscrape.com -13%, a long Wikipedia article -8%.
+
 ### Input tools say whether the page received anything
 
 A CDP `Input.*` acknowledgement proves only that the browser queued the event. An
