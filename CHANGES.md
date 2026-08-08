@@ -144,6 +144,39 @@ the entry that caused it. A response that arrived outranks a later transport
 error, because Chrome aborts the body of a `fetch()` nobody reads — reporting that
 as FAILED hid the 500 the caller was looking for.
 
+### Frames are no longer a blind spot
+
+`take_snapshot` called `getFullAXTree` with no `frame_id`, which stops at every
+frame boundary, and `document.querySelector` never crosses one — so a payment
+field, a consent wall, an embedded editor or a CAPTCHA widget did not exist as far
+as this server was concerned. `get_page_content` returned `""` for a frameset,
+which is indistinguishable from a blank page.
+
+- **`list_frames`** shows the frame tree with each frame's index, URL and name.
+- `take_snapshot` reads every frame and splices its tree in under the element that
+  hosts it, so the result is one document and an element inside an iframe gets a
+  uid like any other. `include_frames=false` opts out on frame-heavy pages.
+- `get_page_content`, `query_selector` and `evaluate_script` take a `frame`
+  argument. They run in an isolated world, which shares the frame's DOM but not
+  its own JavaScript variables — finding the main world's context id needs
+  `Runtime.enable`, the one domain this server keeps off because attaching it is
+  detectable.
+- Trusted input reaches into frames. A click is delivered by viewport coordinate
+  while the hit test necessarily runs in the element's own document, so for
+  anything inside an iframe the point was frame-relative and the click landed
+  elsewhere — reporting success for it. The offset is measured as the difference
+  between `DOM.getBoxModel` (top-level coordinates) and the element's own
+  `getBoundingClientRect`, which is zero in the main frame, so one code path
+  serves both and nesting depth does not matter.
+
+No uid scheme change was needed: this server disables site isolation, so a child
+frame's backendNodeIds already resolve through the same session.
+
+Also: a snapshot taken the instant a navigation returns used to come back with
+only the root node, because Chrome builds its accessibility cache lazily and the
+tool could not tell that from a genuinely empty page. It now waits briefly and
+asks again.
+
 ### WebSockets are visible
 
 `WebSocket` was an offered value of `resource_types` that could never match,
@@ -237,7 +270,7 @@ the defects above; it asserts that the prose and the signatures agree, which is
 worth having and is not the same thing as asserting that a tool does what it
 says. Every defect in this release was of the second kind.
 
-Tool count: 61 -> 63 (set_checked, select_option).
+Tool count: 61 -> 64 (set_checked, select_option, list_frames).
 
 ## 2.0.1 — the landing page did not mention the headline feature
 

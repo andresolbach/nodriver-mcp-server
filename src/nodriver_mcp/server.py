@@ -467,6 +467,7 @@ _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
 _network_collection_enabled_tabs: set[tuple] = set()  # (target_id, session_id) with Network enabled
 _network_handler_targets: set[int] = set()  # id(tab) of tabs whose request handler is installed
+_frame_worlds: dict[tuple, Any] = {}  # (target_id, frame_id) -> isolated-world execution context
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
 _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
@@ -1713,6 +1714,87 @@ async def _open_new_tab(
     return tab
 
 
+async def _frame_list(tab: uc.Tab) -> list[dict]:
+    """Flatten the page's frame tree, main frame first.
+
+    Everything frame-aware in the server is built on this. Chrome's own AX tree
+    call stops at the frame boundary, so a page's payment field, consent wall or
+    embedded editor was simply unreachable — a snapshot showed a bare Iframe node
+    and nothing inside it.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    tree = await tab.send(cdp_page.get_frame_tree())
+    frames: list[dict] = []
+
+    def walk(node: Any, depth: int, parent: str) -> None:
+        frame = getattr(node, "frame", None)
+        if frame is None:
+            return
+        frame_id = str(getattr(frame, "id_", "") or "")
+        frames.append({
+            "index": len(frames),
+            "frame_id": frame_id,
+            "url": getattr(frame, "url", "") or "",
+            "name": getattr(frame, "name", "") or "",
+            "depth": depth,
+            "parent": parent,
+        })
+        for child in (getattr(node, "child_frames", None) or []):
+            walk(child, depth + 1, frame_id)
+
+    walk(tree, 0, "")
+    return frames
+
+
+async def _resolve_frame(tab: uc.Tab, frame: str) -> tuple[str, str]:
+    """Turn a frame index or id into (frame_id, url), or raise with the choices."""
+    frames = await _frame_list(tab)
+    wanted = (frame or "").strip()
+    if wanted.isdigit():
+        idx = int(wanted)
+        if idx < len(frames):
+            return frames[idx]["frame_id"], frames[idx]["url"]
+    else:
+        for entry in frames:
+            if entry["frame_id"] == wanted or (entry["name"] and entry["name"] == wanted):
+                return entry["frame_id"], entry["url"]
+    listing = "; ".join(f"{f['index']}={f['url'][:60] or f['name'] or '(blank)'}" for f in frames)
+    raise RuntimeError(
+        f"no frame matching {frame!r}. This page has {len(frames)}: {listing}. "
+        "Pass the index, the frame id or its name."
+    )
+
+
+@tool(title="List frames", read_only=True)
+async def list_frames() -> str:
+    """List the page's frames, so their content can be reached at all.
+
+    Chrome's accessibility tree stops at a frame boundary, and
+    document.querySelector never crosses one, so anything inside an iframe —
+    payment fields, consent walls, embedded editors, CAPTCHA widgets — is
+    invisible to take_snapshot and query_selector by default.
+
+    Index 0 is always the main frame. Pass an index or frame id as the `frame`
+    argument of get_page_content, query_selector, evaluate_script,
+    wait_for_selector or take_snapshot to work inside one.
+    """
+    tab = await _active_tab()
+    try:
+        frames = await _frame_list(tab)
+    except Exception as e:
+        return f"Error listing frames: {e}"
+    if len(frames) == 1:
+        return "1 frame (the main document); this page has no iframes."
+    lines = [f"{len(frames)} frames:"]
+    for f in frames:
+        indent = "  " * f["depth"]
+        name = f' name="{f["name"]}"' if f["name"] else ""
+        label = " (main frame)" if f["depth"] == 0 else ""
+        lines.append(f"  [{f['index']}] {indent}{f['url'] or '(blank)'}{name}{label}")
+    return "\n".join(lines)
+
+
 async def _navigate_same_tab(tab: uc.Tab, target_url: str) -> str:
     """Navigate this tab over CDP, without nodriver's re-attach.
 
@@ -1961,6 +2043,12 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
     is actually hit, and try a few points before giving up.
 
     Returns (x, y) on success, or a string describing the blocker.
+
+    For an element inside an iframe the hit test necessarily runs in that frame's
+    own document, so the point it returns is relative to the frame's viewport
+    while CDP input is delivered in the top-level one. The frame's offset is added
+    back, or every click into a frame would land somewhere else entirely — and
+    report success for it.
     """
     obj = await _call_function_on(
         tab,
@@ -1975,7 +2063,8 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
             "   const x = r.left + r.width * fx, y = r.top + r.height * fy;"
             "   if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;"
             "   const el = document.elementFromPoint(x, y);"
-            "   if (el && (el === this || this.contains(el))) return JSON.stringify({x, y});"
+            "   if (el && (el === this || this.contains(el)))"
+            "     return JSON.stringify({x, y, rx: r.left, ry: r.top});"
             "   if (el && !blocker) blocker = el;"
             " }"
             " if (!blocker) return JSON.stringify({"
@@ -1994,8 +2083,36 @@ async def _clickable_point(tab: uc.Tab, remote_obj: Any) -> tuple[float, float] 
     except (TypeError, ValueError):
         return "the page did not report a hit point"
     if "x" in data:
-        return float(data["x"]), float(data["y"])
+        dx, dy = await _frame_offset(
+            tab, remote_obj, float(data.get("rx", 0.0)), float(data.get("ry", 0.0))
+        )
+        return float(data["x"]) + dx, float(data["y"]) + dy
     return str(data.get("reason", "something else is in the way"))
+
+
+async def _frame_offset(tab: uc.Tab, remote_obj: Any, rx: float, ry: float) -> tuple[float, float]:
+    """How far this element's own coordinate space is from the top-level viewport.
+
+    Rather than identifying the element's frame — DOM.describeNode reports a
+    frameId only for the <iframe> element itself, never for nodes inside it — this
+    measures the shift directly: DOM.getBoxModel answers in top-level coordinates
+    for any node, and getBoundingClientRect answered in the element's own
+    document. The difference is the offset, whatever the nesting depth, and it is
+    zero for a main-frame element, so the same code path serves both.
+    """
+    import nodriver.cdp.dom as cdp_dom
+
+    try:
+        model = await tab.send(cdp_dom.get_box_model(object_id=remote_obj.object_id))
+        # border quad is [x1,y1, x2,y2, ...]; the first corner is the top-left.
+        quad = model.border
+        dx, dy = float(quad[0]) - rx, float(quad[1]) - ry
+        # A sub-pixel difference is rounding, not a frame.
+        return (dx, dy) if abs(dx) > 1 or abs(dy) > 1 else (0.0, 0.0)
+    except Exception:
+        # An unshifted click that then reports honestly beats failing every
+        # ordinary main-frame click on a box-model hiccup.
+        return 0.0, 0.0
 
 
 async def _cdp_click(tab: uc.Tab, remote_obj: Any, x: float, y: float, dbl_click: bool) -> None:
@@ -2464,7 +2581,39 @@ async def emulate_device(
     return "Emulation applied: " + ", ".join([*device_results, *extra_results])
 
 
-async def _evaluate_value(tab: Any, expression: str, await_promise: bool = False) -> Any:
+async def _frame_context(tab: Any, frame: str) -> Any:
+    """An execution context inside a named frame, for reading its DOM.
+
+    Uses Page.createIsolatedWorld rather than the frame's main world, because
+    finding the main world's context id needs Runtime.enable — the one domain this
+    server keeps off by default precisely because attaching it is detectable. An
+    isolated world shares the DOM, which is what every reader here wants; it does
+    not share the page's own JS variables, and the tool descriptions say so.
+
+    Worlds are cached per frame so a loop over rows does not create one per call,
+    and a stale one (after the frame navigated) is replaced rather than raised.
+    """
+    import nodriver.cdp.page as cdp_page
+
+    frame_id, _url = await _resolve_frame(tab, frame)
+    key = (getattr(tab, "target_id", None), frame_id)
+    context_id = _frame_worlds.get(key)
+    if context_id is not None:
+        return context_id
+    context_id = await tab.send(
+        cdp_page.create_isolated_world(
+            frame_id=cdp_page.FrameId(frame_id),
+            world_name="nodriver-mcp",
+            grant_univeral_access=True,
+        )
+    )
+    _frame_worlds[key] = context_id
+    return context_id
+
+
+async def _evaluate_value(
+    tab: Any, expression: str, await_promise: bool = False, frame: str = ""
+) -> Any:
     """Evaluate an expression and return its value as plain JSON.
 
     nodriver's Tab.evaluate cannot be used where the result matters. It asks for
@@ -2479,6 +2628,19 @@ async def _evaluate_value(tab: Any, expression: str, await_promise: bool = False
     """
     import nodriver.cdp.runtime as cdp_runtime
 
+    context_id = None
+    if frame:
+        for attempt in (1, 2):
+            try:
+                context_id = await _frame_context(tab, frame)
+                break
+            except Exception:
+                # The cached world may belong to a document that has navigated
+                # away. Drop it and ask once more before giving up.
+                if attempt == 2:
+                    raise
+                _frame_worlds.clear()
+
     remote, errors = await tab.send(
         cdp_runtime.evaluate(
             expression=expression,
@@ -2486,6 +2648,7 @@ async def _evaluate_value(tab: Any, expression: str, await_promise: bool = False
             await_promise=await_promise,
             return_by_value=True,
             allow_unsafe_eval_blocked_by_csp=True,
+            context_id=context_id,
         )
     )
     if errors:
@@ -2521,6 +2684,16 @@ async def evaluate_script(
         Field(description=(
             "Write the JSON result to this local path instead of returning it — for "
             "extractions too large to put in the conversation."
+        )),
+    ] = "",
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Run inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Runs in an isolated world, which "
+            "shares the frame's DOM but not its own JavaScript variables, so use it "
+            "to read and drive the DOM rather than to call the page's own functions. "
+            "Ignored when `args` is given, since a uid already carries its frame."
         )),
     ] = "",
     args: Annotated[
@@ -2601,7 +2774,7 @@ async def evaluate_script(
             expr = function.strip()
             if expr.startswith("(") or expr.startswith("function") or expr.startswith("async"):
                 expr = f"({expr})()"
-            result = await _evaluate_value(tab, expr, await_promise=True)
+            result = await _evaluate_value(tab, expr, await_promise=True, frame=frame)
             return _deliver(result)
     except Exception as e:
         return f"Error: {e}"
@@ -4073,6 +4246,15 @@ async def take_snapshot(
             "for very large pages you intend to search rather than read in full."
         )),
     ] = "",
+    include_frames: Annotated[
+        bool,
+        Field(description=(
+            "Also read the page's iframes and splice each one in under the element "
+            "that hosts it. On by default, because Chrome's accessibility tree stops "
+            "at a frame boundary and anything inside an iframe would otherwise be "
+            "invisible. Set false on a page with many frames to keep the output small."
+        )),
+    ] = True,
 ) -> str:
     """Read the page as compact text, with a uid for every element.
 
@@ -4089,14 +4271,58 @@ async def take_snapshot(
     page change can invalidate them. Whenever a tool reports "unknown uid", take
     a fresh snapshot and use the new uid. Output is capped at 200 000 characters.
 
+    Frames are included and marked, so an element inside an iframe gets a uid like
+    any other and click, fill and evaluate_script work on it unchanged.
+
     For plain page text without uids, get_page_content is cheaper; to find
     elements by CSS selector, use query_selector.
     """
     global _snapshot_id
     tab = await _active_tab()
     import nodriver.cdp.accessibility as cdp_a11y
+    import nodriver.cdp.dom as cdp_dom
+    import nodriver.cdp.page as cdp_page
 
-    nodes = await tab.send(cdp_a11y.get_full_ax_tree())
+    nodes = list(await tab.send(cdp_a11y.get_full_ax_tree()))
+
+    # Chrome builds its AXObjectCache lazily, so a snapshot taken the instant a
+    # navigation returns yields exactly one node with no children — and the tool
+    # cannot tell that from a genuinely empty page. Give it a moment and ask again
+    # rather than reporting a blank document.
+    if len(nodes) <= 1:
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            retry = list(await tab.send(cdp_a11y.get_full_ax_tree()))
+            if len(retry) > 1:
+                nodes = retry
+                break
+
+    # Chrome's AX tree stops at every frame boundary, so an iframe used to appear
+    # as a childless node and everything inside it — payment fields, consent
+    # walls, embedded editors — was unreachable. getFullAXTree takes a frame_id,
+    # so each frame's tree is fetched and spliced under the node that owns it.
+    #
+    # uids need no special handling: this server disables site isolation, so a
+    # child frame's backendNodeIds resolve through the same session, and click,
+    # fill and evaluate_script work on them unchanged.
+    frame_roots: dict[str, list] = {}
+    if include_frames:
+        try:
+            for entry in (await _frame_list(tab))[1:]:
+                try:
+                    sub = list(await tab.send(
+                        cdp_a11y.get_full_ax_tree(frame_id=cdp_page.FrameId(entry["frame_id"]))
+                    ))
+                except Exception:
+                    continue
+                if not sub:
+                    continue
+                child_ids = {c for n in sub for c in (n.child_ids or [])}
+                roots = [n.node_id for n in sub if n.node_id not in child_ids]
+                nodes.extend(sub)
+                frame_roots[entry["frame_id"]] = roots
+        except Exception:
+            pass
 
     # Build a lookup: node_id -> AXNode
     node_map: dict[str, Any] = {}
@@ -4112,6 +4338,27 @@ async def take_snapshot(
             children_map[node.node_id] = list(node.child_ids)
             for cid in node.child_ids:
                 nodes_with_parent.add(cid)
+
+    # Attach each frame's tree to the <iframe> that owns it, so the result is one
+    # document rather than several disconnected ones. DOM.getFrameOwner gives the
+    # owning element's backendNodeId, which the parent tree already carries.
+    if frame_roots:
+        backend_to_ax: dict[Any, str] = {}
+        for node in nodes:
+            backend = getattr(node, "backend_dom_node_id", None)
+            if backend is not None:
+                backend_to_ax.setdefault(backend, node.node_id)
+        for frame_id, roots in frame_roots.items():
+            try:
+                owner = await tab.send(cdp_dom.get_frame_owner(cdp_page.FrameId(frame_id)))
+                backend_id = owner[0] if isinstance(owner, tuple) else owner
+                owner_ax = backend_to_ax.get(backend_id)
+            except Exception:
+                owner_ax = None
+            if owner_ax is None:
+                continue
+            children_map.setdefault(owner_ax, []).extend(roots)
+            nodes_with_parent.update(roots)
 
     for node in nodes:
         if node.node_id not in nodes_with_parent:
@@ -4837,6 +5084,17 @@ async def get_page_content(
             "to capture a large page without flooding the conversation."
         )),
     ] = "",
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Read inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Chrome's DOM queries never cross a "
+            "frame boundary, so anything inside an iframe is unreachable without "
+            "this. The frame is read through an isolated world, which shares the DOM "
+            "but not the page's own JavaScript variables. Empty string reads the main "
+            "document."
+        )),
+    ] = "",
 ) -> str:
     """Get the page's visible text, or its full HTML.
 
@@ -4852,19 +5110,20 @@ async def get_page_content(
     """
     tab = await _active_tab()
     if format == "html":
-        content = await _evaluate_value(tab, "document.documentElement.outerHTML")
+        content = await _evaluate_value(tab, "document.documentElement.outerHTML", frame=frame)
     else:
         # A <frameset> page has no body, and document.body.innerText would be ''
         # — indistinguishable from a blank page. Fall back to documentElement and
         # say so when the text is empty but frames are present.
         content = await _evaluate_value(
-            tab, "(document.body || document.documentElement || {}).innerText || ''"
+            tab, "(document.body || document.documentElement || {}).innerText || ''",
+            frame=frame,
         )
     content = content or ""
     if format == "text" and not content.strip():
         try:
             frames = await _evaluate_value(
-                tab, "document.querySelectorAll('frame,iframe').length"
+                tab, "document.querySelectorAll('frame,iframe').length", frame=frame
             )
         except Exception:
             frames = 0
@@ -4894,6 +5153,17 @@ async def query_selector(
     limit: Annotated[
         int, Field(gt=0, description="Maximum number of matching elements to return.")
     ] = 20,
+    frame: Annotated[
+        str,
+        Field(description=(
+            "Read inside one of the page's frames instead of the main document: an "
+            "index or frame id from list_frames. Chrome's DOM queries never cross a "
+            "frame boundary, so anything inside an iframe is unreachable without "
+            "this. The frame is read through an isolated world, which shares the DOM "
+            "but not the page's own JavaScript variables. Empty string reads the main "
+            "document."
+        )),
+    ] = "",
 ) -> str:
     """Find elements by CSS selector; list their tag, text, href, id and class.
 
@@ -4918,7 +5188,7 @@ async def query_selector(
         "})))" % (sel, int(limit))
     )
     try:
-        raw = await _evaluate_value(tab, expr)
+        raw = await _evaluate_value(tab, expr, frame=frame)
         items = json.loads(raw) if raw else []
     except Exception as e:
         return f"Error querying '{selector}': {e}"

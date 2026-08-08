@@ -38,7 +38,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "scroll_to_selector", "resize_page",
     ]),
     ("Reading the page", [
-        "take_snapshot", "take_screenshot", "get_page_content", "query_selector",
+        "take_snapshot", "take_screenshot", "get_page_content", "query_selector", "list_frames",
         "evaluate_script", "get_computed_styles", "save_pdf",
     ]),
     ("Network & console", [

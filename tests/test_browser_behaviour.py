@@ -574,3 +574,87 @@ def test_websocket_traffic_is_captured_with_its_frames():
         assert detail.count("audit-one") == 2, f"expected it sent and echoed:\n{detail}"
 
     _run(scenario)
+
+
+_FRAME_PAGE = (
+    "data:text/html,<h1 style='margin:0;padding:40px'>Host</h1>"
+    "<iframe style='margin-left:80px;width:400px;height:200px' "
+    "srcdoc=\"<input type=checkbox aria-label=InnerBox>"
+    "<input aria-label=InnerField><p>InnerText</p>\"></iframe>"
+)
+
+
+def test_frames_are_readable_and_listed():
+    """Regression: iframe content was unreachable by every reader.
+
+    take_snapshot called getFullAXTree with no frame_id, which stops at the frame
+    boundary, and document.querySelector never crosses one — so a payment field, a
+    consent wall or an embedded editor simply did not exist as far as the server
+    was concerned. get_page_content returned '' for a frameset, which is
+    indistinguishable from a blank page.
+    """
+
+    async def scenario():
+        await _call("new_page", url=_FRAME_PAGE)
+
+        frames = await _call("list_frames")
+        assert "2 frames" in frames, frames
+
+        snap = await _call("take_snapshot")
+        # Assert on tree lines, not on the whole text: the root line echoes the
+        # data: URL, whose srcdoc attribute mentions every inner element by name.
+        assert re.search(r'uid=\S+ textbox "InnerField"', snap), (
+            f"iframe content missing from the snapshot:\n{snap}"
+        )
+        # And it is nested under the frame, not appended as a second document.
+        assert re.search(r"Iframe\n\s+uid=\S+ RootWebArea", snap), (
+            f"the frame's tree was not spliced under its owner:\n{snap}"
+        )
+
+        assert "InnerText" in await _call("get_page_content", frame="1")
+        assert "InnerText" not in await _call("get_page_content")
+        assert "input" in await _call("query_selector", selector="input", frame="1")
+
+        off = await _call("take_snapshot", include_frames=False)
+        assert not re.search(r'uid=\S+ textbox "InnerField"', off), (
+            f"include_frames=False still read the frame:\n{off}"
+        )
+        assert "Iframe" in off, f"the frame's own node should still be listed:\n{off}"
+
+    _run(scenario)
+
+
+def test_trusted_input_reaches_an_element_inside_a_frame():
+    """A click is delivered by viewport coordinate, but the hit test necessarily
+    runs in the element's own document — so for anything inside an iframe the point
+    was frame-relative while the click was top-level, and it landed elsewhere while
+    reporting success. The offset is measured and added back.
+    """
+
+    async def scenario():
+        await _call("new_page", url=_FRAME_PAGE)
+        snap = await _call("take_snapshot")
+        box = re.search(r'uid=(\S+) checkbox "InnerBox"', snap).group(1)
+
+        result = await _call("set_checked", uid=box, checked=True)
+        assert "now checked" in result, f"input did not reach the frame:\n{result}"
+        state = await _call(
+            "evaluate_script", frame="1",
+            function="() => String(document.querySelector('input[type=checkbox]').checked)",
+        )
+        assert "true" in state.lower(), f"the checkbox did not change:\n{state}"
+
+        # Keyboard-driven fill works inside the frame too.
+        field = re.search(r'uid=(\S+) textbox "InnerField"', snap).group(1)
+        assert "Error" not in await _call("fill", uid=field, value="typed-in-frame")
+        value = await _call(
+            "evaluate_script", frame="1",
+            function="() => document.querySelector('input:not([type=checkbox])').value",
+        )
+        assert "typed-in-frame" in value, value
+
+        # The main document must still be clickable at unshifted coordinates.
+        heading = re.search(r"uid=(\S+) heading", snap).group(1)
+        assert "Clicked" in await _call("click", uid=heading)
+
+    _run(scenario)
