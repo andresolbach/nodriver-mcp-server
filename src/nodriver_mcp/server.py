@@ -466,7 +466,7 @@ _preserved_console_messages: list[list[dict]] = []  # last 3 navigations
 _preserved_network_requests: list[list[dict]] = []  # last 3 navigations
 _tracing_active = False
 _network_collection_enabled_tabs: set[tuple] = set()  # (target_id, session_id) with Network enabled
-_network_handler_targets: set = set()  # targets whose RequestWillBeSent handler is installed
+_network_handler_targets: set[int] = set()  # id(tab) of tabs whose request handler is installed
 _console_collection_enabled_tabs: set[int] = set()  # track which tabs have console collection enabled
 _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered, so we can remove them
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
@@ -602,13 +602,23 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
     """
     import nodriver.cdp.network as cdp_net
 
-    session_key = (getattr(tab, "target_id", None), getattr(tab, "session_id", None))
+    session_id = getattr(tab, "session_id", None)
+    if not session_id:
+        # No session yet: tab.send would go to the browser-level connection and
+        # enable Network there instead. That scope stays enabled, so once the page
+        # session is enabled too, Chrome reports every request twice and
+        # nodriver's dispatcher — which ignores sessionId — delivers both. Skip;
+        # the next call, after the attach, does it on the right session.
+        return
+    session_key = (getattr(tab, "target_id", None), session_id)
     if session_key in _network_collection_enabled_tabs:
         return
     _network_collection_enabled_tabs.add(session_key)
-    # The event handler belongs to the target, not the session: adding it again
-    # after a session change would record every request twice.
-    needs_handler = getattr(tab, "target_id", None) not in _network_handler_targets
+    # The handler belongs to the Tab object, not the session: adding it again
+    # after a session change records every later request twice. id(tab) is the
+    # right key here for the same reason it was the wrong one for the enable —
+    # it tracks the object the handler is attached to, not the session state.
+    needs_handler = id(tab) not in _network_handler_targets
 
     async def _on_request(event: cdp_net.RequestWillBeSent):
         global _request_counter
@@ -646,7 +656,7 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         )
         if needs_handler:
             tab.add_handler(cdp_net.RequestWillBeSent, _on_request)
-            _network_handler_targets.add(getattr(tab, "target_id", None))
+            _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
 

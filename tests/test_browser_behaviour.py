@@ -339,3 +339,29 @@ def test_a_navigation_that_fails_is_reported_as_a_failure():
         assert "Not Found" in await _call("get_page_content", max_chars=200)
 
     _run(scenario)
+
+
+def test_one_request_is_recorded_once():
+    """The Network.enable guard is keyed on the session, the handler on the tab.
+
+    Getting that the wrong way round records every later request twice: enabling
+    per session is what makes response bodies available, but re-adding the event
+    handler each time duplicates the log.
+    """
+
+    async def scenario():
+        await _call("new_page", url="https://httpbingo.org/")
+        # get_network_request also ensures the domain is live, which is the second
+        # place a duplicate handler could be installed from.
+        await _call("evaluate_script", function="async () => (await fetch('/uuid')).status")
+        await asyncio.sleep(0.4)
+        await _call("get_network_request")
+        await _call("evaluate_script", function="async () => (await fetch('/ip')).status")
+        await asyncio.sleep(0.4)
+
+        listing = await _call("list_network_requests", resource_types=["Fetch"])
+        for path in ("/uuid", "/ip"):
+            hits = len(re.findall(rf"GET \S+{re.escape(path)}\b", listing))
+            assert hits == 1, f"{path} recorded {hits} times:\n{listing}"
+
+    _run(scenario)
