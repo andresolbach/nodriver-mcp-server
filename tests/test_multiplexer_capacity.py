@@ -247,3 +247,39 @@ def test_a_correct_call_is_untouched():
             assert not result.isError, mux._text(result)
 
     asyncio.run(scenario())
+
+
+def test_a_failing_tool_is_marked_as_an_error():
+    """Regression: a tool that failed returned its message as an ordinary result.
+
+    MCP has `isError` for exactly this, and without it a failure was
+    indistinguishable from page data — a client could not tell "the element is
+    covered, nothing was clicked" from the text of a page that happens to say so.
+    The message still reaches the model in full; the flag is what was missing.
+    """
+
+    async def scenario():
+        # A preset that does not exist: an honest "I could not", not a bad
+        # argument. It is refused before a browser is ever needed, which is what
+        # lets this run on a CI box with no Chrome — the browser-level version of
+        # this assertion lives in test_browser_behaviour.
+        result = await mux.call_tool("emulate_device", {"device": "nokia_3310"})
+        text = mux._text(result)
+
+        assert result.isError, f"a failed call was reported as success:\n{text}"
+        # And the reason still has to be readable, not swallowed by the flag.
+        assert "nokia_3310" in text, text
+        assert "pixel_7" in text, "the failure must name the presets that do exist"
+
+    asyncio.run(scenario())
+
+
+def test_a_succeeding_tool_is_not_marked_as_an_error():
+    """The flag has to mean something: setting it on ordinary results would make
+    it noise, and page text containing the word "Error" must never trip it."""
+
+    async def scenario():
+        result = await mux.call_tool("list_browsers", {})
+        assert not result.isError, mux._text(result)
+
+    asyncio.run(scenario())

@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from nodriver_mcp.server import mcp
 
 pytestmark = pytest.mark.slow
@@ -29,7 +31,12 @@ async def _call(tool, /, **arguments) -> str:
     Positional-only, so a tool argument called `name` (set_cookie, save_session)
     does not collide with this function's own parameter.
     """
-    result = await mcp.call_tool(tool, arguments)
+    try:
+        result = await mcp.call_tool(tool, arguments)
+    except ToolError as e:
+        # A failing tool raises now, so that the routing layer can mark the
+        # result isError. The text is the same; these tests still assert on it.
+        return str(e)
     # Every tool here declares an output schema, so FastMCP hands back a
     # (content, structured) pair rather than content alone.
     if isinstance(result, tuple):
@@ -907,3 +914,27 @@ def test_a_proxy_without_credentials_needs_no_fetch_domain():
         assert server._proxy_config == {}
 
     asyncio.run(scenario())
+
+
+def test_page_text_that_says_error_is_not_a_failed_call():
+    """The isError flag comes from the tool, never from reading the answer.
+
+    The tempting shortcut — flag anything whose text starts with "Error" — breaks
+    exactly here: a page is free to say that, and marking a successful read as a
+    failed call would be a new lie in place of the old one.
+    """
+    from nodriver_mcp import multiplexer as mux
+
+    async def scenario():
+        await _call("new_page", url="data:text/html,<p>Error: the site is down</p>")
+        result = await mux.call_tool("get_page_content", {})
+
+        assert not result.isError, "reading a page that says Error was flagged as a failure"
+        assert "Error: the site is down" in mux._text(result)
+
+        # And a genuine failure on the same browser still is flagged.
+        failed = await mux.call_tool("click", {"uid": "999_999"})
+        assert failed.isError
+        assert "unknown uid" in mux._text(failed)
+
+    _run(scenario)

@@ -659,8 +659,9 @@ Without `args` the function runs at page level in the main world. With
 operate on one specific element from a snapshot.
 
 Return values must be JSON-serialisable — DOM nodes, functions and circular
-structures are not, so map them to plain values inside the function. Errors
-are returned as a string beginning with "Error:" rather than raised.
+structures are not, so map them to plain values inside the function. A script
+that throws comes back as a failed call carrying the JavaScript error, not as
+a result you have to inspect for the word "Error".
 
 Pass script_path to run a function kept in a .js file, and file_path to write
 the result to disk instead of into the conversation.

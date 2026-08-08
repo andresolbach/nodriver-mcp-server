@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.3.0 — a failed call now says so
+
+MCP has an `isError` flag on a tool result, and this server never set it. Around
+seventy failure paths returned their message as an ordinary, successful
+result — so "the element is covered, nothing was clicked" was, to a client,
+indistinguishable from the text of a page that happens to say that. The model
+always saw the message; what was missing was any way for anything else to tell a
+failure from data.
+
+Those paths raise now, and the routing layer marks the result. **The message is
+unchanged and still reaches the model in full**, prefixed by MCP's own
+"Error executing tool <name>:".
+
+The flag comes from the tool, never from reading its answer. Flagging anything
+whose text begins with "Error" would have been a line of code instead of seventy
+edits, and it breaks the moment a page says that about itself — which is a new
+lie in place of the old one. There is a test for exactly that case.
+
+What did not change: a bad *argument* is still rejected by the router before it
+reaches a tool, and expected-but-empty answers — no elements match, no console
+messages — are still ordinary results. "Found nothing" is not a failure.
+
+Tool count: 65 -> 65.
+
 ## 2.2.0 — a proxy you can actually authenticate to
 
 `set_proxy` routes a browser through a proxy, with credentials when it wants

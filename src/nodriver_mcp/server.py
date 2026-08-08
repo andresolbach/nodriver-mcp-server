@@ -350,6 +350,20 @@ mcp = FastMCP(
 )
 
 
+class ToolFailure(Exception):
+    """A tool tried to do its job and could not.
+
+    Raised rather than returned, because MCP's `isError` is what tells a client
+    that a call failed — and returning the failure as an ordinary result made it
+    indistinguishable from page data. The message still reaches the model in
+    full; the flag is what was missing.
+
+    It is not for a bad argument, which never reaches the tool: the router
+    rejects those. It is for the honest "I could not": an element that is
+    covered, a selector that matches nothing, a proxy that refuses.
+    """
+
+
 def tool(
     *,
     title: str,
@@ -1938,7 +1952,7 @@ async def list_frames() -> str:
     try:
         frames = await _frame_list(tab)
     except Exception as e:
-        return f"Error listing frames: {e}"
+        raise ToolFailure(f"Listing frames: {e}")
     if len(frames) == 1:
         return "1 frame (the main document); this page has no iframes."
     lines = [f"{len(frames)} frames:"]
@@ -2183,8 +2197,8 @@ async def cf_verify() -> str:
     page and finds no challenge at all.
     """
     if importlib.util.find_spec("cv2") is None:
-        return (
-            "Error: cf_verify needs opencv, which is not installed. Install it with "
+        raise ToolFailure(
+            "cf_verify needs opencv, which is not installed. Install it with "
             "`pip install nodriver-mcp[cf]` (or `pip install opencv-python`). "
             "Everything else in this server works without it — and a Cloudflare "
             "interstitial often clears on its own, so try "
@@ -2222,7 +2236,7 @@ async def cf_verify() -> str:
             await tab.verify_cf()
             return "Cloudflare verification attempted. Check the page before continuing."
         except Exception as e:
-            return f"Error: {e}"
+            raise ToolFailure(f"{e}")
         finally:
             try:
                 os.chdir(previous)
@@ -2557,11 +2571,11 @@ async def click(
 
     tab = await _active_tab()
     if uid not in _uid_to_backend_node_id:
-        return f"Error clicking uid={uid}: unknown uid. Take a new snapshot first."
+        raise ToolFailure(f"Clicking uid={uid}: unknown uid. Take a new snapshot first.")
     try:
         remote_obj = await _as_element(tab, await _resolve_uid(tab, uid))
     except ValueError as e:
-        return f"Error clicking uid={uid}: {e}"
+        raise ToolFailure(f"Clicking uid={uid}: {e}")
 
     # CDP input is the default: those events arrive as isTrusted, which is the
     # whole point of an undetected driver. Two cases need the scripted
@@ -2584,8 +2598,8 @@ async def click(
         point = await _clickable_point(tab, remote_obj)
         if isinstance(point, str):
             if if_covered == "report":
-                return (
-                    f"Error clicking uid={uid}: {point}, so a real mouse click would land "
+                raise ToolFailure(
+                    f"Clicking uid={uid}: {point}, so a real mouse click would land "
                     "somewhere else. Nothing was clicked. Dismiss "
                     "or scroll past whatever is in the way and try again, or pass "
                     'if_covered="synthetic_click" to click it anyway — that works '
@@ -2612,12 +2626,12 @@ async def click(
                 _scripted_click(tab, uid, dbl_click), timeout=_CLICK_TIMEOUT_S
             )
         except asyncio.TimeoutError:
-            return (
-                f"Error clicking uid={uid}: {fallback_reason}, and the scripted click "
+            raise ToolFailure(
+                f"Clicking uid={uid}: {fallback_reason}, and the scripted click "
                 f"timed out too after {_CLICK_TIMEOUT_S:g}s (page busy or connection wedged)"
             )
         except Exception as e:
-            return f"Error clicking uid={uid}: {fallback_reason}; scripted click also failed: {e}"
+            raise ToolFailure(f"Clicking uid={uid}: {fallback_reason}; scripted click also failed: {e}")
 
     result = f"Clicked uid={uid}"
     if fallback_reason:
@@ -2721,13 +2735,13 @@ async def click_at(
                 _scripted_click_at(tab, x, y, dbl_click), timeout=_CLICK_TIMEOUT_S
             )
         except asyncio.TimeoutError:
-            return (
-                f"Error clicking at ({x}, {y}): {fallback_reason}, and the scripted click "
+            raise ToolFailure(
+                f"Clicking at ({x}, {y}): {fallback_reason}, and the scripted click "
                 f"timed out too after {_CLICK_TIMEOUT_S:g}s (page busy or connection wedged)"
             )
         except Exception as e:
-            return (
-                f"Error clicking at ({x}, {y}): {fallback_reason}; "
+            raise ToolFailure(
+                f"Clicking at ({x}, {y}): {fallback_reason}; "
                 f"scripted click also failed: {e}"
             )
 
@@ -2760,12 +2774,12 @@ async def close_page(
     global _selected_target_id
     browser = await _get_browser()
     if len(browser.tabs) <= 1:
-        return "Error: Cannot close the last open page."
+        raise ToolFailure("Cannot close the last open page.")
     if page_id == -1:
         tab = await _active_tab()
     else:
         if page_id < 0 or page_id >= len(browser.tabs):
-            return f"Error: Invalid page_id {page_id}, have {len(browser.tabs)} tabs."
+            raise ToolFailure(f"Invalid page_id {page_id}, have {len(browser.tabs)} tabs.")
         tab = browser.tabs[page_id]
     if tab.target and str(tab.target.target_id) == _selected_target_id:
         _selected_target_id = None
@@ -2845,8 +2859,8 @@ async def drag(
                 pass
             point = await _clickable_point(tab, remote_obj)
             if isinstance(point, str):
-                return (
-                    f"Error dragging: uid={uid} cannot be reached — {point}. "
+                raise ToolFailure(
+                    f"Dragging: uid={uid} cannot be reached — {point}. "
                     "Nothing was dragged."
                 )
             points.append(point)
@@ -2869,7 +2883,7 @@ async def drag(
         result += await _maybe_snapshot(include_snapshot)
         return result
     except Exception as e:
-        return f"Error dragging: {e}"
+        raise ToolFailure(f"Dragging: {e}")
 
 
 @tool(title="Emulate page conditions", idempotent=True)
@@ -2969,7 +2983,7 @@ async def emulate_device(
     """
     if _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
-        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+        raise ToolFailure(f"Unknown device preset '{device}'. Supported presets: {supported}")
 
     tab = await _active_tab()
     device_results = await _apply_device_preset(tab, device)
@@ -3118,22 +3132,23 @@ async def evaluate_script(
     operate on one specific element from a snapshot.
 
     Return values must be JSON-serialisable — DOM nodes, functions and circular
-    structures are not, so map them to plain values inside the function. Errors
-    are returned as a string beginning with "Error:" rather than raised.
+    structures are not, so map them to plain values inside the function. A script
+    that throws comes back as a failed call carrying the JavaScript error, not as
+    a result you have to inspect for the word "Error".
 
     Pass script_path to run a function kept in a .js file, and file_path to write
     the result to disk instead of into the conversation.
     """
     if script_path:
         if function.strip():
-            return "Error: pass either function or script_path, not both."
+            raise ToolFailure("Pass either function or script_path, not both.")
         try:
             with open(script_path, encoding="utf-8") as fh:
                 function = fh.read()
         except OSError as e:
-            return f"Error reading {script_path}: {e}"
+            raise ToolFailure(f"Reading {script_path}: {e}")
     if not function.strip():
-        return "Error: nothing to run — provide function or script_path."
+        raise ToolFailure("Nothing to run — provide function or script_path.")
 
     def _deliver(value: Any) -> str:
         payload = json.dumps(value, default=str)
@@ -3142,7 +3157,7 @@ async def evaluate_script(
                 with open(file_path, "w", encoding="utf-8") as fh:
                     fh.write(payload)
             except OSError as e:
-                return f"Error writing {file_path}: {e}"
+                raise ToolFailure(f"Writing {file_path}: {e}")
             return f"Result ({len(payload)} chars) written to {file_path}."
         return f"```json\n{payload}\n```"
 
@@ -3179,7 +3194,7 @@ async def evaluate_script(
             result = await _evaluate_value(tab, expr, await_promise=True, frame=frame)
             return _deliver(result)
     except Exception as e:
-        return f"Error: {e}"
+        raise ToolFailure(f"{e}")
 
 
 @tool(title="Fill input", open_world=True)
@@ -3219,7 +3234,7 @@ async def fill(
         result += await _maybe_snapshot(include_snapshot)
         return result
     except Exception as e:
-        return f"Error filling uid={uid}: {e}"
+        raise ToolFailure(f"Filling uid={uid}: {e}")
 
 
 class FormField(BaseModel):
@@ -3320,13 +3335,13 @@ async def set_checked(
         info = probe.value if probe and isinstance(probe.value, dict) else None
         if not info or info.get("type") not in ("checkbox", "radio"):
             found = (info or {}).get("type") or (info or {}).get("tag") or "unknown"
-            return (
-                f"Error: uid={uid} is not a checkbox or radio (it is {found}). "
+            raise ToolFailure(
+                f"uid={uid} is not a checkbox or radio (it is {found}). "
                 "Use fill for text fields, select_option for a <select>, or click "
                 "for anything else."
             )
         if info.get("disabled"):
-            return f"Error: uid={uid} is disabled, so its state cannot be changed."
+            raise ToolFailure(f"Uid={uid} is disabled, so its state cannot be changed.")
 
         field_type = str(info["type"])
         before = await _read_field(tab, remote_obj, field_type) == "true"
@@ -3336,8 +3351,8 @@ async def set_checked(
                 "nothing to do."
             ) + await _maybe_snapshot(include_snapshot)
         if field_type == "radio" and not checked:
-            return (
-                f"Error: a radio button cannot be unchecked directly. Call "
+            raise ToolFailure(
+                f"a radio button cannot be unchecked directly. Call "
                 f"set_checked on another radio in the same group instead."
             )
 
@@ -3362,23 +3377,23 @@ async def set_checked(
                 if not isinstance(label_point, str):
                     target, point, note = label, label_point, " (clicked its label)"
         if isinstance(point, str):
-            return (
-                f"Error: cannot click uid={uid}: {point}. Dismiss whatever is in "
+            raise ToolFailure(
+                f"cannot click uid={uid}: {point}. Dismiss whatever is in "
                 "the way, or scroll it into view, and try again."
             )
 
         await _cdp_click(tab, target, point[0], point[1], False)
         after = await _read_field(tab, remote_obj, field_type) == "true"
         if after != checked:
-            return (
-                f"Error: uid={uid} is still {'unchecked' if checked else 'checked'} "
+            raise ToolFailure(
+                f"uid={uid} is still {'unchecked' if checked else 'checked'} "
                 "after the click. Something may be intercepting it, or the page "
                 "resets the control."
             )
         state = "checked" if checked else "unchecked"
         return f"uid={uid} is now {state}{note}." + await _maybe_snapshot(include_snapshot)
     except Exception as e:
-        return f"Error setting uid={uid}: {e}"
+        raise ToolFailure(f"Setting uid={uid}: {e}")
 
 
 @tool(title="Choose a select option", open_world=True)
@@ -3413,12 +3428,12 @@ async def select_option(
         info = probe.value if probe and isinstance(probe.value, dict) else None
         if not info or info.get("tag") != "select":
             found = (info or {}).get("tag") or "unknown"
-            return (
-                f"Error: uid={uid} is not a <select> (it is <{found}>). Use "
+            raise ToolFailure(
+                f"uid={uid} is not a <select> (it is <{found}>). Use "
                 "set_checked for checkboxes and radios, or fill for text fields."
             )
         if info.get("disabled"):
-            return f"Error: uid={uid} is disabled, so no option can be chosen."
+            raise ToolFailure(f"Uid={uid} is disabled, so no option can be chosen.")
 
         note = await _set_select_value(tab, remote_obj, option)
         chosen = await _read_field(tab, remote_obj)
@@ -3427,7 +3442,7 @@ async def select_option(
             + await _maybe_snapshot(include_snapshot)
         )
     except Exception as e:
-        return f"Error selecting in uid={uid}: {e}"
+        raise ToolFailure(f"Selecting in uid={uid}: {e}")
 
 
 @tool(title="Get console message", read_only=True)
@@ -3448,10 +3463,10 @@ async def get_console_message(
     """
     tab = await _active_tab()
     if id(tab) not in _console_collection_enabled_tabs:
-        return "Error: Console collection is disabled for the current page. Call enable_console_collection first."
+        raise ToolFailure("Console collection is disabled for the current page. Call enable_console_collection first.")
     match = [m for m in _all_console_messages() if m.get("seq") == msgid]
     if not match:
-        return f"Error: No console message with id {msgid}."
+        raise ToolFailure(f"No console message with id {msgid}.")
     msg = match[-1]
     return f"[{msg['type']}] {msg['text']} (timestamp: {msg['timestamp']})"
 
@@ -3559,7 +3574,7 @@ async def get_network_request(
     else:
         match = [r for r in _all_network_requests() if r.get("seq") == reqid]
         if not match:
-            return f"Error: No network request with id {reqid}."
+            raise ToolFailure(f"No network request with id {reqid}.")
         req = match[-1]
 
     lines = [f"Request #{reqid if reqid is not None else 'latest'}:"]
@@ -3685,12 +3700,12 @@ async def handle_dialog(
             await tab.send(cdp_page.handle_java_script_dialog(accept=False))
     except Exception as e:
         if pending is None:
-            return (
-                "Error: no dialog is open on this page. If one opened before the "
+            raise ToolFailure(
+                "No dialog is open on this page. If one opened before the "
                 "first navigation on this tab, it was not being tracked; the page "
                 f"may still be blocked by it. ({e})"
             )
-        return f"Error handling dialog (is one open?): {e}"
+        raise ToolFailure(f"Handling dialog (is one open?): {e}")
     _open_dialogs.pop(_target_key(tab), None)
     if pending:
         detail = f' ({pending["type"]}: "{pending["message"][:120]}")' if pending.get("message") else ""
@@ -3721,8 +3736,8 @@ async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
             pass
         point = await _clickable_point(tab, remote_obj)
         if isinstance(point, str):
-            return (
-                f"Error hovering uid={uid}: {point}, so the pointer would land on "
+            raise ToolFailure(
+                f"hovering uid={uid}: {point}, so the pointer would land on "
                 "that instead. Dismiss or scroll past whatever is in the way."
             )
         await _move_mouse(tab, point[0], point[1])
@@ -3730,7 +3745,7 @@ async def hover(uid: Uid, include_snapshot: IncludeSnapshot = False) -> str:
         result += await _maybe_snapshot(include_snapshot)
         return result
     except Exception as e:
-        return f"Error hovering uid={uid}: {e}"
+        raise ToolFailure(f"Hovering uid={uid}: {e}")
 
 
 @tool(title="List console messages", read_only=True)
@@ -4004,9 +4019,9 @@ async def navigate_page(
 
     if device and _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
-        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+        raise ToolFailure(f"Unknown device preset '{device}'. Supported presets: {supported}")
     if type == "url" and not url:
-        return "Error: URL is required for type=url."
+        raise ToolFailure("URL is required for type=url.")
 
     # Preserve current console/network messages before navigation
     _preserve_on_navigation()
@@ -4065,7 +4080,7 @@ async def navigate_page(
         suffix = f" (pre-navigation emulation: {', '.join(device_results)})" if device_results else ""
         return f"Navigated to {tab.target.url or 'about:blank'}{suffix}{note}{pages}"
     except Exception as e:
-        return f"Error: {e}"
+        raise ToolFailure(f"{e}")
     finally:
         tab.remove_handler(cdp_page.JavascriptDialogOpening, _on_javascript_dialog)
 
@@ -4117,7 +4132,7 @@ async def new_page(
     global _selected_target_id
     if device and _resolve_device_preset(device) is None:
         supported = ", ".join(sorted(_DEVICE_PRESETS))
-        return f"Error: Unknown device preset '{device}'. Supported presets: {supported}"
+        raise ToolFailure(f"Unknown device preset '{device}'. Supported presets: {supported}")
 
     browser = await _get_browser()
     previous_tab = await _active_tab()
@@ -4183,7 +4198,7 @@ async def new_page(
         verb = "Reused the empty startup tab for" if reuse_tab is not None else "Opened new page:"
         return f"{verb} {tab.target.url or 'about:blank'}{suffix}{pages}"
     except Exception as e:
-        return f"Error opening new page: {e}"
+        raise ToolFailure(f"Opening new page: {e}")
 
 
 @tool(title="Start performance trace")
@@ -4229,7 +4244,7 @@ async def performance_start_trace(
     import nodriver.cdp.tracing as cdp_tracing
 
     if _tracing_active:
-        return "Error: A trace is already running. Stop it first."
+        raise ToolFailure("A trace is already running. Stop it first.")
 
     categories = [
         "-*", "blink.console", "blink.user_timing", "devtools.timeline",
@@ -4278,7 +4293,7 @@ async def performance_stop_trace(
     import nodriver.cdp.tracing as cdp_tracing
 
     if not _tracing_active:
-        return "Error: No trace is running."
+        raise ToolFailure("No trace is running.")
 
     trace_chunks = []
 
@@ -4471,7 +4486,7 @@ async def select_page(
     global _selected_target_id
     browser = await _get_browser()
     if page_id < 0 or page_id >= len(browser.tabs):
-        return f"Error: Invalid page_id {page_id}, have {len(browser.tabs)} tabs."
+        raise ToolFailure(f"Invalid page_id {page_id}, have {len(browser.tabs)} tabs.")
     tab = browser.tabs[page_id]
     _selected_target_id = str(tab.target.target_id) if tab.target else None
     if bring_to_front:
@@ -4639,7 +4654,7 @@ async def take_screenshot(
     import nodriver.cdp.page as cdp_page
 
     if uid and full_page:
-        return "Error: Cannot use both uid and full_page together."
+        raise ToolFailure("Cannot use both uid and full_page together.")
 
     clip = None
     if uid:
@@ -4647,7 +4662,7 @@ async def take_screenshot(
             import nodriver.cdp.dom as cdp_dom
             backend_node_id = _uid_to_backend_node_id.get(uid)
             if backend_node_id is None:
-                return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+                raise ToolFailure(f"Unknown uid '{uid}'. Take a new snapshot first.")
             model = await tab.send(cdp_dom.get_box_model(
                 backend_node_id=cdp_dom.BackendNodeId(backend_node_id)
             ))
@@ -4658,7 +4673,7 @@ async def take_screenshot(
             h = max(quad[1], quad[3], quad[5], quad[7]) - y
             clip = cdp_page.Viewport(x=x, y=y, width=w, height=h, scale=1)
         except Exception as e:
-            return f"Error getting element bounds for uid={uid}: {e}"
+            raise ToolFailure(f"Getting element bounds for uid={uid}: {e}")
 
     kwargs = {"format_": format, "capture_beyond_viewport": full_page}
     if quality and format in ("jpeg", "webp"):
@@ -5131,14 +5146,14 @@ async def upload_file(
     import nodriver.cdp.dom as cdp_dom
 
     if uid not in _uid_to_backend_node_id:
-        return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+        raise ToolFailure(f"Unknown uid '{uid}'. Take a new snapshot first.")
     if not os.path.isfile(file_path):
-        return f"Error: no such file: {file_path}"
+        raise ToolFailure(f"No such file: {file_path}")
 
     try:
         remote_obj = await _resolve_uid(tab, uid)
     except ValueError as e:
-        return f"Error: {e}"
+        raise ToolFailure(f"{e}")
 
     # Chrome renders <input type=file> with an internal shadow button, and that
     # is what the accessibility tree exposes. Addressing the uid directly makes
@@ -5165,8 +5180,8 @@ async def upload_file(
         object_id=remote_obj.object_id,
     )
     if located is None or not getattr(located, "object_id", None):
-        return (
-            f"Error: uid={uid} is not a file input and none was found near it. "
+        raise ToolFailure(
+            f"uid={uid} is not a file input and none was found near it. "
             'Locate it with query_selector("input[type=file]") and use that element.'
         )
 
@@ -5176,7 +5191,7 @@ async def upload_file(
             object_id=located.object_id,
         ))
     except Exception as e:
-        return f"Error attaching {file_path}: {e}"
+        raise ToolFailure(f"Attaching {file_path}: {e}")
 
     # Read it back: the page's own JS may consume and reset the input, which is
     # a successful upload, but an empty input plus no reaction is not.
@@ -5666,7 +5681,7 @@ async def query_selector(
         raw = await _evaluate_value(tab, expr, frame=frame)
         items = json.loads(raw) if raw else []
     except Exception as e:
-        return f"Error querying '{selector}': {e}"
+        raise ToolFailure(f"Querying '{selector}': {e}")
     if not items:
         return f"No elements match '{selector}'."
     lines = [f"{len(items)} element(s) for '{selector}':"]
@@ -5726,18 +5741,18 @@ async def get_computed_styles(
     tab = await _active_tab()
 
     if not selector and not uid:
-        return "Error: provide either selector or uid."
+        raise ToolFailure("Provide either selector or uid.")
 
     if selector:
         sel = json.dumps(selector)
         expr = f"document.querySelector({sel})"
     else:
         if uid not in _uid_to_backend_node_id:
-            return f"Error: Unknown uid '{uid}'. Take a new snapshot first."
+            raise ToolFailure(f"Unknown uid '{uid}'. Take a new snapshot first.")
         try:
             remote_obj = await _resolve_uid(tab, uid)
         except ValueError as e:
-            return f"Error: {e}"
+            raise ToolFailure(f"{e}")
         expr = None
 
     wanted = json.dumps([p.strip() for p in (properties or []) if p and p.strip()])
@@ -5781,14 +5796,14 @@ async def get_computed_styles(
             )
             raw = remote.value if remote else None
     except Exception as e:
-        return f"Error reading computed styles: {e}"
+        raise ToolFailure(f"Reading computed styles: {e}")
 
     if not raw:
         return f"No element matches '{selector or uid}'."
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
     except (TypeError, ValueError) as e:
-        return f"Error decoding computed styles: {e}"
+        raise ToolFailure(f"Decoding computed styles: {e}")
     if not isinstance(data, dict):
         return f"No element matches '{selector or uid}'."
 
@@ -5833,8 +5848,8 @@ async def scroll_to_selector(
         # Only call it a bad selector when it is one; a detached context or a
         # crashed renderer arrives here too and deserves its own words.
         if "SyntaxError" in str(e) or "not a valid selector" in str(e):
-            return f"Error: invalid selector '{selector}': {e}"
-        return f"Error scrolling to '{selector}': {e}"
+            raise ToolFailure(f"Invalid selector '{selector}': {e}")
+        raise ToolFailure(f"Scrolling to '{selector}': {e}")
     return f"Scrolled to '{selector}'." if ok else f"No element matches '{selector}'."
 
 
@@ -5939,7 +5954,7 @@ async def wait_for_selector(
             # A selector that does not parse will never start parsing, so
             # waiting out the timeout only hides the real problem.
             if "SyntaxError" in str(e) or "not a valid selector" in str(e):
-                return f"Error: invalid selector '{selector}': {e}"
+                raise ToolFailure(f"Invalid selector '{selector}': {e}")
             last_error = str(e)
         await asyncio.sleep(0.3)
     msg = f"Timeout: '{selector}' did not appear within {timeout}ms."
@@ -6257,7 +6272,7 @@ async def set_proxy(
     if server and "://" not in server:
         server = f"http://{server}"
     if password and not username:
-        return "Error: a password without a username. Pass both, or neither."
+        raise ToolFailure("A password without a username. Pass both, or neither.")
 
     _proxy_config = (
         {"server": server, "username": username, "password": password, "bypass": bypass}
@@ -6382,9 +6397,9 @@ async def manage_extensions(
         if not target:
             return 'Error: "load" needs path= pointing at the extension folder.'
         if not os.path.isdir(target):
-            return f"Error: not a directory: {target}"
+            raise ToolFailure(f"Not a directory: {target}")
         if not os.path.isfile(os.path.join(target, "manifest.json")):
-            return f"Error: no manifest.json in {target} — point at the folder that contains it."
+            raise ToolFailure(f"No manifest.json in {target} — point at the folder that contains it.")
         if target in _loaded_extensions:
             return f"Already loaded: {target}"
         _loaded_extensions.append(target)
@@ -6539,7 +6554,7 @@ async def create_profile(
     """
     safe = _safe_profile_name(name)
     if not safe:
-        return "Error: invalid profile name. Use letters, digits, '-' or '_'."
+        raise ToolFailure("Invalid profile name. Use letters, digits, '-' or '_'.")
     path = os.path.join(_PROFILES_DIR, safe)
     existed = os.path.isdir(path)
     os.makedirs(path, exist_ok=True)
@@ -6600,7 +6615,7 @@ async def use_running_browser(
     except Exception as e:
         _connect_host = _connect_port = None
         _connect_disabled = True
-        return f"Error: {e}"
+        raise ToolFailure(f"{e}")
     pages = await _format_pages()
     return (
         f"Attached to the browser running at {host}:{port}. "
@@ -6647,11 +6662,13 @@ async def use_profile(
         return await use_temp_profile()
     safe = _safe_profile_name(name)
     if not safe:
-        return "Error: invalid profile name."
+        raise ToolFailure("Invalid profile name.")
     path = os.path.join(_PROFILES_DIR, safe)
     if not os.path.isdir(path):
-        return (f"Error: profile '{safe}' does not exist. "
-                f"Create it with create_profile(\"{safe}\") or see list_profiles().")
+        raise ToolFailure(
+            f"Profile '{safe}' does not exist. "
+            f"Create it with create_profile(\"{safe}\") or see list_profiles()."
+        )
     await _restart_browser_with(path, safe)
     return f"Switched to persistent profile '{safe}' ({path}). It starts on the next action."
 
@@ -6673,12 +6690,12 @@ async def delete_profile(
     """
     safe = _safe_profile_name(name)
     if not safe:
-        return "Error: invalid profile name."
+        raise ToolFailure("Invalid profile name.")
     if _selected_profile_name == safe:
-        return f"Error: '{safe}' is the active profile. Switch away first with use_temp_profile()."
+        raise ToolFailure(f"'{safe}' is the active profile. Switch away first with use_temp_profile().")
     path = os.path.join(_PROFILES_DIR, safe)
     if not os.path.isdir(path):
-        return f"Error: profile '{safe}' does not exist."
+        raise ToolFailure(f"Profile '{safe}' does not exist.")
 
     # Chrome releases a profile directory asynchronously, so deleting right
     # after switching away from it hits files that are still open. That is a
