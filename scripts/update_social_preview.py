@@ -24,7 +24,7 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from nodriver_mcp.server import mcp  # noqa: E402
+from nodriver_mcp.multiplexer import list_tools as client_tools  # noqa: E402
 
 CARD = ROOT / "assets" / "social-preview.png"
 
@@ -62,7 +62,9 @@ def _ink_box(mask: Image.Image):
 
 
 def main() -> None:
-    count = len(asyncio.run(mcp.list_tools()))
+    # The client-visible surface, not what server.py registers: browser_status
+    # is hidden and the routing layer adds two of its own.
+    count = len(asyncio.run(client_tools()))
     label = f"{count} tools"
 
     card = Image.open(CARD).convert("RGB")
