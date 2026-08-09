@@ -952,25 +952,54 @@ def test_a_uid_does_not_survive_into_the_next_document():
     """
 
     async def scenario():
-        # No '#' anywhere: it would start the data URL's fragment and truncate
-        # the document.
-        await _call(
-            "new_page",
-            url="data:text/html,<a id=one href='https://example.org/one'>FirstLink</a>",
-        )
+        # Real documents, not data: URLs — backendNodeId recycling is what this
+        # test is about, and a data: URL is too small to reuse the ids the
+        # previous document held. The document that follows also has to be
+        # BIGGER than the one before it: the collision happens when the new
+        # document hands out the low backendNodeIds the old one was using, so
+        # navigating between two tiny pages does not reproduce it.
+        # example.com -> iana.org is the pair the bug was found on.
+        await _call("new_page", url="https://example.com")
         snapshot = await _call("take_snapshot")
         stale = await _uid(snapshot, r"uid=(\S+) link")
 
-        await _call(
-            "navigate_page",
-            url=(
-                "data:text/html,<a id=two href='https://example.org/two'>SecondLink</a>"
-                "<p>Other text</p>"
-            ),
-        )
+        await _call("click", uid=stale)
+        # Wait for the next document to actually be there: snapshotting mid
+        # navigation reads the old one back, and then the comparison below is
+        # comparing a page with itself and passes for the wrong reason.
+        waited = await _call("wait_for", text=["Example Domains"], timeout=15000)
         fresh = await _call("take_snapshot")
-        assert stale not in fresh, (
-            "the uid from the previous document was handed to a node in this one"
+        # Guard against passing vacuously: if the snapshot is still the old
+        # document, comparing it with itself proves nothing.
+        assert "iana.org" in fresh, (
+            f"never reached the second document (wait_for said {waited!r}):\n{fresh[:300]}"
+        )
+
+        # Not just the one uid: NO id from the old document may reappear. The
+        # first version of this fix keyed on the node's own frameId, which CDP
+        # sets only on a document root — so every child still shared one empty
+        # key and kept colliding, while a test that checked a single link uid
+        # passed anyway.
+        before = set(re.findall(r"uid=(\S+)", snapshot))
+        after = set(re.findall(r"uid=(\S+)", fresh))
+        assert not (before & after), (
+            f"uids carried into the next document: {sorted(before & after)}"
+        )
+
+        # The check above is the property that matters, but as a *detector* it
+        # is probabilistic: a recycled id only becomes visible when the node
+        # that inherited it also happens to be one the renderer prints. So
+        # assert the mechanism directly — every stability key must carry the
+        # current document's loader id, which is what makes a key from the
+        # previous document unmatchable.
+        from nodriver_mcp import server
+
+        loader = (await server._frame_list(await server._active_tab()))[0]["loader_id"]
+        assert loader, "no loader id for the main frame"
+        stale_keys = [k for k in server._unique_id_to_mcp_id if loader not in k]
+        assert not stale_keys, (
+            f"{len(stale_keys)} uid keys do not identify the current document, "
+            f"so ids can be inherited across a navigation: {stale_keys[:3]}"
         )
 
         out = await _call("click", uid=stale)

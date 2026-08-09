@@ -5060,7 +5060,14 @@ async def take_snapshot(
         frame_entries = await _frame_list(tab)
     except Exception:
         frame_entries = []
-    frame_loader = {e["frame_id"]: e.get("loader_id", "") for e in frame_entries}
+
+    # Which document each node came from. It has to be tracked per node rather
+    # than read off the node itself: CDP sets frameId only on the root of a
+    # document, so every child would otherwise share one empty key and collide
+    # across documents exactly as before. The tree fetched above belongs to the
+    # main frame; each spliced frame tree below is tagged with its own.
+    main_loader = frame_entries[0].get("loader_id", "") if frame_entries else ""
+    node_loader: dict[str, str] = {n.node_id: main_loader for n in nodes}
 
     frame_roots: dict[str, list] = {}
     if include_frames:
@@ -5077,6 +5084,8 @@ async def take_snapshot(
                 child_ids = {c for n in sub for c in (n.child_ids or [])}
                 roots = [n.node_id for n in sub if n.node_id not in child_ids]
                 nodes.extend(sub)
+                for n in sub:
+                    node_loader[n.node_id] = entry.get("loader_id", "")
                 frame_roots[entry["frame_id"]] = roots
         except Exception:
             pass
@@ -5136,7 +5145,7 @@ async def take_snapshot(
         # document the backendNodeIds the last one used, and a uid the agent is
         # still holding silently retargets onto an unrelated element — a click
         # that reports success and hits the wrong thing.
-        loader_id = frame_loader.get(frame_id, "")
+        loader_id = node_loader.get(node.node_id, "")
         has_identity = bool(frame_id or backend_id)
         unique_id = f"{frame_id}_{loader_id}_{backend_id}"
 
