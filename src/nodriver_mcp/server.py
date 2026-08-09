@@ -1778,7 +1778,28 @@ async def _apply_emulation(
                     f"Invalid geolocation '{geolocation}'. Expected 'latitude,longitude'."
                 )
             await tab.send(cdp_emu.set_geolocation_override(latitude=lat, longitude=lng, accuracy=1.0))
-            results.append(f"geolocation={lat},{lng}")
+
+            # The override alone is not enough: the page still has to be allowed
+            # to ask. Without the grant, permissions.query stays "prompt" and
+            # getCurrentPosition fires neither callback — it waits on a
+            # permission bubble no agent can answer, so the page hangs for good
+            # rather than failing. Granting makes the coordinates actually
+            # reachable, which is the only reason to set them.
+            try:
+                import nodriver.cdp.browser as cdp_browser
+
+                origin = await _eval_value(tab, "window.location.origin")
+                await tab.send(cdp_browser.set_permission(
+                    permission=cdp_browser.PermissionDescriptor(name="geolocation"),
+                    setting=cdp_browser.PermissionSetting.GRANTED,
+                    origin=origin if isinstance(origin, str) and origin.startswith("http") else None,
+                ))
+                results.append(f"geolocation={lat},{lng} (permission granted)")
+            except Exception:
+                results.append(
+                    f"geolocation={lat},{lng} (permission NOT granted — the page may "
+                    "hang on getCurrentPosition)"
+                )
         else:
             await tab.send(cdp_emu.clear_geolocation_override())
             results.append("geolocation=reset")

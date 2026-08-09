@@ -59,6 +59,12 @@ site and a fingerprint contradiction. A user agent on its own blanked the client
 hints to an empty brands list, which no real Chrome emits. Both are carried over
 now; clear them explicitly with the new `notouch` / `nomobile` viewport flags.
 
+**Emulated geolocation could never be read.** The coordinate override was
+applied but the permission never granted, so `permissions.query` stayed
+`"prompt"` and `getCurrentPosition` fired neither callback — it waited on a
+permission bubble no agent can answer, hanging instead of failing. The
+permission is granted along with the coordinates.
+
 **`evaluate_script` returned a DOM node as `{}`.** CDP serialises a node by value
 as an empty object, so the call looked successful and the caller concluded the
 element had no properties. It now says what came back and what to return instead.

@@ -1109,3 +1109,36 @@ def test_scroll_page_says_whether_it_moved():
             raise AssertionError("reaching the bottom was never reported")
 
     _run(scenario)
+
+
+def test_emulated_geolocation_is_actually_reachable():
+    """Regression: emulate(geolocation=...) set coordinates the page could never read.
+
+    The override was applied but the permission never granted, so
+    permissions.query stayed "prompt" and getCurrentPosition fired neither
+    callback — it waited on a permission bubble no agent can answer. The page
+    hung rather than failing, which is the worst of both.
+    """
+
+    async def scenario():
+        # A real https origin: geolocation needs a secure context, and a
+        # permission cannot be granted to a data: URL's opaque origin.
+        await _call("new_page", url="https://example.com")
+        await _call("emulate", geolocation="48.1372,11.5756")
+
+        got = await _call(
+            "evaluate_script",
+            function=(
+                "() => new Promise(res => {"
+                " const t = setTimeout(() => res('HUNG'), 5000);"
+                " navigator.geolocation.getCurrentPosition("
+                "  p => { clearTimeout(t);"
+                "    res(p.coords.latitude.toFixed(2) + ',' + p.coords.longitude.toFixed(2)); },"
+                "  e => { clearTimeout(t); res('ERR:' + e.code); });"
+                "})"
+            ),
+        )
+        assert "HUNG" not in got, f"getCurrentPosition never called back: {got!r}"
+        assert "48.14" in got and "11.58" in got, f"wrong coordinates came back: {got!r}"
+
+    _run(scenario)
