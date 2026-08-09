@@ -416,6 +416,24 @@ def _as_result(raw: Any) -> types.CallToolResult:
     return types.CallToolResult(content=list(raw))
 
 
+def _prefix_notice(result: types.CallToolResult, notice: str) -> types.CallToolResult:
+    """Put a line in front of a tool's own text, in BOTH halves of the result.
+
+    Every tool here declares an output schema, so a client reads
+    structuredContent["result"] and never sees an extra content block. Adding
+    the notice to only one half means nobody reads it.
+    """
+    structured = result.structuredContent
+    if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+        structured["result"] = f"{notice}\n{structured['result']}"
+    for block in result.content:
+        if getattr(block, "type", None) == "text":
+            block.text = f"{notice}\n{block.text}"
+            return result
+    result.content.insert(0, types.TextContent(type="text", text=notice))
+    return result
+
+
 def _error(text: str) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=text)], isError=True
@@ -765,13 +783,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
         return _error(str(e))
     result = await _call_worker(worker, name, args)
     if was_new and not result.isError:
-        result.content.insert(0, types.TextContent(
-            type="text",
-            text=(
-                f"[Started a new browser {target!r}: it has its own Chrome, profile "
-                "and cookies, and began with no tabs. If you meant one that is "
-                "already open, check the name with list_browsers.]"
-            ),
+        result = _prefix_notice(result, (
+            f"[Started a new browser {target!r}: it has its own Chrome, profile "
+            "and cookies, and began with no tabs. If you meant one that is "
+            "already open, check the name with list_browsers.]"
         ))
     return result
 

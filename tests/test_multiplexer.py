@@ -346,3 +346,41 @@ def test_shutting_down_a_browser_removes_its_temp_profile():
                 )
 
     asyncio.run(scenario())
+
+
+@pytest.mark.slow
+def test_a_new_browser_name_says_it_started_a_browser():
+    """Regression: a typo in `browser` silently spawned a second Chrome.
+
+    Creating on first use is how a second browser is meant to be opened, but
+    nothing in the response distinguished that from working in the browser you
+    meant, so the mistake surfaced much later as inexplicably empty pages.
+
+    The notice has to land in structuredContent too: every tool declares an
+    output schema, so that is the half a client actually reads.
+    """
+    import asyncio
+
+    from nodriver_mcp import multiplexer as mux
+
+    async def scenario():
+        try:
+            first = await mux.call_tool("list_pages", {"browser": "typo-probe-xyz"})
+            assert not first.isError, mux._text(first)
+            assert "Started a new browser" in mux._text(first), (
+                f"no notice in the content half: {mux._text(first)!r}"
+            )
+            structured = first.structuredContent
+            assert isinstance(structured, dict) and "Started a new browser" in structured["result"], (
+                f"no notice in the structured half, which is the one clients read: {structured!r}"
+            )
+
+            # A second call on the same name is not a new browser any more.
+            again = await mux.call_tool("list_pages", {"browser": "typo-probe-xyz"})
+            assert "Started a new browser" not in mux._text(again), (
+                "an existing browser was announced as new"
+            )
+        finally:
+            await mux.call_tool("shutdown_browser", {"browser": "typo-probe-xyz"})
+
+    asyncio.run(scenario())
