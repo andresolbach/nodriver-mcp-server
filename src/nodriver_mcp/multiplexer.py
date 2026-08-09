@@ -750,11 +750,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             text=f"No browser named {target!r} is open; nothing to close.",
         )])
 
+    # Whether this call is about to bring a whole browser into existence.
+    # Creating on first use is the intended way to open a second browser, but it
+    # also means a typo in `browser` starts a second Chrome and runs the call
+    # against a blank session — and nothing in the response used to tell that
+    # apart from working in the browser you meant. The mistake then surfaced
+    # much later, as inexplicably empty pages in the browser you thought you
+    # were driving.
+    was_new = target not in _workers
+
     try:
         worker = await _ensure_worker(target)
     except RuntimeError as e:
         return _error(str(e))
-    return await _call_worker(worker, name, args)
+    result = await _call_worker(worker, name, args)
+    if was_new and not result.isError:
+        result.content.insert(0, types.TextContent(
+            type="text",
+            text=(
+                f"[Started a new browser {target!r}: it has its own Chrome, profile "
+                "and cookies, and began with no tabs. If you meant one that is "
+                "already open, check the name with list_browsers.]"
+            ),
+        ))
+    return result
 
 
 async def _serve() -> None:

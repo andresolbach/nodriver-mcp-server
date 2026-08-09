@@ -480,6 +480,11 @@ Scroll the page up or down by a percentage of the viewport.
 The way to trigger lazy-loaded content and infinite scroll; take a fresh
 take_snapshot afterwards to see what was added.
 
+The response reports how far the page actually moved and whether the end has
+been reached, so a scroll loop has something to stop on: "did not move" means
+you are at the end, and a page height that keeps growing means more content
+is still loading.
+
 To bring one known element into view, scroll_to_selector is more precise.
 `click` already scrolls to its target, so no scrolling is needed before it.
 
@@ -775,8 +780,13 @@ Blocking stylesheets breaks layout, so anything that depends on element
 geometry becomes unreliable — click_at, element screenshots, and the
 `visible` check in wait_for_selector. Text extraction is unaffected.
 
-Applies to the current page session and stays in effect across navigations
-until called again with no types.  
+Requests are matched on the resource type Chrome reports for them, so an
+asset served from an extension-less URL is still blocked, and blocking one
+type never catches another.
+
+Applies to ONE TAB — the selected page — and stays in effect there across
+navigations until called again with no types. A tab opened afterwards with
+new_page starts unblocked and needs its own call.  
 <sub>idempotent</sub>
 
 | Parameter | Type | Required | Description |
@@ -865,7 +875,10 @@ Emulate network, CPU, geolocation, user agent, color scheme or viewport.
 
 Applies to the selected page and persists across navigations until
 reset_emulation. Every parameter is independent — pass only what you want to
-change, leave the rest at their defaults.
+change, leave the rest at their defaults. Settings already in force are
+carried over rather than dropped: a user_agent on its own keeps the client
+hints a device preset established, and a viewport on its own keeps its touch
+and mobile flags unless you clear them with `notouch` / `nomobile`.
 
 To emulate a real phone or tablet, use emulate_device instead: it sets user
 agent, client hints, viewport, DPR and touch as one coherent set, which
@@ -883,7 +896,7 @@ scripted path (`isTrusted=false`) for as long as touch is enabled.
 | `geolocation` | `string` | — | Override geolocation, as "latitude,longitude" (e.g. "37.7749,-122.4194"). Omit to leave unchanged; pass an empty string to clear a previous override. |
 | `user_agent` | `string` | — | Override the User-Agent header and navigator.userAgent. Omit to leave unchanged; pass an empty string to restore Chrome's real one. This does NOT touch UA client hints (Sec-CH-UA-*), which then contradict the spoofed UA and give the automation away — use emulate_device for mobile, it sets both consistently. |
 | `color_scheme` | `""` \| `dark` \| `light` \| `auto` | — | Emulate the prefers-color-scheme media feature. "auto" clears a previous override; empty string leaves it unchanged. |
-| `viewport` | `string` | — | Viewport override as "WIDTHxHEIGHTxDPR[,mobile][,touch][,landscape]", e.g. "375x812x3,mobile,touch" or "1920x1080x1". The trailing flags are optional: `mobile` turns on mobile viewport behaviour, `touch` enables touch emulation, `landscape` sets the screen orientation. Empty string leaves the viewport unchanged. |
+| `viewport` | `string` | — | Viewport override as "WIDTHxHEIGHTxDPR[,mobile][,touch][,landscape]", e.g. "375x812x3,mobile,touch" or "1920x1080x1". The trailing flags are optional: `mobile` turns on mobile viewport behaviour, `touch` enables touch emulation, `landscape` sets the screen orientation. Omitting `mobile` or `touch` leaves that setting as it is, so resizing after emulate_device keeps the phone's touch support; turn them off explicitly with `nomobile` / `notouch`. Empty string leaves the viewport unchanged. |
 | `browser` | `string` | — | Which browser to act on. Each name is an independent Chrome, created on first use. Omit for the shared default; parallel agents each need their own name. *(default: `default`)* |
 
 ### `emulate_device`

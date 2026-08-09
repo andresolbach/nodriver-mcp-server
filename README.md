@@ -303,7 +303,7 @@ Tools not implemented: `performance_analyze_insight` (needs the DevTools fronten
 
 ## Use cases
 
-- **Scrape sites behind Cloudflare / anti-bot** (DataDome, PerimeterX, hCaptcha challenges) without being fingerprinted or blocked.
+- **Scrape sites that reject other automation** (Cloudflare, DataDome, PerimeterX, hCaptcha) without leaking a CDP/WebDriver fingerprint. Fingerprinting is only part of what those systems weigh — IP reputation and behaviour count too — so a challenge is still possible; `cf_verify` handles a Cloudflare checkbox.
 - **Let an AI agent browse the real web** — Claude, Cursor, Windsurf and other LLM agents can log in, fill forms, click, read pages, and screenshot.
 - **Automate authenticated workflows** and reuse the login across sessions with persistent profiles.
 - **LLM-driven web research & data extraction** using compact accessibility-tree snapshots instead of brittle screenshots.
