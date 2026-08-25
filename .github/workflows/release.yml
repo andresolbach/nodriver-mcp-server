@@ -33,13 +33,32 @@ jobs:
       - name: Verify metadata
         run: uvx twine check dist/*
 
+      # A re-run of this workflow — after a failure in the registry job, or a
+      # workflow_dispatch to check the setup — must not fail merely because the
+      # version is already out. PyPI rejects any re-upload of a filename, and
+      # --check-url does not cover it: it skips a file only when the hash
+      # matches, and a wheel rebuilt on a runner is not byte-identical to the
+      # published one. So the version is checked before anything is uploaded.
+      - name: Is this version already on PyPI?
+        id: released
+        run: |
+          VERSION=$(grep -m1 '^version' pyproject.toml | sed 's/.*"\(.*\)".*/\1/')
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/nodriver-mcp/$VERSION/json")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" = "200" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is already on PyPI — skipping the upload."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is not on PyPI yet — publishing."
+          fi
+
       # No API token anywhere: `always` makes uv fail loudly if the OIDC
-      # exchange does not work, rather than falling back to asking for
-      # credentials that do not exist here. --check-url skips files already on
-      # PyPI, so re-running this on an existing version is a no-op instead of a
-      # duplicate-file error — which is what makes workflow_dispatch usable as
-      # a test of the trusted-publishing setup itself.
+      # exchange does not work, rather than quietly falling back to credentials
+      # that do not exist here. --check-url stays as the narrower guard, for a
+      # previous run that uploaded one of the two files and then died.
       - name: Publish
+        if: steps.released.outputs.skip == 'false'
         run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/nodriver-mcp/
 
   registry:
