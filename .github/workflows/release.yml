@@ -1,0 +1,79 @@
+name: Release
+
+# One workflow, because the two publishes are ordered rather than independent:
+# the MCP Registry verifies that the PyPI package exists before it accepts the
+# entry. As two tag-triggered workflows they would race and the registry half
+# would lose. `needs` is what makes the order a fact instead of a hope.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  pypi:
+    name: publish to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # the OIDC token PyPI trades for an upload token
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify metadata
+        run: uvx twine check dist/*
+
+      # No API token anywhere: `always` makes uv fail loudly if the OIDC
+      # exchange does not work, rather than falling back to asking for
+      # credentials that do not exist here. --check-url skips files already on
+      # PyPI, so re-running this on an existing version is a no-op instead of a
+      # duplicate-file error — which is what makes workflow_dispatch usable as
+      # a test of the trusted-publishing setup itself.
+      - name: Publish
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/nodriver-mcp/
+
+  registry:
+    name: publish to MCP Registry
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC, so no registry token has to be stored
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      # On a tag the tag wins, so the entry can never disagree with the release.
+      # On a manual dispatch there is no tag to read, so server.json stands as
+      # committed rather than being rewritten with a branch name.
+      - name: Pin server.json to the tagged version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+            mv server.tmp server.json
+            echo "pinned to $VERSION"
+          else
+            echo "not a tag ref — using server.json as committed"
+          fi
+          cat server.json
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish
