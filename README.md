@@ -56,7 +56,7 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 | `navigator.languages` | 4 entries |
 | User agent | no `Headless` token |
 
-**What this does and does not prove.** It shows the browser presents no automation artifacts to client-side fingerprinting, which is what these suites test and what most blocks key off. It does not prove any particular site will let you in: server-side signals such as IP reputation and request rate are outside what any driver controls, and captchas are not solved (see above). Measured on Chrome 150 / Windows 11, headful, with the default profile.
+**What this does and does not prove.** It shows the browser presents no automation artifacts to client-side fingerprinting, which is what these suites test and what most blocks key off. It does not prove any particular site will let you in: server-side signals such as IP reputation and request rate are outside what any driver controls, and captchas are not solved (see above). Measured on Chrome 151 / Windows 11, headful, with the default profile.
 
 ## Features
 
@@ -96,7 +96,7 @@ uv tool install "nodriver-mcp @ git+https://github.com/andresolbach/nodriver-mcp
 
 Also listed in the [official MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.andresolbach/nodriver-mcp-server`, so clients and marketplaces that read the registry can find and install it directly.
 
-> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.3`, which contains the Chrome 146+ CDP fixes (`sameParty` removed from `Cookie`, `privateNetworkRequestPolicy` → `localNetworkAccessRequestPolicy`) — **verified working against Chrome 150**. `pip install` also works, but `uv tool install` keeps it isolated.
+> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.3`, which contains the Chrome 146+ CDP fixes (`sameParty` removed from `Cookie`, `privateNetworkRequestPolicy` → `localNetworkAccessRequestPolicy`) — **verified working against Chrome 151**. `pip install` also works, but `uv tool install` keeps it isolated.
 
 You'll also need a local installation of **Google Chrome** (auto-detected).
 
@@ -108,12 +108,12 @@ uv tool upgrade nodriver-mcp
 
 ## Requirements & tested versions
 
-Every tool in this server was tested **end-to-end against Google Chrome 150** with **nodriver 0.50.3** on **Python 3.12.11 / Windows 11** (macOS and Linux are supported too). Because nodriver talks to Chrome directly over CDP and tracks upstream Chrome changes, it keeps working as Chrome auto-updates.
+Every tool in this server was tested **end-to-end against Google Chrome 151** with **nodriver 0.50.3** on **Python 3.12.11 / Windows 11** (macOS and Linux are supported too). Because nodriver talks to Chrome directly over CDP and tracks upstream Chrome changes, it keeps working as Chrome auto-updates.
 
 | Component | Requirement | Verified version |
 |-----------|-------------|------------------|
 | Python | 3.12+ | 3.12.11 |
-| Google Chrome | any recent stable | 150.0.7871.101 |
+| Google Chrome | any recent stable | 151.0.7922.174 |
 | Operating system | Windows / macOS / Linux | Windows 11 |
 | `nodriver` | >= 0.50.3 | 0.50.3 |
 | `mcp` (MCP SDK) | >= 1.26.0, < 2 | 1.26.0 |
@@ -340,11 +340,11 @@ A real Chrome window by default; set `NODRIVER_HEADLESS=true` for headless.
 Create a persistent profile with `create_profile` and switch to it with `use_profile`, or use `save_session` / `load_session`.
 
 **Does it work on Windows / macOS / Linux?**
-Yes, all three. Tested on Windows 11 with Chrome 150 and Python 3.12.
+Yes, all three. Tested on Windows 11 with Chrome 151 and Python 3.12.
 
 ## Changelog
 
-See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 150 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
+See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 151 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
 
 ## Credits
 
