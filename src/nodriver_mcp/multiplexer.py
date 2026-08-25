@@ -416,6 +416,24 @@ def _as_result(raw: Any) -> types.CallToolResult:
     return types.CallToolResult(content=list(raw))
 
 
+def _prefix_notice(result: types.CallToolResult, notice: str) -> types.CallToolResult:
+    """Put a line in front of a tool's own text, in BOTH halves of the result.
+
+    Every tool here declares an output schema, so a client reads
+    structuredContent["result"] and never sees an extra content block. Adding
+    the notice to only one half means nobody reads it.
+    """
+    structured = result.structuredContent
+    if isinstance(structured, dict) and isinstance(structured.get("result"), str):
+        structured["result"] = f"{notice}\n{structured['result']}"
+    for block in result.content:
+        if getattr(block, "type", None) == "text":
+            block.text = f"{notice}\n{block.text}"
+            return result
+    result.content.insert(0, types.TextContent(type="text", text=notice))
+    return result
+
+
 def _error(text: str) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=text)], isError=True
@@ -750,11 +768,27 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResul
             text=f"No browser named {target!r} is open; nothing to close.",
         )])
 
+    # Whether this call is about to bring a whole browser into existence.
+    # Creating on first use is the intended way to open a second browser, but it
+    # also means a typo in `browser` starts a second Chrome and runs the call
+    # against a blank session — and nothing in the response used to tell that
+    # apart from working in the browser you meant. The mistake then surfaced
+    # much later, as inexplicably empty pages in the browser you thought you
+    # were driving.
+    was_new = target not in _workers
+
     try:
         worker = await _ensure_worker(target)
     except RuntimeError as e:
         return _error(str(e))
-    return await _call_worker(worker, name, args)
+    result = await _call_worker(worker, name, args)
+    if was_new and not result.isError:
+        result = _prefix_notice(result, (
+            f"[Started a new browser {target!r}: it has its own Chrome, profile "
+            "and cookies, and began with no tabs. If you meant one that is "
+            "already open, check the name with list_browsers.]"
+        ))
+    return result
 
 
 async def _serve() -> None:

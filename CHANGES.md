@@ -1,5 +1,106 @@
 # Changelog
 
+## 2.4.0 — what a uid promises, and five tools that reported work they had not done
+
+Black-box testing with a fleet of agents drove every tool the way an agent
+actually drives it. Most held up. These did not, and each one failed in the same
+shape: the tool answered as though it had worked.
+
+**A uid could point into a document you never saw.** uid stability keyed on
+frame + backendNodeId, and Chrome recycles backendNodeIds per document. After a
+navigation an old uid therefore resolved to a *different, live* element:
+`click` answered `Clicked uid=1_4` and the browser went somewhere nobody asked
+for — reproduced on example.com, where a uid taken from the heading later
+clicked a link on the page that had replaced it. The key now includes the
+frame's loader id, so a uid cannot cross a document boundary.
+
+**uids were minted for nodes the snapshot never printed.** Every accessibility
+node got one, but the renderer folds many away — unnamed wrappers, text merged
+into a parent line, names repeated from the parent. Those uids stayed
+addressable, so a uid nobody had been shown resolved to an invisible node and
+`click` reported success while nothing observable happened. Only uids that
+reach the output are addressable now.
+
+Together these are why the documented rule — "unknown uid means take a fresh
+snapshot" — could not be relied on: the phrase never appeared for the commonest
+case. CDP's raw node-lookup errors are now phrased as that message too.
+
+**`block_resources` matched on how a URL was spelled.** It built globs from file
+extensions and handed them to `Network.setBlockedURLs`. On any site serving
+assets from an extension-less endpoint both halves were wrong: on Wikipedia's
+`/w/load.php`, blocking `image` also killed the stylesheets and scripts, because
+`*.ico*` matches the substring `.ico` inside `modules=skins.vector.icons` — while
+blocking `stylesheet` blocked nothing at all, because that URL contains no
+`.css`. Blocking is now matched on the resource type Chrome reports. Its scope
+was also never documented: it applies to one tab, and a tab opened afterwards
+starts unblocked.
+
+**A profile switch could lose the login it had just made.** Chrome was stopped
+with `TerminateProcess`, which runs no exit handlers. Cookies are held in memory
+and committed lazily, so switching away shortly after a login came back to an
+empty cookie jar, while localStorage — a different backend, written eagerly —
+survived and made the profile look like it had worked. The browser is now asked
+to close itself first and given time to exit.
+
+**A failed attach destroyed the browser you already had.** `use_running_browser`
+stopped the running Chrome *before* trying to connect, so a mistyped port, or
+probing 9222 to see whether anything was there, silently threw away every open
+tab. The endpoint is checked first now, and nothing is torn down until it
+answers.
+
+**`type_text` counted the characters it sent.** It reported `Typed 9 characters
+into input#password` at fields that were readonly, capped by `maxlength`, or
+never focused. It reads the value back and says what actually landed.
+
+**`emulate` parameters were not independent**, though the docstring said they
+were. A viewport on its own switched touch and the mobile flag off — leaving a
+phone-sized viewport reporting `maxTouchPoints: 0`, which is both wrong for the
+site and a fingerprint contradiction. A user agent on its own blanked the client
+hints to an empty brands list, which no real Chrome emits. Both are carried over
+now; clear them explicitly with the new `notouch` / `nomobile` viewport flags.
+
+**Emulated geolocation could never be read.** The coordinate override was
+applied but the permission never granted, so `permissions.query` stayed
+`"prompt"` and `getCurrentPosition` fired neither callback — it waited on a
+permission bubble no agent can answer, hanging instead of failing. The
+permission is granted along with the coordinates.
+
+**`evaluate_script` returned a DOM node as `{}`.** CDP serialises a node by value
+as an empty object, so the call looked successful and the caller concluded the
+element had no properties. It now says what came back and what to return instead.
+
+**`scroll_page` said the same thing at the top and at the end.** It reported
+`Scrolled down 50%` whether the page moved a screen or was already pinned, so the
+infinite-scroll loop its own description recommends had nothing to stop on. It
+reports the offsets, whether the page moved, and whether it is still growing.
+
+**`disable_console_collection` contradicted its own promise** that already
+collected messages stay readable — disabling blocked every read. Reads are
+allowed as long as something was captured.
+
+**`list_sessions` promised newest first** and sorted reverse-alphabetically by
+filename, so yesterday's `toolcheck` outranked today's `livecheck`. It sorts by
+time.
+
+**`navigate_page("javascript:...")`** reported a clean `net::ERR_ABORTED` while
+wedging the renderer; every later call then sat in the 300s CDP timeout with no
+clue why. That scheme is refused, pointing at `evaluate_script`.
+
+**`get_cookies` never showed expiry, httpOnly or sameSite** — the fields that
+decide whether a login survives a restart. It shows them.
+
+**An unknown `browser` name spawns a whole Chrome**, which is how a second
+browser is meant to be opened — but a typo did it silently and ran the call
+against a blank session. The response now says when a name brought a new browser
+into existence.
+
+The claim at the top of the server instructions was overstated: a clean
+fingerprint is not the whole of anti-bot detection, and testing hit a DataDome
+interstitial on the first request from a clean IP. It now says what it does —
+no CDP/WebDriver fingerprint — and what to do when a challenge appears anyway.
+
+Tool count: 65 → 65.
+
 ## 2.3.1 — why attaching to your own browser did not work
 
 `use_running_browser` promised the one thing Chrome no longer allows. Its

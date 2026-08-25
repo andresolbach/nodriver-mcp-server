@@ -938,3 +938,236 @@ def test_page_text_that_says_error_is_not_a_failed_call():
         assert "unknown uid" in mux._text(failed)
 
     _run(scenario)
+
+
+def test_a_uid_does_not_survive_into_the_next_document():
+    """Regression: a stale uid silently retargeted onto an unrelated element.
+
+    uid stability keyed on frame + backendNodeId, and Chrome recycles
+    backendNodeIds per document, so after a navigation an old uid could resolve
+    to a *different, live* node. Measured: a uid taken from example.com's
+    heading later clicked a link on the page that replaced it — the tool
+    answered "Clicked uid=1_4" and the browser went somewhere nobody asked for.
+    A stale uid has to be refused, not silently re-pointed.
+    """
+
+    async def scenario():
+        # Real documents, not data: URLs — backendNodeId recycling is what this
+        # test is about, and a data: URL is too small to reuse the ids the
+        # previous document held. The document that follows also has to be
+        # BIGGER than the one before it: the collision happens when the new
+        # document hands out the low backendNodeIds the old one was using, so
+        # navigating between two tiny pages does not reproduce it.
+        # example.com -> iana.org is the pair the bug was found on.
+        await _call("new_page", url="https://example.com")
+        snapshot = await _call("take_snapshot")
+        stale = await _uid(snapshot, r"uid=(\S+) link")
+
+        await _call("click", uid=stale)
+        # Wait for the next document to actually be there: snapshotting mid
+        # navigation reads the old one back, and then the comparison below is
+        # comparing a page with itself and passes for the wrong reason.
+        waited = await _call("wait_for", text=["Example Domains"], timeout=15000)
+        fresh = await _call("take_snapshot")
+        # Guard against passing vacuously: if the snapshot is still the old
+        # document, comparing it with itself proves nothing.
+        assert "iana.org" in fresh, (
+            f"never reached the second document (wait_for said {waited!r}):\n{fresh[:300]}"
+        )
+
+        # Not just the one uid: NO id from the old document may reappear. The
+        # first version of this fix keyed on the node's own frameId, which CDP
+        # sets only on a document root — so every child still shared one empty
+        # key and kept colliding, while a test that checked a single link uid
+        # passed anyway.
+        before = set(re.findall(r"uid=(\S+)", snapshot))
+        after = set(re.findall(r"uid=(\S+)", fresh))
+        assert not (before & after), (
+            f"uids carried into the next document: {sorted(before & after)}"
+        )
+
+        # The check above is the property that matters, but as a *detector* it
+        # is probabilistic: a recycled id only becomes visible when the node
+        # that inherited it also happens to be one the renderer prints. So
+        # assert the mechanism directly — every stability key must carry the
+        # current document's loader id, which is what makes a key from the
+        # previous document unmatchable.
+        from nodriver_mcp import server
+
+        loader = (await server._frame_list(await server._active_tab()))[0]["loader_id"]
+        assert loader, "no loader id for the main frame"
+        stale_keys = [k for k in server._unique_id_to_mcp_id if loader not in k]
+        assert not stale_keys, (
+            f"{len(stale_keys)} uid keys do not identify the current document, "
+            f"so ids can be inherited across a navigation: {stale_keys[:3]}"
+        )
+
+        out = await _call("click", uid=stale)
+        assert "unknown uid" in out.lower(), (
+            f"a stale uid was accepted instead of refused: {out!r}"
+        )
+
+    _run(scenario)
+
+
+def test_only_uids_you_were_shown_are_addressable():
+    """Regression: uids were minted for nodes the snapshot never printed.
+
+    Every accessibility node got a uid, but the renderer folds a lot of them
+    away — unnamed wrappers, text merged into the parent line, names repeated
+    from the parent. Those uids stayed addressable, so a uid the caller had
+    never seen resolved to some invisible node and `click` reported success
+    while nothing observable happened. A uid is a promise about something you
+    were shown.
+    """
+
+    async def scenario():
+        await _call(
+            "new_page",
+            url=(
+                "data:text/html,<div><div><span>alpha</span></div></div>"
+                "<div><p>beta</p></div><a href='#z'>OnlyLink</a>"
+            ),
+        )
+        snapshot = await _call("take_snapshot")
+        shown = set(re.findall(r"uid=(\S+)", snapshot))
+        assert shown, f"no uids in snapshot:\n{snapshot}"
+
+        # Every uid in the generation that was NOT printed must be unknown.
+        probes = set()
+        for uid in shown:
+            gen, _, counter = uid.partition("_")
+            if not counter.isdigit():
+                continue
+            for n in range(int(counter) + 1):
+                candidate = f"{gen}_{n}"
+                if candidate not in shown:
+                    probes.add(candidate)
+
+        assert probes, "nothing to probe — page was too small to fold any node"
+        for candidate in sorted(probes)[:12]:
+            out = await _call("click", uid=candidate)
+            assert "unknown uid" in out.lower(), (
+                f"uid {candidate} was never shown but is still addressable: {out!r}"
+            )
+
+    _run(scenario)
+
+
+def test_a_dom_node_return_is_reported_not_flattened():
+    """Regression: returning a DOM node came back as a successful `{}`.
+
+    CDP serialises a node by value as an empty object, so the call looked like
+    it worked and the caller concluded the element had no properties or the page
+    was broken — rather than that the script had to return a plain value.
+    """
+
+    async def scenario():
+        await _call("new_page", url="data:text/html,<h1>Heading</h1>")
+
+        out = await _call("evaluate_script", function="() => document.body")
+        assert "{}" not in out, f"a DOM node still came back as an empty object: {out!r}"
+        assert "DOM node" in out, f"the reason was not named: {out!r}"
+
+        # A plain value still works, and so does a genuinely empty object.
+        assert "Heading" in await _call(
+            "evaluate_script", function="() => document.querySelector('h1').textContent"
+        )
+        assert "{}" in await _call("evaluate_script", function="() => ({})")
+
+    _run(scenario)
+
+
+def test_type_text_reports_what_actually_landed():
+    """Regression: type_text counted the characters it sent and called it done.
+
+    It reported "Typed 9 characters into input#password" at a field that never
+    changed — readonly, capped by maxlength, or not focused at all — which is
+    the most expensive kind of wrong answer, because the caller moves on.
+    """
+
+    async def scenario():
+        await _call(
+            "new_page",
+            url=(
+                "data:text/html,<input id=ro readonly aria-label=Locked>"
+                "<input id=cap maxlength=3 aria-label=Capped>"
+            ),
+        )
+        snapshot = await _call("take_snapshot")
+
+        locked = await _uid(snapshot, r"uid=(\S+) textbox \"Locked\"")
+        await _call("click", uid=locked)
+        out = await _call("type_text", text="hello")
+        assert "did not change" in out.lower(), (
+            f"typing into a readonly field still reported plain success: {out!r}"
+        )
+
+        capped = await _uid(snapshot, r"uid=(\S+) textbox \"Capped\"")
+        await _call("click", uid=capped)
+        out = await _call("type_text", text="abcdefgh")
+        assert "accepted" in out.lower(), (
+            f"a maxlength-truncated field reported the full count: {out!r}"
+        )
+
+    _run(scenario)
+
+
+def test_scroll_page_says_whether_it_moved():
+    """Regression: scroll_page returned the same string at the top and the end.
+
+    "Scrolled down 50%." was reported whether the page moved a full screen or
+    was already pinned at the bottom, so the infinite-scroll loop its own
+    description recommends it for had nothing to terminate on.
+    """
+
+    async def scenario():
+        await _call(
+            "new_page",
+            url="data:text/html,<div style='height:4000px'>tall</div>",
+        )
+        moved = await _call("scroll_page", direction="down", amount=100)
+        assert re.search(r"y \d+ -> \d+", moved), f"no offsets reported: {moved!r}"
+        assert "did not move" not in moved, f"a real scroll was reported as stuck: {moved!r}"
+
+        for _ in range(12):
+            out = await _call("scroll_page", direction="down", amount=100)
+            if "did not move" in out:
+                break
+        else:
+            raise AssertionError("reaching the bottom was never reported")
+
+    _run(scenario)
+
+
+def test_emulated_geolocation_is_actually_reachable():
+    """Regression: emulate(geolocation=...) set coordinates the page could never read.
+
+    The override was applied but the permission never granted, so
+    permissions.query stayed "prompt" and getCurrentPosition fired neither
+    callback — it waited on a permission bubble no agent can answer. The page
+    hung rather than failing, which is the worst of both.
+    """
+
+    async def scenario():
+        # A real https origin: geolocation needs a secure context, and a
+        # permission cannot be granted to a data: URL's opaque origin.
+        await _call("new_page", url="https://example.com")
+        await _call("emulate", geolocation="48.1372,11.5756")
+
+        got = await _call(
+            "evaluate_script",
+            function=(
+                "() => new Promise(res => {"
+                " const t = setTimeout(() => res('HUNG'), 5000);"
+                " navigator.geolocation.getCurrentPosition("
+                "  p => { clearTimeout(t);"
+                "    res(p.coords.latitude.toFixed(2) + ',' + p.coords.longitude.toFixed(2)); },"
+                "  e => { clearTimeout(t); res('ERR:' + e.code); });"
+                "})"
+            ),
+        )
+        assert "HUNG" not in got, f"getCurrentPosition never called back: {got!r}"
+        assert "48.14" in got and "11.58" in got, f"wrong coordinates came back: {got!r}"
+
+    _run(scenario)

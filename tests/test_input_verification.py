@@ -81,24 +81,66 @@ def test_cf_verify_says_what_is_missing_instead_of_failing_obscurely(monkeypatch
     assert "Everything else in this server works without it" in out
 
 
-def test_a_failed_attach_names_the_cause(monkeypatch):
-    """Regression: a failed attach returned the bare connection error.
+def _patch_attach_globals(monkeypatch, stopped):
+    """Shared setup: record whether the running browser would be torn down."""
 
-    Chrome refuses the debugging port when --user-data-dir is its own default
-    directory — measured on 151: the browser starts, reports nothing, and no port
-    ever opens. All the tool said was that the connection was refused, which sends
-    you checking the port number, the one thing that was right.
-    """
-
-    async def no_browser():
-        raise OSError("Connect call failed ('127.0.0.1', 9222)")
+    async def record_stop():
+        stopped.append(True)
 
     # monkeypatch restores these, so the failure path's own writes to them do not
     # leak into the next test.
     monkeypatch.setattr(server, "_connect_disabled", False)
     monkeypatch.setattr(server, "_connect_host", None)
     monkeypatch.setattr(server, "_connect_port", None)
-    monkeypatch.setattr(server, "_stop_browser", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(server, "_stop_browser", record_stop)
+
+
+def test_an_unreachable_port_costs_you_nothing(monkeypatch):
+    """Regression: a failed attach used to destroy the browser you already had.
+
+    use_running_browser stopped the running Chrome *before* trying to connect, so
+    a mistyped port — or a speculative probe of 9222 to see whether anything was
+    there — silently threw away every open tab, and on an ephemeral profile the
+    cookies and storage with them. The error mentioned only that it could not
+    attach. Nothing may be torn down until the endpoint is known to answer.
+    """
+    stopped: list[bool] = []
+    _patch_attach_globals(monkeypatch, stopped)
+
+    async def nothing_there(host, port, timeout=3.0):
+        return "nothing is listening (connection refused)"
+
+    monkeypatch.setattr(server, "_probe_devtools_endpoint", nothing_there)
+
+    with pytest.raises(server.ToolFailure) as excinfo:
+        asyncio.run(server.use_running_browser(port=9222))
+    out = str(excinfo.value)
+
+    assert not stopped, "the running browser must survive an attach that cannot work"
+    assert "still open" in out, "and the message has to say so"
+    assert "9222" in out, "it names which endpoint it tried"
+    assert "--user-data-dir" in out, "and the actual cause"
+    assert "default directory" in out
+
+
+def test_a_failed_attach_names_the_cause(monkeypatch):
+    """A reachable endpoint that still fails keeps the underlying error.
+
+    Chrome refuses the debugging port when --user-data-dir is its own default
+    directory — measured on 151: the browser starts, reports nothing, and no port
+    ever opens. All the tool said was that the connection was refused, which sends
+    you checking the port number, the one thing that was right.
+    """
+    stopped: list[bool] = []
+    _patch_attach_globals(monkeypatch, stopped)
+
+    async def endpoint_answers(host, port, timeout=3.0):
+        return ""
+
+    async def no_browser():
+        raise OSError("Connect call failed ('127.0.0.1', 9222)")
+
+    monkeypatch.setattr(server, "_probe_devtools_endpoint", endpoint_answers)
     monkeypatch.setattr(server, "_get_browser", no_browser)
 
     with pytest.raises(server.ToolFailure) as excinfo:
