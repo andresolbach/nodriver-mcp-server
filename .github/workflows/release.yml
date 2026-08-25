@@ -91,8 +91,30 @@ jobs:
           fi
           cat server.json
 
+      # Same reasoning as the PyPI guard above: the registry rejects a duplicate
+      # version, so without this a re-run fails on the half that already
+      # succeeded. Read after the pin step, so it checks the version that would
+      # actually be published.
+      - name: Is this version already in the registry?
+        id: registered
+        run: |
+          NAME=$(jq -r .name server.json)
+          VERSION=$(jq -r .version server.json)
+          FOUND=$(curl -s "https://registry.modelcontextprotocol.io/v0/servers?search=$NAME&limit=100" \
+            | jq -r --arg n "$NAME" --arg v "$VERSION" \
+              '[.servers[] | (.server // .) | select(.name == $n and .version == $v)] | length')
+          if [ "$FOUND" != "0" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is already in the registry — skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "$VERSION is not in the registry yet — publishing."
+          fi
+
       - name: Authenticate to MCP Registry
+        if: steps.registered.outputs.skip == 'false'
         run: ./mcp-publisher login github-oidc
 
       - name: Publish
+        if: steps.registered.outputs.skip == 'false'
         run: ./mcp-publisher publish
