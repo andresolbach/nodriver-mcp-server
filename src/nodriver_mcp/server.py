@@ -491,6 +491,13 @@ TimeoutMs = Annotated[
     Field(ge=0, description="Maximum wait in milliseconds. 0 uses the built-in default."),
 ]
 
+ResourceTypeName = Literal[
+    "Document", "Stylesheet", "Image", "Media", "Font", "Script",
+    "TextTrack", "XHR", "Fetch", "Prefetch", "EventSource", "WebSocket",
+    "Manifest", "SignedExchange", "Ping", "CSPViolationReport",
+    "Preflight", "FedCM", "Other",
+]
+
 
 async def _active_tab() -> uc.Tab:
     """Return the tab selected via select_page(), else the last-opened tab."""
@@ -942,6 +949,8 @@ def _request_timing(req: dict) -> str:
         parts.append(f"{req['size']}B")
     if req.get("from_cache"):
         parts.append("cached")
+    if req.get("captured_file"):
+        parts.append("saved")
     return " " + " ".join(parts) if parts else ""
 
 
@@ -2326,6 +2335,9 @@ async def _stop_browser() -> bool:
     # Same reason as in _get_browser: .stopped is meaningless for a browser we
     # did not spawn, so an attached one counts as running whenever we hold it.
     was_running = _browser is not None and (attached or not _browser.stopped)
+    # Its connection dies with the browser; finish it first, so what it wrote is
+    # indexed and the reason it ended is on record for the next status call.
+    await _end_body_capture("the browser was closed")
     if _browser is not None and not attached:
         try:
             await _close_browser_and_profile(_browser)
@@ -3898,7 +3910,26 @@ async def get_network_request(
         else:
             lines.append(f"  Response body ({len(body_content)} chars): {body_content[:5000]}")
     except Exception as e:
-        lines.append(f"  Response body: Error — {e}")
+        captured = req.get("captured_file")
+        if captured and os.path.isfile(captured):
+            # Chrome no longer has it, but capture_bodies took it on the way in.
+            if response_file_path:
+                shutil.copyfile(captured, response_file_path)
+                lines.append(f"  Response body saved to: {response_file_path} (from the capture)")
+            else:
+                with open(captured, "rb") as f:
+                    raw = f.read()
+                text = raw.decode("utf-8", errors="replace")
+                lines.append(
+                    f"  Response body ({len(raw)} bytes, from the capture at {captured}): {text[:5000]}"
+                )
+        else:
+            lines.append(f"  Response body: Error — {e}")
+            if captured:
+                lines.append(f"  Captured copy {captured} no longer exists.")
+        return "\n".join(lines)
+    if req.get("captured_file"):
+        lines.append(f"  Also captured to: {req['captured_file']}")
 
     return "\n".join(lines)
 
@@ -4114,15 +4145,7 @@ async def list_network_requests(
         int, Field(ge=0, description="0-based page number, used together with page_size.")
     ] = 0,
     resource_types: Annotated[
-        list[
-            Literal[
-                "Document", "Stylesheet", "Image", "Media", "Font", "Script",
-                "TextTrack", "XHR", "Fetch", "Prefetch", "EventSource", "WebSocket",
-                "Manifest", "SignedExchange", "Ping", "CSPViolationReport",
-                "Preflight", "FedCM", "Other",
-            ]
-        ]
-        | None,
+        list[ResourceTypeName] | None,
         Field(description=(
             'Only return these resource types. ["XHR", "Fetch"] is the useful filter '
             "for finding a page's own API calls. Matching is case-insensitive. Omit "
@@ -6332,6 +6355,657 @@ async def block_resources(
     if unknown:
         base += f" Ignored unknown: {', '.join(unknown)} (valid: image, font, stylesheet, media)."
     return base
+
+
+# ---------------------------------------------------------------------------
+# Response-body capture
+# ---------------------------------------------------------------------------
+# get_network_request asks Chrome for a body only once someone asks, and by then
+# it is often gone. Measured on Chrome 151: a 12 MB response was already
+# "evicted from inspector cache" at its own loadingFinished, and a small JSON
+# response that read fine a moment earlier answered "No resource with given
+# identifier found" after one cross-site navigation. A body taken while the
+# response is still paused cannot be lost that way.
+#
+# Why a CDP connection of its own instead of the tab's sessions:
+#   * Fetch.enable replaces the Fetch configuration of its session, and
+#     block_resources and proxy authentication already use Fetch on the tab's.
+#     A separate session intercepts independently; Chrome chains the two.
+#   * Coverage, measured with a page fetch, a dedicated worker, a blob worker, a
+#     request a service worker passes through and one it makes itself: Network
+#     on the page saw 2 of 5, Fetch on the page 3 (not the service worker's),
+#     Fetch on the browser target only the 2 workers. Fetch on the page plus
+#     Fetch on the service worker's own target saw all 5 — and browser-level
+#     auto-attach is what reaches both, including tabs the page opens itself.
+#   * waitForDebuggerOnStart holds every new target until interception is
+#     armed, so the first request of a new tab or a freshly started service
+#     worker is not missed.
+
+_CAPTURE_ROOT = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "captures")
+
+# Responses that never really end. Fetch.getResponseBody waits for the end, so
+# the page would receive nothing until then — an EventSource never. These are
+# released at once and written chunk by chunk as they arrive instead.
+_STREAMING_MIME_TYPES = frozenset({"text/event-stream", "application/x-ndjson"})
+
+_CAPTURE_EXTENSIONS: dict[str, str] = {
+    "application/json": ".json", "text/html": ".html", "text/css": ".css",
+    "text/javascript": ".js", "application/javascript": ".js",
+    "text/plain": ".txt", "text/event-stream": ".txt", "application/x-ndjson": ".ndjson",
+    "text/xml": ".xml", "application/xml": ".xml", "application/pdf": ".pdf",
+    "application/wasm": ".wasm", "image/png": ".png", "image/jpeg": ".jpg",
+    "image/gif": ".gif", "image/webp": ".webp", "image/avif": ".avif",
+    "image/svg+xml": ".svg", "image/x-icon": ".ico", "font/woff": ".woff",
+    "font/woff2": ".woff2", "video/mp4": ".mp4", "audio/mpeg": ".mp3",
+}
+
+
+def _capture_filename(seq: int, url: str, mime: str) -> str:
+    """A name that says where the body came from: 0007_api.example.com_search.json"""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    host = parts.hostname or parts.scheme or "local"
+    stem, url_ext = os.path.splitext(parts.path.rstrip("/").rsplit("/", 1)[-1])
+    ext = _CAPTURE_EXTENSIONS.get(mime)
+    if ext is None and mime.endswith("+json"):
+        ext = ".json"
+    if ext is None and re.fullmatch(r"\.[A-Za-z0-9]{1,6}", url_ext):
+        ext = url_ext.lower()
+    if ext is None:
+        ext = ".txt" if mime.startswith("text/") else ".bin"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{host}_{stem or 'index'}").strip("_.")
+    return f"{seq:04d}_{slug[:80]}{ext}"
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _link_captured_body(network_id: str | None, path: str) -> None:
+    """Tell the network log where a request's body went, so the lazy lookup
+    (get_network_request) can fall back to it once Chrome has dropped its copy."""
+    if not network_id:
+        return
+    for batch in (_network_requests, *reversed(_preserved_network_requests)):
+        for rec in reversed(batch):
+            if rec.get("id") == network_id and rec.get("redirect_to") is None:
+                rec["captured_file"] = path
+                return
+
+
+class _BodyCapture:
+    """One running capture: a CDP connection of its own, and what it saved.
+
+    Speaks raw CDP over its own websocket rather than through a nodriver
+    Connection, because it has to know which session every event came from, and
+    nodriver's dispatcher drops the sessionId.
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        pattern: str,
+        types: list[str],
+        out_dir: str,
+        max_bytes: int,
+    ) -> None:
+        self.ws_url = ws_url
+        self.pattern = pattern
+        self.types = types
+        self.out_dir = out_dir
+        self.manifest = os.path.join(out_dir, "capture.jsonl")
+        self.max_bytes = max_bytes
+        self.started = time.time()
+        self.ws: Any = None
+        self.reader: asyncio.Task | None = None
+        self.msg_id = 0
+        self.replies: dict[int, asyncio.Future] = {}
+        self.sessions: dict[str, dict] = {}  # sessionId -> {"type", "url"}
+        self.arm_errors: list[str] = []
+        self.seq = 0
+        self.recent: list[dict] = []  # newest last, capped
+        self.saved = 0
+        self.saved_bytes = 0
+        self.skipped: dict[str, int] = {}
+        self.failed = 0
+        self.failures: list[str] = []
+        # (sessionId, network requestId) -> an event stream being written.
+        self.streams: dict[tuple[str, str], dict] = {}
+        self.tasks: set[asyncio.Task] = set()
+        self.ended: str | None = None  # why it stopped, once it has
+
+    # -- transport -------------------------------------------------------------
+
+    async def open(self) -> None:
+        import websockets
+
+        # No keepalive pings: a multi-megabyte body can hold the loop long enough
+        # to miss one, and a dropped capture connection is exactly the silent
+        # loss this exists to prevent. nodriver sets the same size ceiling.
+        self.ws = await websockets.connect(self.ws_url, max_size=2**28, ping_interval=None)
+        self.reader = asyncio.create_task(self._read())
+
+    async def send(
+        self,
+        method: str,
+        params: dict | None = None,
+        session: str | None = None,
+        timeout: float | None = 30,
+    ) -> dict:
+        self.msg_id += 1
+        mid = self.msg_id
+        message: dict[str, Any] = {"id": mid, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
+        future = asyncio.get_running_loop().create_future()
+        self.replies[mid] = future
+        try:
+            await self.ws.send(json.dumps(message))
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self.replies.pop(mid, None)
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self.ws:
+                message = json.loads(raw)
+                if "id" in message:
+                    future = self.replies.get(message["id"])
+                    if future is None or future.done():
+                        continue
+                    if "error" in message:
+                        future.set_exception(RuntimeError(message["error"].get("message", "CDP error")))
+                    else:
+                        future.set_result(message.get("result") or {})
+                else:
+                    self._dispatch(
+                        message.get("method", ""), message.get("params") or {}, message.get("sessionId", "")
+                    )
+        except Exception:
+            pass
+        finally:
+            if self.ended is None:
+                self.ended = "the connection to the browser closed (was the browser closed?)"
+            for future in self.replies.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("capture connection closed"))
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def _dispatch(self, method: str, params: dict, session: str) -> None:
+        if method == "Fetch.requestPaused":
+            self._spawn(self._on_paused(params, session))
+        elif method == "Target.attachedToTarget":
+            self._spawn(self._on_attached(params))
+        elif method == "Target.detachedFromTarget":
+            self.sessions.pop(params.get("sessionId", ""), None)
+        elif method.startswith("Network.") and self.streams:
+            key = (session, params.get("requestId", ""))
+            if key not in self.streams:
+                return
+            if method == "Network.dataReceived":
+                # Handled inline, not as a task: chunks must land in arrival order.
+                self._on_stream_data(key, params)
+            elif method == "Network.responseReceived":
+                self._spawn(self._start_stream(key, session))
+            elif method == "Network.loadingFinished":
+                self._end_stream(key, "complete")
+            elif method == "Network.loadingFailed":
+                self._end_stream(
+                    key,
+                    "stream closed by the page" if params.get("canceled")
+                    else f"stream broke off: {params.get('errorText') or 'error'}",
+                )
+
+    # -- arming ------------------------------------------------------------------
+
+    def _patterns(self) -> list[dict]:
+        base = {"urlPattern": self.pattern, "requestStage": "Response"}
+        if not self.types:
+            return [base]
+        return [{**base, "resourceType": t} for t in self.types]
+
+    async def start(self) -> None:
+        await self.open()
+        await self.send("Target.setAutoAttach", {
+            "autoAttach": True,
+            "waitForDebuggerOnStart": True,
+            "flatten": True,
+            # Pages and the workers that are targets of their own. Dedicated
+            # workers are not listed: the page's Fetch session already sees
+            # their requests (measured), and they are not top-level targets.
+            "filter": [
+                {"type": "page"}, {"type": "service_worker"}, {"type": "shared_worker"},
+                {"exclude": True},
+            ],
+        })
+
+    async def _on_attached(self, params: dict) -> None:
+        session = params.get("sessionId", "")
+        info = params.get("targetInfo") or {}
+        kind = info.get("type", "")
+        # Registered before arming: a request can be paused the instant Fetch is
+        # on, and its handler needs to know what kind of target it came from.
+        self.sessions[session] = {"type": kind, "url": info.get("url", ""), "armed": False}
+        try:
+            await self.send("Fetch.enable", {"patterns": self._patterns()}, session)
+            if kind == "page":
+                # Only for event streams, which are read through Network. It has to
+                # be on before their request starts, or Chrome keeps no record of
+                # it to stream from.
+                await self.send("Network.enable", {
+                    "maxTotalBufferSize": 10_000_000,
+                    "maxResourceBufferSize": 5_000_000,
+                }, session)
+            self.sessions[session]["armed"] = True
+        except Exception as e:  # noqa: BLE001
+            self.sessions.pop(session, None)
+            self.arm_errors.append(f"{kind} {info.get('url', '')[:80]}: {e}")
+        finally:
+            if params.get("waitingForDebugger"):
+                try:
+                    await self.send("Runtime.runIfWaitingForDebugger", {}, session)
+                except Exception:
+                    pass
+
+    # -- bodies ------------------------------------------------------------------
+
+    async def _on_paused(self, params: dict, session: str) -> None:
+        try:
+            await self._take_body(params, session)
+        except Exception as e:  # noqa: BLE001
+            self._fail((params.get("request") or {}).get("url", ""), str(e))
+        finally:
+            # Always let the response go on to the page, whatever happened here.
+            try:
+                await self.send("Fetch.continueRequest", {"requestId": params["requestId"]}, session)
+            except Exception:
+                pass
+
+    async def _take_body(self, params: dict, session: str) -> None:
+        request = params.get("request") or {}
+        status = params.get("responseStatusCode")
+        if params.get("responseErrorReason") or status is None:
+            self._skip("failed before a response arrived")
+            return
+        headers = {h["name"].lower(): h["value"] for h in params.get("responseHeaders") or []}
+        if 300 <= status < 400 and "location" in headers:
+            self._skip("redirect (no body)")
+            return
+        if status == 304:
+            self._skip("304: body came from Chrome's cache")
+            return
+        if status == 204 or request.get("method") == "HEAD":
+            self._skip("no body (204 or HEAD)")
+            return
+        mime = headers.get("content-type", "").split(";")[0].strip().lower()
+        entry = self._entry(params, session, status, mime, headers)
+
+        if mime in _STREAMING_MIME_TYPES:
+            network_id = params.get("networkId")
+            if self.sessions.get(session, {}).get("type") == "page" and network_id:
+                self.streams[(session, network_id)] = {"entry": entry, "state": "released", "chunks": []}
+            else:
+                self._skip("event stream outside a page (not readable there)")
+            return
+
+        length = headers.get("content-length", "")
+        if length.isdigit() and int(length) > self.max_bytes:
+            self._skip("larger than max_body_mb")
+            return
+
+        body = await self.send(
+            "Fetch.getResponseBody", {"requestId": params["requestId"]}, session, timeout=None
+        )
+        if body.get("base64Encoded"):
+            data = base64.b64decode(body.get("body") or "")
+        else:
+            data = (body.get("body") or "").encode("utf-8")
+        path = self._path_for(entry)
+        await asyncio.to_thread(_write_bytes, path, data)
+        self._finish(entry, path, len(data), "complete")
+
+    def _entry(self, params: dict, session: str, status: int, mime: str, headers: dict) -> dict:
+        self.seq += 1
+        request = params.get("request") or {}
+        entry: dict[str, Any] = {
+            "seq": self.seq,
+            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "url": request.get("url", ""),
+            "method": request.get("method", ""),
+            "status": status,
+            "mime_type": mime,
+            "resource_type": params.get("resourceType", ""),
+            "source": self.sessions.get(session, {}).get("type", ""),
+            "network_id": params.get("networkId"),
+        }
+        if request.get("postData"):
+            entry["post_data"] = request["postData"]
+        elif request.get("hasPostData"):
+            entry["post_data"] = None  # sent, but too large for Chrome to include
+        entry["response_headers"] = headers
+        return entry
+
+    def _path_for(self, entry: dict) -> str:
+        name = _capture_filename(entry["seq"], entry["url"], entry["mime_type"])
+        path = os.path.join(self.out_dir, name)
+        stem, ext = os.path.splitext(path)
+        n = 1
+        while os.path.exists(path):  # never overwrite an earlier capture's file
+            path = f"{stem}-{n}{ext}"
+            n += 1
+        return path
+
+    def _finish(self, entry: dict, path: str, size: int, outcome: str) -> None:
+        entry["file"] = os.path.basename(path)
+        entry["bytes"] = size
+        entry["outcome"] = outcome
+        try:
+            with open(self.manifest, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as e:
+            self._fail(entry["url"], f"manifest not written: {e}")
+        self.saved += 1
+        self.saved_bytes += size
+        self.recent.append(entry)
+        if len(self.recent) > 200:
+            self.recent.pop(0)
+        _link_captured_body(entry.get("network_id"), path)
+
+    def _skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+    def _fail(self, url: str, reason: str) -> None:
+        self.failed += 1
+        if len(self.failures) < 20:
+            self.failures.append(f"{url[:120]} — {reason}")
+
+    # -- event streams -------------------------------------------------------------
+
+    async def _start_stream(self, key: tuple[str, str], session: str) -> None:
+        stream = self.streams.get(key)
+        if stream is None or stream["state"] != "released":
+            return
+        stream["state"] = "starting"
+        try:
+            reply = await self.send("Network.streamResourceContent", {"requestId": key[1]}, session)
+            buffered = base64.b64decode(reply.get("bufferedData") or "")
+        except Exception as e:  # noqa: BLE001
+            # Chrome refuses once the response has finished; then the whole body
+            # is in its buffer and can be read the ordinary way.
+            self.streams.pop(key, None)
+            try:
+                body = await self.send("Network.getResponseBody", {"requestId": key[1]}, session)
+                data = (
+                    base64.b64decode(body.get("body") or "") if body.get("base64Encoded")
+                    else (body.get("body") or "").encode("utf-8")
+                )
+                path = self._path_for(stream["entry"])
+                await asyncio.to_thread(_write_bytes, path, data)
+                self._finish(stream["entry"], path, len(data), "complete")
+            except Exception:  # noqa: BLE001
+                self._fail(stream["entry"]["url"], f"event stream not readable: {e}")
+            return
+        path = self._path_for(stream["entry"])
+        handle = open(path, "wb")
+        written = 0
+        for chunk in (buffered, *stream["chunks"]):
+            handle.write(chunk)
+            written += len(chunk)
+        handle.flush()
+        stream.update(state="streaming", path=path, handle=handle, bytes=written, chunks=[])
+        if stream.get("end"):
+            self._end_stream(key, stream["end"])
+
+    def _on_stream_data(self, key: tuple[str, str], params: dict) -> None:
+        stream = self.streams[key]
+        if not params.get("data"):
+            return
+        chunk = base64.b64decode(params["data"])
+        if stream["state"] == "streaming":
+            stream["handle"].write(chunk)
+            stream["handle"].flush()  # readable on disk while the stream is still open
+            stream["bytes"] += len(chunk)
+        else:
+            stream["chunks"].append(chunk)
+
+    def _end_stream(self, key: tuple[str, str], outcome: str) -> None:
+        stream = self.streams.get(key)
+        if stream is None:
+            return
+        if stream["state"] == "starting":
+            stream["end"] = outcome  # _start_stream finishes it
+            return
+        self.streams.pop(key, None)
+        if stream["state"] == "released":
+            self._fail(stream["entry"]["url"], f"{outcome} before any of it arrived")
+            return
+        stream["handle"].close()
+        self._finish(stream["entry"], stream["path"], stream["bytes"], outcome)
+
+    # -- lifecycle -------------------------------------------------------------------
+
+    async def stop(self, reason: str) -> None:
+        if self.ended is None:
+            self.ended = reason
+        # Bodies already being read get a moment to land on disk.
+        if self.tasks:
+            await asyncio.wait(set(self.tasks), timeout=3)
+        try:
+            # Turning auto-attach off detaches every session it made, which ends
+            # their interception; Chrome releases anything still paused.
+            await self.send("Target.setAutoAttach", {"autoAttach": False, "waitForDebuggerOnStart": False}, timeout=5)
+        except Exception:
+            pass
+        for key in list(self.streams):
+            if self.streams[key]["state"] == "streaming":
+                self._end_stream(key, "still streaming when the capture stopped")
+            else:
+                self.streams.pop(key, None)
+        for task in list(self.tasks):
+            task.cancel()
+        try:
+            await asyncio.wait_for(self.ws.close(), timeout=5)
+        except Exception:
+            pass
+        if self.reader is not None:
+            self.reader.cancel()
+
+    def summary(self) -> str:
+        types = ", ".join(self.types) if self.types else "all types"
+        kinds: dict[str, int] = {}
+        for s in self.sessions.values():
+            if s["armed"]:
+                kinds[s["type"]] = kinds.get(s["type"], 0) + 1
+        armed = ", ".join(f"{n} {k.replace('_', ' ')}{'s' if n != 1 else ''}" for k, n in sorted(kinds.items()))
+        lines = [
+            f'Pattern "{self.pattern}" ({types}) -> {self.out_dir}',
+            f"{'Running' if self.ended is None else 'Ran'} {time.time() - self.started:.0f}s"
+            + (f", intercepting on {armed}." if armed and self.ended is None else "."),
+            f"Saved {self.saved} bod{'y' if self.saved == 1 else 'ies'} "
+            f"({self.saved_bytes / 1_048_576:.2f} MB)"
+            + (f"; {len(self.streams)} event stream(s) still open." if self.streams else "."),
+        ]
+        if self.skipped:
+            lines.append("Skipped: " + ", ".join(f"{r} ({n})" for r, n in sorted(self.skipped.items())) + ".")
+        if self.failed:
+            lines.append(f"Failed {self.failed}:")
+            lines += [f"  {f}" for f in self.failures]
+        if self.arm_errors:
+            lines.append("Could not intercept on:")
+            lines += [f"  {e}" for e in self.arm_errors[:10]]
+        if self.saved:
+            lines.append(f"Index of every file: {self.manifest}")
+            lines.append("Latest:")
+            for e in self.recent[-10:]:
+                done = "" if e["outcome"] == "complete" else f" [{e['outcome']}]"
+                lines.append(
+                    f"  {e['file']}  {e['status']} {e['mime_type'] or '?'} {e['bytes']}B{done}  {e['url'][:100]}"
+                )
+        return "\n".join(lines)
+
+
+_body_capture: _BodyCapture | None = None
+_last_capture_summary: str = ""
+# Set when a capture ended without the agent being told — the browser closed
+# under it — so the next stop reports that instead of "nothing is running".
+_last_capture_unseen: bool = False
+
+
+async def _end_body_capture(reason: str) -> str:
+    """Stop the running capture, if any, and return its final summary."""
+    global _body_capture, _last_capture_summary, _last_capture_unseen
+    capture = _body_capture
+    if capture is None:
+        return ""
+    _body_capture = None
+    try:
+        await capture.stop(reason)
+    except Exception:
+        logger.warning("stopping the body capture failed", exc_info=True)
+    _last_capture_summary = f"Ended: {capture.ended}.\n{capture.summary()}"
+    _last_capture_unseen = True
+    return _last_capture_summary
+
+
+@tool(title="Capture response bodies to disk")
+async def capture_bodies(
+    action: Annotated[
+        Literal["start", "status", "stop"],
+        Field(description=(
+            '"start" begins capturing in the background, "status" reports progress '
+            'while it runs, "stop" ends it and reports what was saved.'
+        )),
+    ] = "start",
+    url_pattern: Annotated[
+        str,
+        Field(description=(
+            'Which responses to keep, matched against the full URL — required for '
+            'start. "*" matches any run of characters and "?" exactly one, as in '
+            'Chrome\'s own interception patterns: "*/api/*", "*graphql*". A pattern '
+            'without "*" matches anywhere in the URL. "*" keeps everything.'
+        )),
+    ] = "",
+    out_dir: Annotated[
+        str,
+        Field(description=(
+            "Folder to write into, created if missing. Empty uses "
+            "~/.nodriver-mcp/captures/<timestamp>."
+        )),
+    ] = "",
+    resource_types: Annotated[
+        list[ResourceTypeName] | None,
+        Field(description=(
+            'Only these resource types, e.g. ["XHR", "Fetch"] for a page\'s own API '
+            "calls. Omit for all."
+        )),
+    ] = None,
+    max_body_mb: Annotated[
+        int,
+        Field(ge=1, le=150, description=(
+            "Skip a response whose Content-Length announces more than this many MB. "
+            "A captured body is held in memory whole on its way to disk."
+        )),
+    ] = 100,
+) -> str:
+    """Save every matching response body to disk the moment it arrives, in the background.
+
+    get_network_request asks Chrome for a body only when you ask — by then it is
+    often gone: Chrome drops bodies over ~10 MB at once, and a navigation to
+    another site drops the rest. This takes each body while the response is
+    still paused, before the page even sees it, and writes it to a file.
+
+    Covers the whole browser until stopped: every tab, including ones the page
+    opens itself, plus dedicated workers and service workers. Each body is its
+    own file; capture.jsonl beside them records URL, method, POST data, status
+    and headers per file. list_network_requests marks captured requests "saved",
+    and get_network_request falls back to the file.
+
+    Not captured: responses from Chrome's cache (they never touch the network —
+    reload with ignore_cache), redirects, and event streams inside workers.
+    Event streams on a page are written as they arrive; every other matching
+    response reaches the page only once complete, so keep the pattern off
+    long-running downloads.
+    """
+    global _body_capture, _last_capture_unseen
+    if _body_capture is not None and _body_capture.ended is not None:
+        # Its connection died under it: the browser crashed or was closed from
+        # outside. Say so, rather than report a capture that is not running.
+        await _end_body_capture(_body_capture.ended)
+    if action == "status":
+        if _body_capture is not None:
+            return f"Capture running.\n{_body_capture.summary()}"
+        if _last_capture_summary:
+            _last_capture_unseen = False
+            return f"No capture running. The last one:\n{_last_capture_summary}"
+        return "No capture running."
+    if action == "stop":
+        if _body_capture is None:
+            if _last_capture_unseen:
+                _last_capture_unseen = False
+                return f"No capture was running any more; it had already ended.\n{_last_capture_summary}"
+            raise ToolFailure("No capture is running.")
+        summary = await _end_body_capture("stopped by request")
+        _last_capture_unseen = False
+        return "Capture stopped. " + summary
+
+    pattern = url_pattern.strip()
+    if not pattern:
+        raise ToolFailure('url_pattern is required to start a capture; pass "*" for everything.')
+    note = ""
+    if "*" not in pattern:
+        pattern = f"*{pattern}*"
+        note = f' (no "*" in the pattern, so it matches anywhere in the URL: "{pattern}")'
+    if _body_capture is not None:
+        raise ToolFailure("A capture is already running — stop it first.\n" + _body_capture.summary())
+
+    directory = os.path.abspath(os.path.expanduser(out_dir.strip())) if out_dir.strip() else os.path.join(
+        _CAPTURE_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as e:
+        raise ToolFailure(f"Cannot create {directory}: {e}")
+
+    browser = await _get_browser()
+    ws_url = getattr(browser, "websocket_url", None) or getattr(getattr(browser, "info", None), "webSocketDebuggerUrl", None)
+    if not ws_url:
+        raise ToolFailure("The browser exposes no DevTools websocket to capture through.")
+
+    capture = _BodyCapture(ws_url, pattern, list(resource_types or []), directory, max_body_mb * 1_048_576)
+    try:
+        await capture.start()
+        # Auto-attach reaches the pages that already exist asynchronously. Wait
+        # until each one is actually intercepting before saying so.
+        pages = [
+            t for t in (await capture.send("Target.getTargets")).get("targetInfos", [])
+            if t.get("type") == "page"
+        ]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline:
+            armed = sum(1 for s in capture.sessions.values() if s["type"] == "page" and s["armed"])
+            if armed + len(capture.arm_errors) >= len(pages):
+                break
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        await capture.stop(f"failed to start: {e}")
+        raise ToolFailure(f"Could not start the capture: {e}")
+
+    armed_pages = sum(1 for s in capture.sessions.values() if s["type"] == "page" and s["armed"])
+    if pages and armed_pages == 0:
+        await capture.stop("could not intercept on any page")
+        raise ToolFailure("Could not intercept on any open page.\n" + capture.summary())
+    _body_capture = capture
+    return (
+        f"Capturing{note}. Tabs opened from now on are included from their first "
+        f"request. Check with action=\"status\", end with action=\"stop\".\n{capture.summary()}"
+    )
 
 
 @tool(title="Wait for element", read_only=True, open_world=True)

@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.5.0 — response bodies that are on disk before Chrome can drop them
+
+The flagship workflow — find the page's own API call, read the JSON it already
+received — had a hole the size of Chrome's buffer. `get_network_request` asks
+for a body only when you ask, and by then it is often gone. Measured on Chrome
+151: a 12 MB response was already "evicted from inspector cache" at its own
+`loadingFinished`, and a small JSON response that read fine a moment earlier
+answered "No resource with given identifier found" after one cross-site
+navigation.
+
+**`capture_bodies`** fixes that at the source. It runs in the background and
+takes every matching body while the response is still paused, before the page
+sees it, and writes it to a file. `capture.jsonl` beside the files records URL,
+method, POST data, status and headers for each one, so a GraphQL endpoint that
+answers every query at the same URL is still sorted out. `start`, `status` and
+`stop` are one tool, and `stop` says what was saved, what was skipped and why.
+
+It uses Fetch interception on a CDP connection of its own, not the tab's. On the
+tab's session it would have silently replaced the patterns `block_resources`
+and proxy authentication already rely on, because `Fetch.enable` overwrites
+its session's configuration; a separate session is chained by Chrome instead.
+Coverage was measured before anything was built, with a page fetch, a dedicated
+worker, a blob worker, a request a service worker passes through and one it
+makes itself: Network on the page saw 2 of the 5, Fetch on the page 3, Fetch on
+the browser target only the 2 workers. Fetch on each page plus Fetch on the
+service worker's own target saw all 5 — and browser-level auto-attach with
+`waitForDebuggerOnStart` reaches both, including tabs a page opens itself,
+armed before their first request.
+
+Event streams are the one thing Fetch cannot hold: `getResponseBody` waits for
+the end of a body, and an EventSource has none, so the page would have received
+nothing, ever. Those are released at once and written chunk by chunk as they
+arrive, through `Network.streamResourceContent`.
+
+`list_network_requests` marks captured requests `saved`, and
+`get_network_request` falls back to the file once Chrome has let its own copy
+go.
+
+Every test was also run against a broken capture to prove it catches one: with
+bodies not written, four of the five fail; with event streams handled like any
+other body, the stream test fails because the page starves.
+
+nodriver stays at 0.50.3, which is still the newest release on PyPI.
+
+Tool count: 65 → 66.
+
 ## 2.4.0 — what a uid promises, and five tools that reported work they had not done
 
 Black-box testing with a fleet of agents drove every tool the way an agent
