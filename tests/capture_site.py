@@ -45,21 +45,61 @@ PIXEL = bytes.fromhex(
 )
 
 
+# For audit_security: one page with the weaknesses it should report, and one
+# configured the way it should stay silent about.
+WEAK_HEADERS = [
+    ("Content-Security-Policy", "script-src 'self' 'unsafe-inline' 'unsafe-eval'; img-src 'self'"),
+    ("X-Powered-By", "PHP/7.4.3"),
+    ("Set-Cookie", "session_id=abc123; Path=/"),
+    # SameSite=None without Secure: Chrome rejects it and reports why.
+    ("Set-Cookie", "tracking=1; SameSite=None"),
+]
+HARDENED_HEADERS = [
+    ("Content-Security-Policy",
+     "default-src 'self'; script-src 'self' 'nonce-abc'; object-src 'none'; "
+     "base-uri 'none'; frame-ancestors 'none'"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "strict-origin-when-cross-origin"),
+    ("Permissions-Policy", "camera=()"),
+    ("Cross-Origin-Opener-Policy", "same-origin"),
+    ("Set-Cookie", "session_id=x; HttpOnly; SameSite=Lax; Path=/"),
+]
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # noqa: D102 - keep test output readable
         pass
 
-    def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
+    def _send(self, body: bytes, content_type: str, status: int = 200, extra=()) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in extra:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's naming
         path = self.path.split("?", 1)[0]
-        if path == "/api/fo/big":
+        port = self.server.server_address[1]
+        if path == "/audit":
+            # The image comes from another origin, which img-src 'self' blocks.
+            page = (
+                b"<!doctype html><html><head><title>audit</title></head><body><h1>weak</h1>"
+                b"<img src='http://localhost:%d/img.png'></body></html>" % port
+            )
+            self._send(page, "text/html", extra=WEAK_HEADERS)
+        elif path == "/hardened":
+            self._send(b"<!doctype html><html><head><title>hardened</title></head><body>ok</body></html>",
+                       "text/html", extra=HARDENED_HEADERS)
+        elif path == "/api/cors":
+            self._send(b'{"cors": true}', "application/json", extra=[
+                ("Access-Control-Allow-Origin", "null"),
+                ("Access-Control-Allow-Credentials", "true"),
+            ])
+        elif path == "/api/fo/big":
             self._send(BIG_BODY, "application/octet-stream")
         elif path == "/api/fo/sse":
             # Three events, then the stream stays open the way a live feed does.

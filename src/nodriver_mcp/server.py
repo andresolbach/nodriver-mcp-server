@@ -538,6 +538,8 @@ _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 _selected_target_id: str | None = None  # target_id chosen via select_page(); honored by _active_tab()
 _request_counter: int = 0  # monotonic id assigned to each collected network request
+_extra_info_pending: dict[str, dict] = {}  # request id -> wire headers that arrived before their record
+_audit_issues: list[tuple[str, dict]] = []  # (target key, DevTools issue) since that tab's last navigation
 _console_counter: int = 0  # monotonic id assigned to each collected console message
 
 _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
@@ -693,6 +695,12 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             # "XHR" — storing that made the resource_types filter in
             # list_network_requests unmatchable. Unwrap to the CDP value.
             resource_type = getattr(event.type_, "value", event.type_) or "unknown"
+            target = _target_key(tab)
+            if resource_type == "Document" and str(getattr(event, "frame_id", "")) == target:
+                # The main frame is loading a new document (its frame id is the
+                # target id): the previous page's issues no longer apply.
+                _audit_issues[:] = [i for i in _audit_issues if i[0] != target]
+            post_data = getattr(event.request, "post_data", None)
             _network_requests.append({
                 "seq": _request_counter,
                 "id": str(event.request_id),
@@ -700,6 +708,13 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                 "method": event.request.method,
                 "timestamp": str(event.timestamp),
                 "type": str(resource_type),
+                # For export_har: what was sent, and when on the wall clock (the
+                # timestamp above is monotonic and means nothing outside Chrome).
+                "wall_time": float(getattr(event, "wall_time", 0) or 0),
+                "request_headers": {
+                    str(k): str(v) for k, v in dict(getattr(event.request, "headers", None) or {}).items()
+                },
+                "post_data": post_data[:100_000] if post_data else None,
                 # Filled in by the response-side handlers below. Until then the
                 # request is genuinely still in flight, and saying so is the point:
                 # a pending request and a completed 200 used to look identical.
@@ -723,8 +738,14 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                         rec["status"] = getattr(redirect, "status", None)
                         rec["status_text"] = getattr(redirect, "status_text", "") or ""
                         rec["redirect_to"] = event.request.url
+                        rec["response_headers"] = {
+                            str(k): str(v) for k, v in dict(getattr(redirect, "headers", None) or {}).items()
+                        }
                         break
             _request_counter += 1
+            early = _extra_info_pending.pop(str(event.request_id), None)
+            if early:
+                _network_requests[-1].update(early)
             if len(_network_requests) > 1000:
                 _network_requests.pop(0)
         except Exception:
@@ -737,6 +758,46 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             if rec["id"] == wanted and rec.get("redirect_to") is None:
                 return rec
         return None
+
+    # The headers above are the ones the renderer built. Cookie and Set-Cookie,
+    # and everything else the network stack adds, only appear in the ExtraInfo
+    # events — which can arrive before the event they belong to, so an early
+    # one waits in _extra_info_pending until its record exists.
+    def _attach_extra(request_id: Any, key: str, headers: Any) -> None:
+        values = {str(k): str(v) for k, v in dict(headers or {}).items()}
+        rec = _latest(request_id)
+        if rec is not None and key not in rec:
+            rec[key] = values
+            return
+        _extra_info_pending.setdefault(str(request_id), {})[key] = values
+        while len(_extra_info_pending) > 500:
+            _extra_info_pending.pop(next(iter(_extra_info_pending)))
+
+    async def _on_request_extra(event: cdp_net.RequestWillBeSentExtraInfo):
+        try:
+            _attach_extra(event.request_id, "request_headers_raw", event.headers)
+        except Exception:
+            pass
+
+    async def _on_response_extra(event: cdp_net.ResponseReceivedExtraInfo):
+        try:
+            _attach_extra(event.request_id, "response_headers_raw", event.headers)
+        except Exception:
+            pass
+
+    # What DevTools shows in its Issues panel: CSP violations, mixed content,
+    # rejected cookies, CORS errors. It has to be collected live — Audits.enable
+    # replays the renderer's issues, but not the cookie issues the browser
+    # raises during a navigation (measured: a SameSite=None cookie without
+    # Secure was reported live and never again). The domain has no effect on
+    # the page; it only reports.
+    async def _on_issue(event: _RawIssueAdded):
+        try:
+            _audit_issues.append((_target_key(tab), event.issue))
+            if len(_audit_issues) > 1000:
+                _audit_issues.pop(0)
+        except Exception:
+            pass
 
     async def _on_response(event: cdp_net.ResponseReceived):
         try:
@@ -756,6 +817,9 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             timing = getattr(r, "timing", None)
             if timing is not None:
                 rec["_request_time"] = getattr(timing, "request_time", None)
+            rec["protocol"] = getattr(r, "protocol", "") or ""
+            rec["remote_ip"] = getattr(r, "remote_ip_address", "") or ""
+            rec["security"] = _compact_security_details(getattr(r, "security_details", None))
         except Exception:
             pass
 
@@ -901,9 +965,61 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             tab.add_handler(cdp_net.WebSocketFrameReceived, _on_ws_received)
             tab.add_handler(cdp_net.WebSocketClosed, _on_ws_closed)
             tab.add_handler(cdp_net.WebSocketFrameError, _on_ws_error)
+            tab.add_handler(cdp_net.RequestWillBeSentExtraInfo, _on_request_extra)
+            tab.add_handler(cdp_net.ResponseReceivedExtraInfo, _on_response_extra)
+            tab.add_handler(_RawIssueAdded, _on_issue)
             _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
+        return
+    try:
+        await tab.send(_cdp("Audits.enable"))
+    except Exception:
+        pass  # the network log does not depend on it
+
+
+class _RawIssueAdded:
+    """Audits.issueAdded, left as the dict Chrome sent.
+
+    nodriver parses every event before it looks for a handler, and its typed
+    parser raises on any issue code newer than its bindings — measured on
+    github.com, where "LazyLoadImageIssue" filled the log with tracebacks and the
+    issue itself was lost. Registered in place of nodriver's parser below.
+    """
+
+    def __init__(self, issue: dict) -> None:
+        self.issue = issue
+
+    @classmethod
+    def from_json(cls, json: dict) -> "_RawIssueAdded":
+        return cls(json.get("issue") or {})
+
+
+def _install_raw_issue_parser() -> None:
+    import nodriver.cdp.util as cdp_util
+
+    cdp_util._event_parsers["Audits.issueAdded"] = _RawIssueAdded
+
+
+_install_raw_issue_parser()
+
+
+def _compact_security_details(details: Any) -> dict | None:
+    """The TLS facts audit_security reports, from a response's securityDetails."""
+    if details is None:
+        return None
+    compliance = getattr(details, "certificate_transparency_compliance", None)
+    return {
+        "protocol": getattr(details, "protocol", "") or "",
+        "cipher": getattr(details, "cipher", "") or "",
+        "key_exchange": getattr(details, "key_exchange_group", None) or getattr(details, "key_exchange", "") or "",
+        "subject": getattr(details, "subject_name", "") or "",
+        "issuer": getattr(details, "issuer", "") or "",
+        "valid_from": float(getattr(details, "valid_from", 0) or 0),
+        "valid_to": float(getattr(details, "valid_to", 0) or 0),
+        "san": list(getattr(details, "san_list", None) or [])[:20],
+        "ct": str(getattr(compliance, "value", compliance) or ""),
+    }
 
 
 def _request_outcome(req: dict) -> str:
@@ -7006,6 +7122,801 @@ async def capture_bodies(
         f"Capturing{note}. Tabs opened from now on are included from their first "
         f"request. Check with action=\"status\", end with action=\"stop\".\n{capture.summary()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Security inspection: HAR export, audit, storage inventory
+# ---------------------------------------------------------------------------
+# All three are passive: they read what the browser already holds or was already
+# sent. The one request any of them makes is audit_security's fallback when the
+# page load itself was not recorded, and its answer says so when that happens.
+
+
+def _cdp(method: str, params: dict | None = None):
+    """A raw CDP command for tab.send(), answered with the plain JSON result.
+
+    For Audits, IndexedDB, CacheStorage and friends, whose nodriver bindings parse
+    replies into dataclasses that break on any field newer than the bindings. A
+    dict survives a Chrome update.
+    """
+    result = yield {"method": method, "params": params or {}}
+    return result
+
+
+def _lower_headers(headers: dict | None) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+
+
+def _is_loopback(host: str) -> bool:
+    host = (host or "").strip("[]").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost")
+
+
+def _origin_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme in ("http", "https") else ""
+
+
+# Names that usually mean "this is a credential". Deliberately loose: a false
+# hit costs a line in a report, a miss costs a finding.
+_SENSITIVE_NAME = re.compile(
+    r"sess|(^|[^a-z])sid|auth|token|jwt|login|remember|refresh|secret|passw|api[-_]?key|bearer|credential",
+    re.IGNORECASE,
+)
+_CSRF_NAME = re.compile(r"csrf|xsrf", re.IGNORECASE)
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+
+def _jwt_summary(token: str) -> tuple[str, list[str]]:
+    """Decode a JWT's header and claims — no signature check, it is a read-out."""
+    def decode(segment: str) -> Any:
+        return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+
+    try:
+        head_b64, body_b64 = token.split(".")[:2]
+        header, claims = decode(head_b64), decode(body_b64)
+    except Exception:
+        return "", []
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        return "", []
+    parts = [f"alg={header.get('alg')}"]
+    warnings: list[str] = []
+    if str(header.get("alg", "")).lower() == "none":
+        warnings.append("unsigned (alg=none)")
+    for claim in ("iss", "aud", "scope", "role"):
+        if claim in claims:
+            parts.append(f"{claim}={str(claims[claim])[:60]}")
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        days = (exp - time.time()) / 86400
+        when = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d")
+        parts.append(f"exp={when} ({'expired' if days < 0 else f'{days:.0f}d left'})")
+        if days > 30:
+            warnings.append(f"valid for another {days:.0f} days")
+    else:
+        warnings.append("no exp claim, never expires")
+    parts.append("claims: " + ", ".join(sorted(claims)[:12]))
+    return "JWT " + ", ".join(parts), warnings
+
+
+# -- HAR ---------------------------------------------------------------------------
+
+_TEXTUAL_MIME = re.compile(r"^text/|json|javascript|xml|html|svg|x-www-form-urlencoded|event-stream|ndjson")
+
+
+def _har_body(raw: bytes, mime: str) -> dict:
+    if _TEXTUAL_MIME.search(mime or ""):
+        try:
+            return {"text": raw.decode("utf-8")}
+        except UnicodeDecodeError:
+            pass
+    return {"text": base64.b64encode(raw).decode("ascii"), "encoding": "base64"}
+
+
+def _har_entry(req: dict, body: dict | None) -> dict:
+    from urllib.parse import parse_qsl, urlsplit
+
+    url = req["url"]
+    started = req.get("wall_time") or 0
+    started_iso = (
+        datetime.fromtimestamp(started, tz=timezone.utc).isoformat(timespec="milliseconds")
+        if started else "1970-01-01T00:00:00.000+00:00"
+    )
+    duration = float(req.get("duration_ms") or 0)
+    http_version = req.get("protocol") or "http/1.1"
+    # The wire headers (ExtraInfo) carry Cookie and Set-Cookie; the renderer's
+    # copy does not. A HAR without them is useless for replaying a session.
+    request_headers = req.get("request_headers_raw") or req.get("request_headers") or {}
+    response_headers = req.get("response_headers_raw") or req.get("response_headers") or {}
+    post = req.get("post_data")
+    request: dict[str, Any] = {
+        "method": req.get("method") or "GET",
+        "url": url,
+        "httpVersion": http_version,
+        "cookies": [],
+        "headers": [{"name": k, "value": v} for k, v in request_headers.items()],
+        "queryString": [
+            {"name": k, "value": v} for k, v in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        ],
+        "headersSize": -1,
+        "bodySize": len(post.encode("utf-8")) if post else 0,
+    }
+    if post:
+        request["postData"] = {
+            "mimeType": _lower_headers(request_headers).get("content-type", ""),
+            "text": post,
+        }
+    content: dict[str, Any] = {"size": 0, "mimeType": req.get("mime_type") or "x-unknown"}
+    if body is not None:
+        body = dict(body)
+        content["size"] = body.pop("_size", 0)
+        content.update(body)
+    entry: dict[str, Any] = {
+        "startedDateTime": started_iso,
+        "time": duration,
+        "request": request,
+        "response": {
+            "status": req.get("status") or 0,
+            "statusText": req.get("status_text") or "",
+            "httpVersion": http_version,
+            "cookies": [],
+            "headers": [{"name": k, "value": v} for k, v in response_headers.items()],
+            "content": content,
+            "redirectURL": req.get("redirect_to") or "",
+            "headersSize": -1,
+            "bodySize": req["size"] if req.get("size") is not None else -1,
+        },
+        "cache": {},
+        "timings": {"blocked": -1, "dns": -1, "connect": -1, "ssl": -1, "send": 0, "wait": duration, "receive": 0},
+        "_resourceType": str(req.get("type") or "other").lower(),
+    }
+    if req.get("remote_ip"):
+        entry["serverIPAddress"] = req["remote_ip"].strip("[]")
+    if req.get("failed") and req.get("status") is None:
+        entry["_error"] = req.get("status_text") or "failed"
+    if req.get("type") == "WebSocket":
+        entry["_webSocketMessages"] = [
+            {"type": "send" if f["dir"] == "sent" else "receive", "time": 0,
+             "opcode": 1 if f["kind"] == "text" else 2, "data": f["data"]}
+            for f in req.get("frames") or []
+        ]
+    return entry
+
+
+@tool(title="Export network log as HAR")
+async def export_har(
+    file_path: Annotated[str, Field(description="Where to write the .har file.")],
+    include_bodies: Annotated[
+        bool,
+        Field(description=(
+            "Embed response bodies: from capture_bodies' files where there is one, "
+            "otherwise whatever Chrome still holds. Off gives headers and timing only."
+        )),
+    ] = True,
+    include_preserved_requests: Annotated[
+        bool,
+        Field(description="Also export the previous 3 navigations' requests, not just the current page's."),
+    ] = True,
+    url_filter: Annotated[
+        str,
+        Field(description='Only requests whose URL contains this substring, e.g. "/api/". Empty exports all.'),
+    ] = "",
+) -> str:
+    """Write the network log to a HAR 1.2 file — importable into Burp, ZAP,
+    Chrome DevTools, Charles and anything else that reads HAR.
+
+    Headers are the ones that went over the wire, Cookie and Set-Cookie
+    included, with POST bodies, status, timing, server IP and WebSocket frames.
+    Response bodies come from capture_bodies' files where available — start a
+    capture first for a HAR that has every body — and otherwise from Chrome's
+    buffer, which only still holds recent ones on the current tab.
+
+    The file holds live session cookies and tokens; treat it like a password.
+    """
+    tab = await _active_tab()
+    import nodriver.cdp.network as cdp_net
+
+    requests = list(_all_network_requests() if include_preserved_requests else _network_requests)
+    if url_filter:
+        requests = [r for r in requests if url_filter in r["url"]]
+    if not requests:
+        raise ToolFailure("No network requests collected to export." + (" (url_filter matched none)" if url_filter else ""))
+
+    entries = []
+    from_capture = from_chrome = without = 0
+    for req in requests:
+        body = None
+        if include_bodies and req.get("type") != "WebSocket" and req.get("status") and not req.get("redirect_to"):
+            path = req.get("captured_file")
+            if path and os.path.isfile(path):
+                with open(path, "rb") as f:
+                    raw = f.read()
+                body = {**_har_body(raw, req.get("mime_type", "")), "_size": len(raw)}
+                from_capture += 1
+            else:
+                try:
+                    text, is_b64 = await tab.send(cdp_net.get_response_body(cdp_net.RequestId(req["id"])))
+                    raw = base64.b64decode(text) if is_b64 else text.encode("utf-8")
+                    body = {**_har_body(raw, req.get("mime_type", "")), "_size": len(raw)}
+                    from_chrome += 1
+                except Exception:
+                    without += 1
+        entries.append(_har_entry(req, body))
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        own_version = version("nodriver-mcp")
+    except PackageNotFoundError:
+        own_version = "dev"
+    har = {"log": {
+        "version": "1.2",
+        "creator": {"name": "nodriver-mcp", "version": own_version},
+        "pages": [],
+        "entries": entries,
+    }}
+    target = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        data = json.dumps(har, ensure_ascii=False, indent=1)
+        await asyncio.to_thread(_write_bytes, target, data.encode("utf-8"))
+    except OSError as e:
+        raise ToolFailure(f"Could not write {target}: {e}")
+    lines = [f"Wrote {len(entries)} requests to {target} ({len(data) / 1_048_576:.2f} MB)."]
+    if include_bodies:
+        lines.append(
+            f"Response bodies: {from_capture} from capture_bodies, {from_chrome} from Chrome's buffer, "
+            f"{without} no longer available."
+        )
+        if without and not from_capture:
+            lines.append("Start capture_bodies before browsing to get every body into the next export.")
+    return "\n".join(lines)
+
+
+# -- audit ---------------------------------------------------------------------------
+
+def _csp_policies(value: str) -> list[dict[str, list[str]]]:
+    """Parse one or more CSP headers. Chrome joins repeated headers with a newline."""
+    policies = []
+    for policy in re.split(r"[,\n]", value or ""):
+        directives: dict[str, list[str]] = {}
+        for part in policy.split(";"):
+            tokens = part.strip().split()
+            if tokens:
+                directives.setdefault(tokens[0].lower(), [t.lower() for t in tokens[1:]])
+        if directives:
+            policies.append(directives)
+    return policies
+
+
+def _csp_findings(csp: str, report_only: str, has_xfo: bool) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    policies = _csp_policies(csp)
+    if not policies:
+        if report_only:
+            findings.append(("WARN", "Content-Security-Policy is Report-Only — violations are logged, nothing is blocked."))
+        else:
+            findings.append(("WARN", "No Content-Security-Policy: an injected script runs with nothing to stop it."))
+        if not has_xfo:
+            findings.append(("WARN", "Neither X-Frame-Options nor CSP frame-ancestors: any site can frame this page (clickjacking)."))
+        return findings
+
+    def weak_everywhere(check) -> bool:
+        # With several policies a source must pass all of them, so a weakness
+        # only matters if every policy has it.
+        return all(check(p) for p in policies)
+
+    def script_sources(p: dict) -> list[str] | None:
+        return p.get("script-src", p.get("default-src"))
+
+    def unrestricted(p: dict) -> bool:
+        return script_sources(p) is None
+
+    def allows_inline(p: dict) -> bool:
+        src = script_sources(p) or []
+        hashed = any(s.startswith(("'nonce-", "'sha256-", "'sha384-", "'sha512-")) for s in src)
+        return "'unsafe-inline'" in src and not hashed  # a nonce or hash switches unsafe-inline off
+
+    def allows_eval(p: dict) -> bool:
+        return "'unsafe-eval'" in (script_sources(p) or [])
+
+    def allows_any_host(p: dict) -> bool:
+        src = script_sources(p) or []
+        if "'strict-dynamic'" in src:
+            return False  # host and scheme sources are ignored under strict-dynamic
+        return any(s in ("*", "http:", "https:", "data:", "blob:") for s in src)
+
+    if weak_everywhere(unrestricted):
+        findings.append(("WARN", "CSP has neither script-src nor default-src, so scripts are not restricted at all."))
+    else:
+        if weak_everywhere(allows_inline):
+            findings.append(("WARN", "CSP script-src allows 'unsafe-inline' without a nonce or hash — injected inline scripts run."))
+        if weak_everywhere(allows_eval):
+            findings.append(("WARN", "CSP script-src allows 'unsafe-eval'."))
+        if weak_everywhere(allows_any_host):
+            findings.append(("WARN", "CSP script-src allows any host or scheme (*, https:, data: or blob:)."))
+    if weak_everywhere(lambda p: "object-src" not in p and "default-src" not in p):
+        findings.append(("INFO", "CSP does not restrict object-src (plugins)."))
+    if weak_everywhere(lambda p: "base-uri" not in p):
+        findings.append(("INFO", "CSP has no base-uri: an injected <base> tag can redirect relative script URLs."))
+    if weak_everywhere(lambda p: "frame-ancestors" not in p) and not has_xfo:
+        findings.append(("WARN", "Neither X-Frame-Options nor CSP frame-ancestors: any site can frame this page (clickjacking)."))
+    return findings
+
+
+def _header_findings(url: str, headers: dict[str, str]) -> list[tuple[str, str]]:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    findings: list[tuple[str, str]] = []
+    https = parts.scheme == "https"
+    if not https and not _is_loopback(parts.hostname or ""):
+        findings.append(("WARN", "The page is served over plain HTTP — everything on it can be read and changed in transit."))
+    if https:
+        hsts = headers.get("strict-transport-security", "")
+        if not hsts:
+            findings.append(("WARN", "No Strict-Transport-Security: a first visit over http:// can be downgraded."))
+        else:
+            match = re.search(r"max-age\s*=\s*\"?(\d+)", hsts, re.IGNORECASE)
+            age = int(match.group(1)) if match else 0
+            if age < 15_552_000:
+                findings.append(("WARN", f"HSTS max-age is {age}s, under the 180 days browsers' preload list asks for."))
+            if "includesubdomains" not in hsts.lower():
+                findings.append(("INFO", "HSTS does not cover subdomains (no includeSubDomains)."))
+    xfo = headers.get("x-frame-options", "")
+    if xfo and xfo.strip().lower() not in ("deny", "sameorigin"):
+        findings.append(("INFO", f"X-Frame-Options {xfo!r} is not a value browsers honour (only DENY or SAMEORIGIN)."))
+    has_xfo = xfo.strip().lower() in ("deny", "sameorigin")
+    findings += _csp_findings(
+        headers.get("content-security-policy", ""),
+        headers.get("content-security-policy-report-only", ""),
+        has_xfo,
+    )
+    if headers.get("x-content-type-options", "").strip().lower() != "nosniff":
+        findings.append(("INFO", "No X-Content-Type-Options: nosniff — the browser may sniff content types."))
+    referrer = headers.get("referrer-policy", "").lower()
+    if any(p in referrer for p in ("unsafe-url", "no-referrer-when-downgrade")):
+        findings.append(("WARN", f"Referrer-Policy {referrer!r} sends the full URL, query string included, to other sites."))
+    elif not referrer:
+        findings.append(("INFO", "No Referrer-Policy (browsers default to strict-origin-when-cross-origin)."))
+    if not headers.get("permissions-policy"):
+        findings.append(("INFO", "No Permissions-Policy."))
+    if not headers.get("cross-origin-opener-policy"):
+        findings.append(("INFO", "No Cross-Origin-Opener-Policy: pages this one opens keep a handle to it."))
+    for name in ("server", "x-powered-by", "x-aspnet-version", "x-aspnetmvc-version", "x-generator"):
+        value = headers.get(name, "")
+        if value and re.search(r"\d", value):
+            findings.append(("INFO", f"{name} discloses a version: {value[:80]}"))
+    return findings
+
+
+def _cors_findings(requests: list[dict]) -> list[tuple[str, str]]:
+    seen: dict[str, tuple[str, str]] = {}
+    for req in requests:
+        headers = _lower_headers(req.get("response_headers_raw") or req.get("response_headers"))
+        allow_origin = headers.get("access-control-allow-origin", "").strip()
+        if not allow_origin:
+            continue
+        credentials = headers.get("access-control-allow-credentials", "").strip().lower() == "true"
+        where = _origin_of(req["url"]) or req["url"][:80]
+        if allow_origin == "null":
+            # Any sandboxed iframe or data: page has origin "null", so this is
+            # reachable from an attacker's page — with credentials, readably.
+            seen.setdefault(f"null:{where}", (
+                "WARN" if credentials else "INFO",
+                f"{where} allows the origin 'null' (sandboxed iframes, data: and file: pages)"
+                + (" with credentials." if credentials else "."),
+            ))
+        elif allow_origin == "*" and credentials:
+            seen.setdefault(f"star:{where}", (
+                "INFO",
+                f"{where} sends Access-Control-Allow-Origin: * with Allow-Credentials: true — browsers "
+                "refuse that pair, so it is a misconfiguration rather than an open door.",
+            ))
+    return list(seen.values())
+
+
+def _cookie_findings(cookies: list[dict], page_host: str, https: bool) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    unflagged = []
+    for c in cookies:
+        name, domain = c.get("name", ""), c.get("domain", "")
+        label = f"{name} ({domain})"
+        sensitive = bool(_SENSITIVE_NAME.search(name)) and not _CSRF_NAME.search(name)
+        if https and not c.get("secure"):
+            findings.append(("WARN", f"{label} has no Secure flag — it is also sent over plain http://."))
+        if not c.get("httpOnly"):
+            if sensitive:
+                findings.append(("WARN", f"{label} looks like a session or auth cookie and has no HttpOnly — page scripts, and so any XSS, can read it."))
+            else:
+                unflagged.append(name)
+        same_site = c.get("sameSite")
+        if same_site == "None" and sensitive:
+            findings.append(("INFO", f"{label} is SameSite=None: sent on cross-site requests, so CSRF protection must come from elsewhere."))
+        if domain.startswith(".") and sensitive and page_host.endswith(domain.lstrip(".")):
+            findings.append(("INFO", f"{label} is scoped to every subdomain of {domain.lstrip('.')}."))
+        expires = c.get("expires") or -1
+        if sensitive and expires > 0 and (expires - time.time()) > 30 * 86400:
+            findings.append(("INFO", f"{label} lives {(expires - time.time()) / 86400:.0f} more days."))
+    if unflagged:
+        findings.append(("INFO", f"Readable by page scripts (no HttpOnly): {', '.join(sorted(set(unflagged))[:15])}"))
+    return findings
+
+
+# The issue kinds a security review cares about, listed in full and in this
+# order. Everything else (performance, quirks mode, contrast, lazy loading…)
+# is summed up in one line.
+_ISSUE_TITLES = {
+    "MixedContentIssue": "Mixed content",
+    "ContentSecurityPolicyIssue": "CSP violations",
+    "CookieIssue": "Cookie problems",
+    "CorsIssue": "CORS errors",
+    "BlockedByResponseIssue": "Blocked by a response header (COEP/CORP)",
+    "SRIMessageSignatureIssue": "Subresource integrity",
+    "SharedArrayBufferIssue": "SharedArrayBuffer without cross-origin isolation",
+    "GenericIssue": "Other reported problems",
+    "DeprecationIssue": "Deprecated features in use",
+}
+
+
+def _issue_line(code: str, details: dict) -> str:
+    if code == "CookieIssue":
+        cookie = details.get("cookie") or {}
+        name = cookie.get("name") or (details.get("rawCookieLine") or "")[:40]
+        reasons = details.get("cookieExclusionReasons") or details.get("cookieWarningReasons") or []
+        return f"{name} ({cookie.get('domain', '')}): {', '.join(reasons)} on {details.get('operation', '')}"
+    if code == "ContentSecurityPolicyIssue":
+        kind = {
+            "kInlineViolation": "an inline script or style",
+            "kEvalViolation": "eval()",
+            "kWasmEvalViolation": "WebAssembly compilation",
+            "kTrustedTypesSinkViolation": "a Trusted Types sink",
+            "kTrustedTypesPolicyViolation": "a Trusted Types policy",
+        }.get(details.get("contentSecurityPolicyViolationType", ""), "")
+        blocked = details.get("blockedURL") or kind or "?"
+        where = (details.get("sourceCodeLocation") or {}).get("url", "")
+        mode = "would block (report-only)" if details.get("isReportOnly") else "blocked"
+        return f"{details.get('violatedDirective', '?')} {mode} {blocked}" + (f" in {where}" if where else "")
+    if code == "MixedContentIssue":
+        return f"{details.get('resolutionStatus', '')}: {details.get('insecureURL', '')} on {details.get('mainResourceURL', '')}"
+    if code == "CorsIssue":
+        status = details.get("corsErrorStatus") or {}
+        return f"{status.get('corsError', '?')} {(details.get('request') or {}).get('url', '')}"
+    if code == "BlockedByResponseIssue":
+        return f"{details.get('reason', '?')} {(details.get('request') or {}).get('url', '')}"
+    if code == "DeprecationIssue":
+        return str(details.get("type", "?"))
+    values = [f"{k}={v}" for k, v in details.items() if isinstance(v, (str, int, bool)) and k not in ("frameId", "loaderId")]
+    return ", ".join(values[:4]) or code
+
+
+
+AuditCheck = Literal["headers", "tls", "cookies", "issues"]
+
+
+@tool(title="Audit page security", read_only=True)
+async def audit_security(
+    checks: Annotated[
+        list[AuditCheck] | None,
+        Field(description=(
+            'Which parts to run: "headers" (security headers, CSP analysis, CORS on '
+            'every recorded response, version disclosure), "tls" (protocol, cipher, '
+            'certificate of every origin the page talked to), "cookies" (flags of '
+            'every cookie sent to those origins) and "issues" (what Chrome itself '
+            "flagged: CSP violations, mixed content, rejected cookies, CORS errors). "
+            "Omit for all four."
+        )),
+    ] = None,
+) -> str:
+    """Passive security review of the selected page, from what the browser
+    already has — a starting point for a manual test, not a verdict.
+
+    WARN marks a concrete weakness, INFO context worth a look. Headers come from
+    the recorded page load; if it was not recorded (a tab the server did not
+    open), the page URL is fetched once from the page and the answer says so.
+    Chrome's issues are collected from the moment the server first touches a
+    tab, so on a tab it had not touched, reload the page for a full list.
+    Cookie values are never printed — use get_cookies for those.
+    """
+    from urllib.parse import urlsplit
+
+    tab = await _active_tab()
+    fresh = (getattr(tab, "target_id", None), getattr(tab, "session_id", None)) not in _network_collection_enabled_tabs
+    await _auto_enable_network_collection(tab)
+    if fresh:
+        await asyncio.sleep(0.5)  # Audits.enable replays what the renderer already reported
+    await _refresh_targets(await _get_browser())
+    page_url = tab.target.url if tab.target else ""
+    parts = urlsplit(page_url or "")
+    if parts.scheme not in ("http", "https"):
+        raise ToolFailure(f"Nothing to audit on {page_url or 'this tab'} — navigate to an http(s) page first.")
+    wanted = set(checks or ["headers", "tls", "cookies", "issues"])
+    page_requests = list(_network_requests)
+
+    def _is_page(rec: dict) -> bool:
+        return rec["url"].split("#")[0] == page_url.split("#")[0] and bool(rec.get("status")) and not rec.get("redirect_to")
+
+    doc = next((r for r in reversed(page_requests) if _is_page(r) and r.get("type") == "Document"), None)
+    source = "the recorded page load"
+    if doc is None and wanted & {"headers", "tls"}:
+        # The load happened before collection was on (a tab opened by the page
+        # itself, say). One same-origin fetch of the same URL gets the headers
+        # through the network log, Set-Cookie and TLS details included.
+        try:
+            await _evaluate_value(
+                tab,
+                "fetch(location.href, {credentials: 'include', cache: 'no-store'}).then(r => r.status)",
+                await_promise=True,
+            )
+            await asyncio.sleep(0.3)
+            doc = next((r for r in reversed(_network_requests) if _is_page(r)), None)
+            source = "a fresh fetch() of the page URL (the page load itself was not recorded)"
+        except Exception as e:
+            source = f"nothing — the page load was not recorded and re-fetching it failed: {e}"
+
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+    headers = _lower_headers((doc or {}).get("response_headers_raw") or (doc or {}).get("response_headers"))
+
+    if "headers" in wanted:
+        findings = _header_findings(page_url, headers) if doc else [("WARN", "No response headers to audit.")]
+        findings += _cors_findings(page_requests)
+        sections.append((f"Headers (from {source})", findings))
+
+    if "tls" in wanted:
+        findings = []
+        by_origin: dict[str, dict] = {}
+        for rec in ([doc] if doc else []) + page_requests:
+            origin = _origin_of(rec["url"])
+            if origin and origin not in by_origin and rec.get("status"):
+                by_origin[origin] = rec
+        for origin, rec in by_origin.items():
+            host = urlsplit(origin).hostname or ""
+            sec = rec.get("security")
+            if origin.startswith("http://"):
+                if not _is_loopback(host):
+                    findings.append(("WARN", f"{origin}: plain HTTP, no TLS."))
+                continue
+            if not sec:
+                continue
+            valid_to = sec.get("valid_to") or 0
+            days = (valid_to - time.time()) / 86400 if valid_to else None
+            line = (
+                f"{origin}: {sec['protocol']}, {sec['cipher']}"
+                + (f", {sec['key_exchange']}" if sec.get("key_exchange") else "")
+                + f"; cert {sec['subject']} by {sec['issuer']}"
+                + (f", valid until {datetime.fromtimestamp(valid_to, tz=timezone.utc):%Y-%m-%d}" if valid_to else "")
+            )
+            level = "INFO"
+            if sec["protocol"] in ("TLS 1.0", "TLS 1.1", "SSL 3.0"):
+                level, line = "WARN", line + f" — {sec['protocol']} is deprecated and broken"
+            # Certificates are short-lived now and renewed with weeks to spare, so
+            # only the last week is worth a warning.
+            if days is not None and days < 0:
+                level, line = "WARN", line + " — the certificate has EXPIRED"
+            elif days is not None and days < 7:
+                level, line = "WARN", line + f" — expires in {days:.0f} days"
+            if sec.get("ct") == "not-compliant":
+                level, line = "WARN", line + " — not Certificate Transparency compliant"
+            findings.append((level, line))
+        sections.append(("TLS", findings or [("INFO", "No TLS details recorded (plain HTTP or nothing loaded).")]))
+
+    if "cookies" in wanted:
+        urls = sorted({_origin_of(r["url"]) + "/" for r in page_requests if _origin_of(r["url"])} | {page_url})[:50]
+        try:
+            cookies = (await tab.send(_cdp("Network.getCookies", {"urls": urls}))).get("cookies", [])
+            findings = _cookie_findings(cookies, parts.hostname or "", parts.scheme == "https")
+            title = f"Cookies ({len(cookies)} sent to {len(urls)} origin(s) of this page)"
+        except Exception as e:
+            findings, title = [("WARN", f"Could not read cookies: {e}")], "Cookies"
+        sections.append((title, findings or [("INFO", "Nothing to flag.")]))
+
+    issue_lines: list[str] = []
+    if "issues" in wanted:
+        grouped: dict[str, list[str]] = {}
+        target = _target_key(tab)
+        for issue in [i for t, i in _audit_issues if t == target]:
+            code = issue.get("code", "")
+            details = next(iter((issue.get("details") or {}).values()), {}) or {}
+            grouped.setdefault(code, []).append(_issue_line(code, details))
+        for code in [c for c in _ISSUE_TITLES if c in grouped]:
+            lines = list(dict.fromkeys(grouped[code]))
+            issue_lines.append(f"  {_ISSUE_TITLES[code]} ({len(grouped[code])}):")
+            issue_lines += [f"    {line[:200]}" for line in lines[:8]]
+            if len(lines) > 8:
+                issue_lines.append(f"    … {len(lines) - 8} more")
+        others = sorted(c for c in grouped if c not in _ISSUE_TITLES)
+        if others:
+            issue_lines.append("  Not security-related: " + ", ".join(f"{c} ({len(grouped[c])})" for c in others))
+        if not grouped:
+            issue_lines.append("  none")
+
+    warn = sum(1 for _, f in sections for level, _ in f if level == "WARN")
+    info = sum(1 for _, f in sections for level, _ in f if level == "INFO")
+    summary = f"{warn} WARN, {info} INFO"
+    if "issues" in wanted:
+        relevant = sum(len(v) for c, v in grouped.items() if c in _ISSUE_TITLES)
+        summary += f", {relevant} security-related issue{'s' if relevant != 1 else ''} reported by Chrome"
+    out = [f"Security audit of {page_url}", f"{summary}. Passive checks only; confirm before reporting."]
+    for title, findings in sections:
+        out.append(f"\n{title}")
+        for level in ("WARN", "INFO"):
+            out += [f"  {level}  {text}" for lvl, text in findings if lvl == level]
+    if "issues" in wanted:
+        out.append("\nReported by Chrome (DevTools Issues)")
+        out += issue_lines
+    return "\n".join(out)
+
+
+# -- storage ---------------------------------------------------------------------------
+
+def _storage_findings(area: str, items: list[list[str]], reveal: bool) -> tuple[list[str], list[tuple[str, str]]]:
+    lines: list[str] = []
+    findings: list[tuple[str, str]] = []
+
+    def show(value: str, sensitive: bool) -> str:
+        if reveal or not sensitive:
+            return value[:120] + ("…" if len(value) > 120 else "")
+        return f"{value[:6]}… ({len(value)} chars, reveal_values=true shows it)"
+
+    def inspect_value(path: str, value: str) -> bool:
+        """Flag credentials by name or shape; returns whether this one is."""
+        jwt = _JWT_RE.search(value)
+        named = bool(_SENSITIVE_NAME.search(path)) and not _CSRF_NAME.search(path)
+        if not (jwt or named or value.lower().startswith("bearer ")):
+            return False
+        text = f"{area}[{path}] holds what looks like a credential — any script on this origin, so any XSS, can read it."
+        if jwt:
+            summary, warnings = _jwt_summary(jwt.group(0))
+            if summary:
+                text += f" {summary}."
+            if warnings:
+                text += " " + "; ".join(warnings).capitalize() + "."
+        findings.append(("WARN", text))
+        return True
+
+    def walk(prefix: str, node: Any, depth: int) -> None:
+        if depth > 3:
+            return
+        if isinstance(node, dict):
+            for k, v in list(node.items())[:200]:
+                walk(f"{prefix}.{k}", v, depth + 1)
+        elif isinstance(node, list):
+            for i, v in enumerate(node[:50]):
+                walk(f"{prefix}[{i}]", v, depth + 1)
+        elif isinstance(node, str):
+            inspect_value(prefix, node)
+
+    for key, value in items:
+        sensitive = inspect_value(key, value)
+        if not sensitive and value[:1] in "{[":
+            try:
+                before = len(findings)
+                walk(key, json.loads(value), 0)
+                sensitive = len(findings) > before
+            except ValueError:
+                pass
+        lines.append(f"    {key} = {show(value, sensitive)}")
+    return lines, findings
+
+
+@tool(title="Inspect page storage", read_only=True)
+async def inspect_storage(
+    reveal_values: Annotated[
+        bool,
+        Field(description=(
+            "Print values that look like credentials in full (up to 120 characters). "
+            "Default false shows their first characters and length only."
+        )),
+    ] = False,
+) -> str:
+    """Everything the selected page's origin keeps in the browser: localStorage,
+    sessionStorage, IndexedDB, Cache Storage, service workers and quota usage.
+
+    Flags values that look like credentials — by key name, JWT shape or a
+    "Bearer" prefix, also inside JSON values — because anything in web storage
+    is readable by every script on the origin. JWTs are decoded (algorithm,
+    expiry, claims; the signature is not checked).
+
+    Read through DevTools, not page JavaScript, except for the list of service
+    worker registrations. IndexedDB and Cache Storage are listed with their
+    sizes, not dumped; use evaluate_script to read records.
+    """
+    tab = await _active_tab()
+    await _refresh_targets(await _get_browser())
+    page_url = tab.target.url if tab.target else ""
+    origin = _origin_of(page_url or "")
+    if not origin:
+        raise ToolFailure(f"{page_url or 'This tab'} has no web origin — navigate to an http(s) page first.")
+
+    out = [f"Storage for {origin}"]
+    findings: list[tuple[str, str]] = []
+    errors: list[str] = []
+
+    try:
+        quota = await tab.send(_cdp("Storage.getUsageAndQuota", {"origin": origin}))
+        used = ", ".join(
+            f"{u['storageType']} {u['usage'] / 1024:.1f} KB" for u in quota.get("usageBreakdown", []) if u.get("usage")
+        )
+        out.append(f"Usage: {quota.get('usage', 0) / 1024:.1f} KB" + (f" ({used})" if used else ""))
+    except Exception as e:
+        errors.append(f"quota: {e}")
+
+    for area, is_local in (("localStorage", True), ("sessionStorage", False)):
+        try:
+            items = (await tab.send(_cdp("DOMStorage.getDOMStorageItems", {
+                "storageId": {"securityOrigin": origin, "isLocalStorage": is_local},
+            }))).get("entries", [])
+        except Exception as e:
+            errors.append(f"{area}: {e}")
+            continue
+        out.append(f"\n{area} ({len(items)} key{'s' if len(items) != 1 else ''})")
+        lines, found = _storage_findings(area, items, reveal_values)
+        out += lines[:60]
+        if len(lines) > 60:
+            out.append(f"    … {len(lines) - 60} more")
+        findings += found
+
+    try:
+        names = (await tab.send(_cdp("IndexedDB.requestDatabaseNames", {"securityOrigin": origin}))).get("databaseNames", [])
+        out.append(f"\nIndexedDB ({len(names)} database{'s' if len(names) != 1 else ''})")
+        for db_name in names[:20]:
+            db = (await tab.send(_cdp("IndexedDB.requestDatabase", {
+                "securityOrigin": origin, "databaseName": db_name,
+            }))).get("databaseWithObjectStores", {})
+            stores = []
+            for store in db.get("objectStores", [])[:30]:
+                try:
+                    count = (await tab.send(_cdp("IndexedDB.getMetadata", {
+                        "securityOrigin": origin, "databaseName": db_name, "objectStoreName": store["name"],
+                    }))).get("entriesCount", "?")
+                except Exception:
+                    count = "?"
+                stores.append(f"{store['name']} ({count:g} entries)" if isinstance(count, (int, float)) else f"{store['name']} (? entries)")
+                if _SENSITIVE_NAME.search(store["name"]):
+                    findings.append(("INFO", f"IndexedDB {db_name}/{store['name']} may hold credentials — read it with evaluate_script."))
+            out.append(f"    {db_name} v{db.get('version', '?')}: {', '.join(stores) or 'no object stores'}")
+    except Exception as e:
+        errors.append(f"IndexedDB: {e}")
+
+    try:
+        caches = (await tab.send(_cdp("CacheStorage.requestCacheNames", {"securityOrigin": origin}))).get("caches", [])
+        out.append(f"\nCache Storage ({len(caches)} cache{'s' if len(caches) != 1 else ''})")
+        for cache in caches[:20]:
+            entries = await tab.send(_cdp("CacheStorage.requestEntries", {
+                "cacheId": cache["cacheId"], "skipCount": 0, "pageSize": 5,
+            }))
+            urls = [e.get("requestURL", "") for e in entries.get("cacheDataEntries", [])]
+            out.append(f"    {cache.get('cacheName')}: {entries.get('returnCount', len(urls))} entries" + (f", e.g. {', '.join(u[:80] for u in urls[:3])}" if urls else ""))
+            if any(re.search(r"/api/|auth|token|user|account", u, re.IGNORECASE) for u in urls):
+                findings.append(("INFO", f"Cache {cache.get('cacheName')!r} holds API or account responses — readable offline, and after logout unless cleared."))
+    except Exception as e:
+        errors.append(f"Cache Storage: {e}")
+
+    try:
+        registrations = await _evaluate_value(tab, (
+            "navigator.serviceWorker ? navigator.serviceWorker.getRegistrations().then(rs => rs.map(r => ({"
+            " scope: r.scope, script: (r.active || r.waiting || r.installing || {}).scriptURL || '',"
+            " state: r.active ? 'active' : r.waiting ? 'waiting' : 'installing' }))) : []"
+        ), await_promise=True) or []
+        out.append(f"\nService workers ({len(registrations)})")
+        out += [f"    {r['scope']} -> {r['script']} ({r['state']})" for r in registrations]
+    except Exception as e:
+        errors.append(f"service workers: {e}")
+
+    try:
+        cookies = (await tab.send(_cdp("Network.getCookies", {"urls": [page_url]}))).get("cookies", [])
+        out.append(f"\nCookies sent to this page: {len(cookies)} (audit_security checks their flags)")
+    except Exception as e:
+        errors.append(f"cookies: {e}")
+
+    if findings:
+        out.append("\nFindings")
+        out += [f"  {level}  {text}" for level, text in sorted(findings, key=lambda f: f[0] != "WARN")]
+    if errors:
+        out.append("\nCould not read: " + "; ".join(errors))
+    return "\n".join(out)
 
 
 @tool(title="Wait for element", read_only=True, open_world=True)

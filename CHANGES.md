@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.5.0 — response bodies that are on disk before Chrome can drop them
+## 2.5.0 — response bodies that cannot get lost, and a passive security review
 
 The flagship workflow — find the page's own API call, read the JSON it already
 received — had a hole the size of Chrome's buffer. `get_network_request` asks
@@ -42,9 +42,46 @@ Every test was also run against a broken capture to prove it catches one: with
 bodies not written, four of the five fail; with event streams handled like any
 other body, the stream test fails because the page starves.
 
+### Security review tools
+
+Three passive tools for testing a site you are authorised to test. They read
+what the browser already holds and send nothing beyond a normal page load.
+
+**`audit_security`** reviews the selected page: security headers with a CSP
+analysis that knows a nonce switches `'unsafe-inline'` off, that `strict-dynamic`
+voids host allowlists and that a weakness only counts if every policy has it;
+CORS on every recorded response; TLS protocol, cipher and certificate of every
+origin the page talked to; the flags of every cookie sent to those origins
+(names only, never values); and what Chrome's own Issues panel reports — CSP
+violations, mixed content, rejected cookies, CORS errors. Its test runs a
+deliberately weak page and a hardened one, and the hardened one must come back
+with zero warnings: a report that cries wolf gets ignored.
+
+Chrome's issues are collected live now, alongside the network log.
+`Audits.enable` does replay what the renderer reported earlier, but not the
+cookie issues the browser raises during a navigation — measured, a
+`SameSite=None` cookie without `Secure` was reported live and never again. They
+are kept per tab and dropped when its main frame loads a new document. nodriver's
+typed parser for these events raises on any issue code newer than its bindings
+(`LazyLoadImageIssue` on github.com filled the log with tracebacks), so the
+server parses them itself.
+
+**`inspect_storage`** lists localStorage, sessionStorage, IndexedDB, Cache
+Storage, service workers and quota for the page's origin, read through DevTools
+rather than page JavaScript. Values that look like credentials — by key name,
+JWT shape or a Bearer prefix, also inside JSON values — are flagged and masked
+unless `reveal_values` is set, and JWTs are decoded: algorithm, expiry, claims.
+
+**`export_har`** writes the network log as HAR 1.2 for Burp, ZAP or DevTools.
+The network log now also keeps the headers that went over the wire, from
+Chrome's ExtraInfo events — the renderer's copy it kept before has no Cookie
+and no Set-Cookie, which makes a HAR useless for replaying a session — plus POST
+bodies, wall-clock start times, protocol, server IP and TLS details. Response
+bodies come from `capture_bodies` where it ran, otherwise from Chrome's buffer.
+
 nodriver stays at 0.50.3, which is still the newest release on PyPI.
 
-Tool count: 65 → 66.
+Tool count: 65 → 69.
 
 ## 2.4.0 — what a uid promises, and five tools that reported work they had not done
 
