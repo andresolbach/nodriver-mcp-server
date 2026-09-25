@@ -36,9 +36,9 @@ def _params(tool) -> dict:
 # ---------------------------------------------------------------------------
 
 def test_tool_count(tools):
-    # 67 browser tools + browser_status, which the routing layer consumes and
+    # 68 browser tools + browser_status, which the routing layer consumes and
     # hides from clients.
-    assert len(tools) == 68
+    assert len(tools) == 69
 
 
 def test_tool_names_are_unique(tools):
@@ -50,7 +50,7 @@ def test_no_tool_was_renamed_by_accident(by_name):
     """Tool names are public API — a rename silently breaks every user's prompts."""
     expected = {
         "audit_security", "block_resources", "browser_status", "bypass_insecure_warning",
-        "capture_bodies", "export_har", "inspect_storage",
+        "capture_bodies", "export_har", "inspect_storage", "search_bodies",
         "cf_verify", "clear_cookies",
         "click", "click_at", "close_browser", "close_page", "create_profile",
         "select_option", "set_checked", "list_frames", "set_proxy",
@@ -126,7 +126,7 @@ def test_every_tool_is_annotated(tools):
 
 def test_read_only_tools_are_marked(by_name):
     for name in ("take_snapshot", "list_pages", "get_cookies", "query_selector",
-                 "audit_security", "inspect_storage"):
+                 "audit_security", "inspect_storage", "search_bodies"):
         assert by_name[name].annotations.readOnlyHint is True, name
 
 

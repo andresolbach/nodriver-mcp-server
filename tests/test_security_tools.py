@@ -8,15 +8,25 @@ directions are asserted.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import re
 import time
 
 import pytest
 
 from capture_site import CaptureSite
 from nodriver_mcp import server
-from nodriver_mcp.server import _cookie_findings, _csp_findings, _jwt_summary
+from nodriver_mcp.server import (
+    _cache_findings,
+    _cookie_findings,
+    _csp_findings,
+    _format_initiator,
+    _jwt_summary,
+    _site_of,
+    _timing_phases,
+)
 from test_browser_behaviour import _call, _run
 
 
@@ -69,9 +79,119 @@ def test_cookie_flags():
     assert "csrftoken (a.test) looks like" not in text
 
 
+def test_a_reused_connection_reports_no_dns_or_connect_phase():
+    fresh = {"duration_ms": 200.0, "timing": {
+        "dns_start": 1, "dns_end": 11, "connect_start": 11, "connect_end": 41, "ssl_start": 20,
+        "ssl_end": 41, "send_start": 41, "send_end": 42, "receive_headers_end": 150,
+        "proxy_start": -1, "proxy_end": -1, "worker_start": -1, "worker_ready": -1,
+    }}
+    phases = _timing_phases(fresh)
+    assert phases["dns"] == 10 and phases["connect"] == 30 and phases["tls"] == 21
+    assert phases["wait"] == 108 and phases["download"] == 50
+
+    reused = {"duration_ms": 50.0, "timing": {**fresh["timing"], "dns_start": -1, "dns_end": -1,
+                                              "connect_start": -1, "connect_end": -1,
+                                              "ssl_start": -1, "ssl_end": -1}}
+    phases = _timing_phases(reused)
+    assert "dns" not in phases and "connect" not in phases, "a phase that did not happen is not 0ms"
+
+
+def test_initiator_names_the_calling_function():
+    req = {"initiator": {"type": "script", "frame": {
+        "url": "https://a.test/app.js", "function": "loadItems", "line": 2, "column": 10}}}
+    assert _format_initiator(req) == "script — loadItems() at https://a.test/app.js:2:10"
+    assert _format_initiator({"initiator": {"type": "parser", "url": "https://a.test/", "line": 7}}) == (
+        "parser — https://a.test/:7"
+    )
+
+
+def test_sites_group_hosts_the_way_a_registrable_domain_does():
+    assert _site_of("cdn.example.com") == "example.com"
+    assert _site_of("static.shop.example.co.uk") == "example.co.uk"
+    assert _site_of("127.0.0.1") == "127.0.0.1"
+    assert _site_of("localhost") == "localhost"
+
+
+def test_cache_findings_flag_personal_responses_a_cdn_may_share():
+    def rec(url, response, request=None, kind="XHR"):
+        return {"url": url, "status": 200, "type": kind,
+                "response_headers_raw": response, "request_headers_raw": request or {}}
+
+    findings = _cache_findings([
+        rec("https://a.test/me", {"Cache-Control": "public, max-age=60", "Set-Cookie": "s=1"}),
+        rec("https://a.test/feed", {"Cache-Control": "s-maxage=60"}, {"Cookie": "s=1"}),
+        rec("https://a.test/ok", {"Cache-Control": "private, max-age=60", "Set-Cookie": "s=1"}),
+    ], doc=None)
+    text = "\n".join(t for level, t in findings if level == "WARN")
+    assert "https://a.test/me sets a cookie" in text
+    assert "https://a.test/feed was requested with credentials" in text
+    assert "/ok" not in text, "Cache-Control: private is exactly the fix"
+
+
 # ---------------------------------------------------------------------------
 # Real Chrome
 # ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_timing_and_initiator_reach_get_network_request():
+    async def scenario():
+        with CaptureSite() as site:
+            await _call("new_page", url="about:blank")
+            await _call("navigate_page", url=site.base + "/initiator")
+            await _call("evaluate_script", function="() => loadItems()")
+            await asyncio.sleep(0.3)
+            listing = await _call("list_network_requests", url_filter="/api/items")
+            reqid = int(re.search(r"\[(\d+)\]", listing).group(1))
+            detail = await _call("get_network_request", reqid=reqid)
+        assert "Timing:" in detail and "wait (TTFB)" in detail, detail
+        assert re.search(r"Initiator: script — loadItems\(\) at http://127\.0\.0\.1:\d+/app\.js:2:", detail), detail
+
+    _run(scenario)
+
+
+@pytest.mark.slow
+def test_server_sent_events_are_logged_like_socket_frames():
+    async def scenario():
+        with CaptureSite() as site:
+            await _call("new_page", url="about:blank")
+            await _call("navigate_page", url=site.base + "/")
+            await _call("evaluate_script", function=(
+                "() => new Promise(resolve => { const es = new EventSource('/api/fo/sse'); let n = 0;"
+                " es.onmessage = () => { if (++n === 3) { es.close(); resolve(n); } }; })"
+            ))
+            await asyncio.sleep(0.3)
+            listing = await _call("list_network_requests", resource_types=["EventSource"])
+            assert "3 events" in listing, listing
+            reqid = int(re.search(r"\[(\d+)\]", listing).group(1))
+            detail = await _call("get_network_request", reqid=reqid)
+        assert "Server-sent events (3)" in detail, detail
+        assert all(f"<- tick {i}" in detail for i in range(3)), detail
+
+    _run(scenario)
+
+
+@pytest.mark.slow
+def test_search_bodies_follows_a_value_from_response_to_request(tmp_path):
+    async def scenario():
+        with CaptureSite() as site:
+            await _call("new_page", url=site.base + "/")
+            await _call("capture_bodies", url_pattern="*/api/*", out_dir=str(tmp_path))
+            await _call("evaluate_script", function=(
+                "async () => { const t = (await (await fetch('/api/token')).json()).token;"
+                " await (await fetch('/api/fo/use', {method: 'POST', body: JSON.stringify({token: t})})).text();"
+                " return t; }"
+            ))
+            await _call("capture_bodies", action="stop")
+            found = await _call("search_bodies", query="TOK-7F3A9")  # case-insensitive by default
+            missing = await _call("search_bodies", query="no-such-value")
+
+        received, _, sent = found.partition("Sent in requests:")
+        first = received.split("Received in", 1)[1].splitlines()[1]
+        assert "/api/token" in first, f"the first arrival is not the token response:\n{found}"
+        assert "POST" in sent and "/api/fo/use" in sent and "in POST data" in sent, found
+        assert "does not appear" in missing, missing
+
+    _run(scenario)
 
 @pytest.mark.slow
 def test_audit_reports_the_weak_page_and_passes_the_hardened_one():
@@ -79,7 +199,9 @@ def test_audit_reports_the_weak_page_and_passes_the_hardened_one():
         with CaptureSite() as site:
             await _call("new_page", url="about:blank")
             await _call("navigate_page", url=site.base + "/audit")
-            await _call("evaluate_script", function="async () => (await fetch('/api/cors')).status")
+            await _call("evaluate_script", function=(
+                "async () => { await fetch('/api/cors'); await (await fetch('/api/cached')).text(); return 1; }"
+            ))
             report = await _call("audit_security")
 
             # Second, so the weak page's issues and requests are there to leak
@@ -93,6 +215,8 @@ def test_audit_reports_the_weak_page_and_passes_the_hardened_one():
             "'unsafe-inline'", "'unsafe-eval'", "clickjacking", "x-powered-by discloses",
             "session_id (127.0.0.1) looks like a session", "allows the origin 'null'",
             "img-src blocked http://localhost", "ExcludeSameSiteNoneInsecure",
+            "/api/cached sets a cookie and is cacheable by shared caches",
+            "first party 127.0.0.1", "without Subresource Integrity",
         ):
             assert expected in report, f"missing {expected!r}:\n{report}"
         assert "from the recorded page load" in report, report

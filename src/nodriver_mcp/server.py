@@ -715,6 +715,7 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                     str(k): str(v) for k, v in dict(getattr(event.request, "headers", None) or {}).items()
                 },
                 "post_data": post_data[:100_000] if post_data else None,
+                "initiator": _compact_initiator(getattr(event, "initiator", None)),
                 # Filled in by the response-side handlers below. Until then the
                 # request is genuinely still in flight, and saying so is the point:
                 # a pending request and a completed 200 used to look identical.
@@ -817,6 +818,12 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             timing = getattr(r, "timing", None)
             if timing is not None:
                 rec["_request_time"] = getattr(timing, "request_time", None)
+                # Milliseconds relative to request_time, -1 where a phase did
+                # not happen (a reused connection has no DNS or connect).
+                rec["timing"] = {
+                    name: float(getattr(timing, name, -1) if getattr(timing, name, None) is not None else -1)
+                    for name in _TIMING_FIELDS
+                }
             rec["protocol"] = getattr(r, "protocol", "") or ""
             rec["remote_ip"] = getattr(r, "remote_ip_address", "") or ""
             rec["security"] = _compact_security_details(getattr(r, "security_details", None))
@@ -911,6 +918,27 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         except Exception:
             pass
 
+    async def _on_es_message(event: cdp_net.EventSourceMessageReceived):
+        # Server-sent events, one entry per message, the way a socket's frames
+        # are kept — so a push stream is readable without capture_bodies.
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            data = getattr(event, "data", "") or ""
+            messages = rec.setdefault("messages", [])
+            messages.append({
+                "event": getattr(event, "event_name", "") or "message",
+                "id": getattr(event, "event_id", "") or "",
+                "data": data[:_WS_PAYLOAD_CHARS],
+                "truncated": len(data) > _WS_PAYLOAD_CHARS,
+            })
+            rec["messages_total"] = rec.get("messages_total", 0) + 1
+            if len(messages) > _WS_FRAME_CAP:
+                messages.pop(0)
+        except Exception:
+            pass
+
     async def _on_ws_closed(event: cdp_net.WebSocketClosed):
         try:
             rec = _socket(event.request_id)
@@ -968,6 +996,7 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             tab.add_handler(cdp_net.RequestWillBeSentExtraInfo, _on_request_extra)
             tab.add_handler(cdp_net.ResponseReceivedExtraInfo, _on_response_extra)
             tab.add_handler(_RawIssueAdded, _on_issue)
+            tab.add_handler(cdp_net.EventSourceMessageReceived, _on_es_message)
             _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
@@ -1002,6 +1031,99 @@ def _install_raw_issue_parser() -> None:
 
 
 _install_raw_issue_parser()
+
+
+_TIMING_FIELDS = (
+    "proxy_start", "proxy_end", "dns_start", "dns_end", "connect_start", "connect_end",
+    "ssl_start", "ssl_end", "worker_start", "worker_ready", "send_start", "send_end",
+    "receive_headers_end",
+)
+
+
+def _timing_phases(req: dict) -> dict[str, float] | None:
+    """Where a request's time went, in ms: the phases DevTools' Timing tab shows.
+
+    A phase that did not happen is left out rather than reported as 0 — a
+    reused connection has no DNS lookup, and saying "dns 0ms" would claim one.
+    """
+    t = req.get("timing")
+    if not t:
+        return None
+
+    def span(start: str, end: str) -> float | None:
+        a, b = t.get(start, -1), t.get(end, -1)
+        return b - a if a >= 0 and b >= 0 else None
+
+    phases: dict[str, float] = {}
+    firsts = [t[k] for k in ("proxy_start", "dns_start", "connect_start", "send_start") if t.get(k, -1) >= 0]
+    if firsts:
+        phases["queued"] = min(firsts)
+    for name, (start, end) in {
+        "proxy": ("proxy_start", "proxy_end"), "dns": ("dns_start", "dns_end"),
+        "connect": ("connect_start", "connect_end"), "tls": ("ssl_start", "ssl_end"),
+        "service worker": ("worker_start", "worker_ready"), "send": ("send_start", "send_end"),
+        "wait": ("send_end", "receive_headers_end"),
+    }.items():
+        value = span(start, end)
+        if value is not None:
+            phases[name] = value
+    duration = req.get("duration_ms")
+    if duration is not None and t.get("receive_headers_end", -1) >= 0:
+        phases["download"] = max(float(duration) - t["receive_headers_end"], 0.0)
+    return phases
+
+
+def _format_timing(req: dict) -> str:
+    phases = _timing_phases(req)
+    if not phases:
+        return ""
+    parts = []
+    for name, ms in phases.items():
+        label = "wait (TTFB)" if name == "wait" else name
+        parts.append(f"{label} {ms:.1f}ms")
+    if "dns" not in phases and "connect" not in phases and "service worker" not in phases:
+        parts.append("connection reused")
+    return ", ".join(parts)
+
+
+def _compact_initiator(initiator: Any) -> dict | None:
+    """What caused a request: the parser, a script (which frame), a preload…"""
+    if initiator is None:
+        return None
+    kind = getattr(initiator, "type_", "") or ""
+    out: dict[str, Any] = {"type": str(getattr(kind, "value", kind))}
+    if getattr(initiator, "url", None):
+        out["url"] = initiator.url
+        line = getattr(initiator, "line_number", None)
+        if line is not None:
+            out["line"] = int(line) + 1  # CDP counts from 0; editors from 1
+    stack = getattr(initiator, "stack", None)
+    while stack is not None:
+        # The innermost frame with a URL is the code that made the call; an
+        # async boundary (fetch in a .then) moves it into a parent stack.
+        for frame in getattr(stack, "call_frames", None) or []:
+            if getattr(frame, "url", ""):
+                out["frame"] = {
+                    "url": frame.url,
+                    "function": getattr(frame, "function_name", "") or "(anonymous)",
+                    "line": int(getattr(frame, "line_number", 0)) + 1,
+                    "column": int(getattr(frame, "column_number", 0)) + 1,
+                }
+                return out
+        stack = getattr(stack, "parent", None)
+    return out
+
+
+def _format_initiator(req: dict) -> str:
+    init = req.get("initiator")
+    if not init:
+        return ""
+    frame = init.get("frame")
+    if frame:
+        return f"{init['type']} — {frame['function']}() at {frame['url']}:{frame['line']}:{frame['column']}"
+    if init.get("url"):
+        return f"{init['type']} — {init['url']}" + (f":{init['line']}" if init.get("line") else "")
+    return init["type"]
 
 
 def _compact_security_details(details: Any) -> dict | None:
@@ -1059,6 +1181,8 @@ def _request_timing(req: dict) -> str:
             parts.append("closed")
         return " " + " ".join(parts)
     parts = []
+    if req.get("messages_total"):
+        parts.append(f"{req['messages_total']} events")
     if req.get("duration_ms") is not None:
         parts.append(f"{req['duration_ms']:g}ms")
     if req.get("size"):
@@ -3975,6 +4099,12 @@ async def get_network_request(
     detail = _request_timing(req).strip()
     if detail:
         lines.append(f"  Transfer: {detail}")
+    phases = _format_timing(req)
+    if phases:
+        lines.append(f"  Timing: {phases}")
+    initiator = _format_initiator(req)
+    if initiator:
+        lines.append(f"  Initiator: {initiator}")
     headers = req.get("response_headers") or {}
     if headers:
         lines.append(f"  Response headers ({len(headers)}):")
@@ -3997,6 +4127,18 @@ async def get_network_request(
             lines.append(f"    {arrow}{kind} {frame['data']}{suffix}")
         # There is no response body for a socket, so stop before asking for one.
         return "\n".join(lines)
+
+    if req.get("messages_total"):
+        messages = req.get("messages") or []
+        dropped = req["messages_total"] - len(messages)
+        lines.append(
+            f"  Server-sent events ({req['messages_total']}"
+            + (f"; showing the last {len(messages)}" if dropped else "") + "):"
+        )
+        for m in messages:
+            label = "" if m["event"] == "message" else f"[{m['event']}] "
+            suffix = " …(truncated)" if m.get("truncated") else ""
+            lines.append(f"    <- {label}{m['data']}{suffix}")
 
     try:
         request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))
@@ -6971,6 +7113,7 @@ _last_capture_summary: str = ""
 # Set when a capture ended without the agent being told — the browser closed
 # under it — so the next stop reports that instead of "nothing is running".
 _last_capture_unseen: bool = False
+_last_capture_dir: str = ""  # where the most recent capture wrote, for search_bodies
 
 
 async def _end_body_capture(reason: str) -> str:
@@ -7048,7 +7191,7 @@ async def capture_bodies(
     response reaches the page only once complete, so keep the pattern off
     long-running downloads.
     """
-    global _body_capture, _last_capture_unseen
+    global _body_capture, _last_capture_unseen, _last_capture_dir
     if _body_capture is not None and _body_capture.ended is not None:
         # Its connection died under it: the browser crashed or was closed from
         # outside. Say so, rather than report a capture that is not running.
@@ -7118,6 +7261,7 @@ async def capture_bodies(
         await capture.stop("could not intercept on any page")
         raise ToolFailure("Could not intercept on any open page.\n" + capture.summary())
     _body_capture = capture
+    _last_capture_dir = directory
     return (
         f"Capturing{note}. Tabs opened from now on are included from their first "
         f"request. Check with action=\"status\", end with action=\"stop\".\n{capture.summary()}"
@@ -7272,6 +7416,31 @@ def _har_entry(req: dict, body: dict | None) -> dict:
         "timings": {"blocked": -1, "dns": -1, "connect": -1, "ssl": -1, "send": 0, "wait": duration, "receive": 0},
         "_resourceType": str(req.get("type") or "other").lower(),
     }
+    phases = _timing_phases(req)
+    if phases:
+        # HAR's connect includes ssl, as Chrome's does; -1 means "did not happen".
+        entry["timings"] = {
+            "blocked": round(phases.get("queued", -1), 3),
+            "dns": round(phases.get("dns", -1), 3),
+            "connect": round(phases.get("connect", -1), 3),
+            "ssl": round(phases.get("tls", -1), 3),
+            "send": round(phases.get("send", 0), 3),
+            "wait": round(phases.get("wait", 0), 3),
+            "receive": round(phases.get("download", 0), 3),
+        }
+    initiator = req.get("initiator")
+    if initiator:
+        # The field Chrome DevTools itself writes and reads back on import.
+        entry["_initiator"] = {"type": initiator["type"]}
+        frame = initiator.get("frame")
+        if frame:
+            entry["_initiator"].update(url=frame["url"], lineNumber=frame["line"] - 1)
+        elif initiator.get("url"):
+            entry["_initiator"].update(url=initiator["url"], lineNumber=initiator.get("line", 1) - 1)
+    if req.get("messages"):
+        entry["_eventSourceMessages"] = [
+            {"eventName": m["event"], "eventId": m["id"], "data": m["data"]} for m in req["messages"]
+        ]
     if req.get("remote_ip"):
         entry["serverIPAddress"] = req["remote_ip"].strip("[]")
     if req.get("failed") and req.get("status") is None:
@@ -7593,7 +7762,122 @@ def _issue_line(code: str, details: dict) -> str:
 
 
 
-AuditCheck = Literal["headers", "tls", "cookies", "issues"]
+# Second-level labels under which registrations happen (example.co.uk). An
+# approximation of the public suffix list, which is not worth a dependency for
+# a grouping that only has to be right for the common cases.
+_SECOND_LEVEL_LABELS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu", "or", "ne", "go", "gv"})
+
+
+def _site_of(host: str) -> str:
+    """The registrable domain a host belongs to: cdn.example.co.uk -> example.co.uk."""
+    host = (host or "").strip("[]").lower()
+    if not host or re.fullmatch(r"[\d.]+", host) or ":" in host:
+        return host  # an IP address is its own site
+    labels = host.split(".")
+    if len(labels) >= 3 and labels[-2] in _SECOND_LEVEL_LABELS and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _domain_findings(page_url: str, requests: list[dict], no_sri: list[str]) -> tuple[str, list[tuple[str, str]]]:
+    """Who this page talks to: first party versus every third party, by site."""
+    from urllib.parse import urlsplit
+
+    own = _site_of(urlsplit(page_url).hostname or "")
+    stats: dict[str, dict] = {}
+    for rec in requests:
+        host = urlsplit(rec["url"]).hostname or ""
+        if not host:
+            continue  # data:, blob:
+        s = stats.setdefault(_site_of(host), {"requests": 0, "bytes": 0, "types": {}, "hosts": set(),
+                                               "cookies_in": False, "cookies_out": False})
+        s["requests"] += 1
+        s["bytes"] += rec.get("size") or 0
+        s["types"][rec.get("type", "?")] = s["types"].get(rec.get("type", "?"), 0) + 1
+        s["hosts"].add(host)
+        if "cookie" in _lower_headers(rec.get("request_headers_raw")):
+            s["cookies_out"] = True
+        if "set-cookie" in _lower_headers(rec.get("response_headers_raw")):
+            s["cookies_in"] = True
+    findings: list[tuple[str, str]] = []
+    for site, s in sorted(stats.items(), key=lambda kv: (kv[0] != own, -kv[1]["requests"])):
+        types = ", ".join(f"{t} {n}" for t, n in sorted(s["types"].items(), key=lambda kv: -kv[1])[:4])
+        extras = []
+        if s["cookies_out"]:
+            extras.append("receives cookies")
+        if s["cookies_in"]:
+            extras.append("sets cookies")
+        if site != own and s["types"].get("Script"):
+            extras.append("runs its own scripts here, with full access to the page")
+        hosts = f" [{', '.join(sorted(s['hosts'])[:3])}{', …' if len(s['hosts']) > 3 else ''}]"
+        findings.append(("INFO", (
+            f"{'first party' if site == own else 'third party'} {site}{hosts}: {s['requests']} requests, "
+            f"{s['bytes'] / 1024:.0f} KB ({types})" + (f"; {'; '.join(extras)}" if extras else "")
+        )))
+    if no_sri:
+        findings.append(("INFO", (
+            f"{len(no_sri)} script(s)/stylesheet(s) from other origins load without Subresource "
+            f"Integrity, so whoever controls those hosts controls this page: "
+            + ", ".join(u[:80] for u in no_sri[:5]) + (" …" if len(no_sri) > 5 else "")
+        )))
+    third = len(stats) - (1 if own in stats else 0)
+    return f"Domains ({third} third part{'y' if third == 1 else 'ies'}, sites approximated without a suffix list)", findings
+
+
+def _cache_findings(requests: list[dict], doc: dict | None) -> list[tuple[str, str]]:
+    """Responses a shared cache (CDN, proxy) could store and hand to someone else."""
+    findings: list[tuple[str, str]] = []
+    flagged: set[str] = set()
+    uncached_static = 0
+    from_cache = 0
+    for rec in requests:
+        if not rec.get("status") or rec.get("redirect_to"):
+            continue
+        if rec.get("from_cache"):
+            from_cache += 1
+        response = _lower_headers(rec.get("response_headers_raw") or rec.get("response_headers"))
+        request = _lower_headers(rec.get("request_headers_raw") or rec.get("request_headers"))
+        cc = response.get("cache-control", "").lower()
+        shared = (
+            ("public" in cc or "s-maxage" in cc)
+            and "private" not in cc and "no-store" not in cc
+        )
+        where = rec["url"].split("?")[0][:100]
+        if shared and "set-cookie" in response and where not in flagged:
+            flagged.add(where)
+            findings.append(("WARN", (
+                f"{where} sets a cookie and is cacheable by shared caches (Cache-Control: {cc}) — a CDN or "
+                "proxy could serve that cookie to other users."
+            )))
+        elif (shared and ("cookie" in request or "authorization" in request)
+              and rec.get("type") in ("Document", "XHR", "Fetch") and where not in flagged):
+            flagged.add(where)
+            findings.append(("WARN", (
+                f"{where} was requested with credentials and is cacheable by shared caches "
+                f"(Cache-Control: {cc}) — one user's response could be served to another."
+            )))
+        if rec.get("type") in ("Script", "Stylesheet", "Font", "Image") and not (
+            cc or response.get("expires") or response.get("etag") or response.get("last-modified")
+        ):
+            uncached_static += 1
+    if doc is not None:
+        response = _lower_headers(doc.get("response_headers_raw") or doc.get("response_headers"))
+        request = _lower_headers(doc.get("request_headers_raw") or doc.get("request_headers"))
+        cc = response.get("cache-control", "").lower()
+        if ("cookie" in request or "authorization" in request) and "no-store" not in cc and "private" not in cc:
+            findings.append(("INFO", (
+                "The page was requested with credentials and sends neither Cache-Control: no-store nor "
+                "private, so it may stay in the browser's disk cache after logout"
+                + (f" (Cache-Control: {cc})." if cc else ".")
+            )))
+    if uncached_static:
+        findings.append(("INFO", f"{uncached_static} static asset(s) with no caching headers at all (no Cache-Control, Expires, ETag or Last-Modified)."))
+    if from_cache:
+        findings.append(("INFO", f"{from_cache} response(s) came from Chrome's cache; reload with ignore_cache to see what the server sends."))
+    return findings
+
+
+AuditCheck = Literal["headers", "tls", "cookies", "cache", "domains", "issues"]
 
 
 @tool(title="Audit page security", read_only=True)
@@ -7604,9 +7888,11 @@ async def audit_security(
             'Which parts to run: "headers" (security headers, CSP analysis, CORS on '
             'every recorded response, version disclosure), "tls" (protocol, cipher, '
             'certificate of every origin the page talked to), "cookies" (flags of '
-            'every cookie sent to those origins) and "issues" (what Chrome itself '
-            "flagged: CSP violations, mixed content, rejected cookies, CORS errors). "
-            "Omit for all four."
+            'every cookie sent to those origins), "cache" (responses a CDN or proxy '
+            'could serve to the wrong user), "domains" (first and third parties the '
+            'page talks to, and third-party code loaded without integrity checks) and '
+            '"issues" (what Chrome itself flagged: CSP violations, mixed content, '
+            "rejected cookies, CORS errors). Omit for all."
         )),
     ] = None,
 ) -> str:
@@ -7632,7 +7918,7 @@ async def audit_security(
     parts = urlsplit(page_url or "")
     if parts.scheme not in ("http", "https"):
         raise ToolFailure(f"Nothing to audit on {page_url or 'this tab'} — navigate to an http(s) page first.")
-    wanted = set(checks or ["headers", "tls", "cookies", "issues"])
+    wanted = set(checks or ["headers", "tls", "cookies", "cache", "domains", "issues"])
     page_requests = list(_network_requests)
 
     def _is_page(rec: dict) -> bool:
@@ -7711,6 +7997,21 @@ async def audit_security(
         except Exception as e:
             findings, title = [("WARN", f"Could not read cookies: {e}")], "Cookies"
         sections.append((title, findings or [("INFO", "Nothing to flag.")]))
+
+    if "cache" in wanted:
+        sections.append(("Caching", _cache_findings(page_requests, doc) or [("INFO", "Nothing to flag.")]))
+
+    if "domains" in wanted:
+        try:
+            no_sri = await _evaluate_value(tab, (
+                "[...document.querySelectorAll('script[src], link[rel~=stylesheet][href]')]"
+                ".filter(el => !el.integrity && new URL(el.src || el.href, location.href).origin !== location.origin)"
+                ".map(el => el.src || el.href)"
+            )) or []
+        except Exception:
+            no_sri = []
+        title, findings = _domain_findings(page_url, page_requests, no_sri)
+        sections.append((title, findings or [("INFO", "No requests recorded.")]))
 
     issue_lines: list[str] = []
     if "issues" in wanted:
@@ -7916,6 +8217,97 @@ async def inspect_storage(
         out += [f"  {level}  {text}" for level, text in sorted(findings, key=lambda f: f[0] != "WARN")]
     if errors:
         out.append("\nCould not read: " + "; ".join(errors))
+    return "\n".join(out)
+
+
+@tool(title="Search captured bodies", read_only=True)
+async def search_bodies(
+    query: Annotated[str, Field(min_length=1, description="Text to look for, or a regular expression with regex=true.")],
+    regex: Annotated[bool, Field(description="Treat query as a Python regular expression.")] = False,
+    case_sensitive: Annotated[bool, Field(description="Match case exactly. Default false.")] = False,
+    directory: Annotated[
+        str,
+        Field(description=(
+            "A capture_bodies folder to search. Empty uses the running capture, or "
+            "the most recent one."
+        )),
+    ] = "",
+    max_results: Annotated[int, Field(ge=1, le=500, description="Stop after this many matches.")] = 50,
+) -> str:
+    """Find where a value shows up in the traffic capture_bodies recorded — in
+    which response it first arrived, and which later requests sent it back.
+
+    The usual question when following data through an app: where did this ID,
+    token or price come from, and where does it go next. Results are in capture
+    order, so the first hit is the first response that carried it; POST data
+    and URLs from capture.jsonl are searched too, as the "sent" side.
+    """
+    folder = directory.strip()
+    if not folder:
+        folder = _body_capture.out_dir if _body_capture is not None else _last_capture_dir
+    if not folder:
+        raise ToolFailure("No capture to search yet — run capture_bodies first, or pass directory.")
+    folder = os.path.abspath(os.path.expanduser(folder))
+    manifest_path = os.path.join(folder, "capture.jsonl")
+    if not os.path.isfile(manifest_path):
+        raise ToolFailure(f"{folder} holds no capture.jsonl — not a capture_bodies folder.")
+    try:
+        pattern = re.compile(query if regex else re.escape(query), 0 if case_sensitive else re.IGNORECASE)
+    except re.error as e:
+        raise ToolFailure(f"Invalid regular expression: {e}")
+
+    entries = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+    entries.sort(key=lambda e: e.get("seq", 0))
+
+    def snippet(text: str, match: re.Match) -> str:
+        start, end = max(match.start() - 60, 0), min(match.end() + 60, len(text))
+        return ("…" if start else "") + text[start:end].replace("\n", " ") + ("…" if end < len(text) else "")
+
+    received: list[str] = []
+    sent: list[str] = []
+    bodies_hit = 0
+    for entry in entries:
+        if len(received) + len(sent) >= max_results:
+            break
+        label = f"{entry.get('file', '?')}  {entry.get('method', '')} {entry.get('url', '')[:120]}  {entry.get('status', '')}"
+        for field in ("url", "post_data"):
+            value = entry.get(field) or ""
+            m = pattern.search(value)
+            if m:
+                where = "URL" if field == "url" else "POST data"
+                sent.append(f"  #{entry.get('seq')} {entry.get('method', '')} {entry.get('url', '')[:120]}\n    in {where}: {snippet(value, m)}")
+        path = os.path.join(folder, entry.get("file", ""))
+        if not entry.get("file") or not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            raw = f.read(50_000_000)
+        text = raw.decode("utf-8", errors="replace")
+        matches = list(pattern.finditer(text))
+        if not matches:
+            continue
+        bodies_hit += 1
+        received.append(f"  {label}  ({len(matches)} match{'es' if len(matches) != 1 else ''})")
+        for m in matches[:3]:
+            line_no = text.count("\n", 0, m.start()) + 1
+            received.append(f"    line {line_no}: {snippet(text, m)}")
+
+    if not received and not sent:
+        return f"{query!r} does not appear in the {len(entries)} captured responses in {folder}, nor in their URLs or POST data."
+    out = [f"{query!r} in {folder}:"]
+    if received:
+        out.append(f"Received in {bodies_hit} of {len(entries)} response bodies (first arrival first):")
+        out += received
+    if sent:
+        out.append("Sent in requests:")
+        out += sent
+    if len(received) + len(sent) >= max_results:
+        out.append(f"(stopped at max_results={max_results})")
     return "\n".join(out)
 
 

@@ -38,6 +38,13 @@ self.addEventListener('message', e => {
 });
 """
 
+# A named function in a real file, so a request it makes has an initiator with
+# a function name, a URL and a line to report.
+APP_JS = b"""function loadItems() {
+  return fetch('/api/items').then(r => r.text());
+}
+"""
+
 # A 1x1 transparent PNG.
 PIXEL = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -71,11 +78,12 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # noqa: D102 - keep test output readable
         pass
 
-    def _send(self, body: bytes, content_type: str, status: int = 200, extra=()) -> None:
+    def _send(self, body: bytes, content_type: str, status: int = 200, extra=(), cache="no-store") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if cache:
+            self.send_header("Cache-Control", cache)
         for name, value in extra:
             self.send_header(name, value)
         self.end_headers()
@@ -88,12 +96,23 @@ class _Handler(BaseHTTPRequestHandler):
             # The image comes from another origin, which img-src 'self' blocks.
             page = (
                 b"<!doctype html><html><head><title>audit</title></head><body><h1>weak</h1>"
-                b"<img src='http://localhost:%d/img.png'></body></html>" % port
+                b"<img src='http://localhost:%d/img.png'>"
+                b"<script src='http://localhost:%d/app.js'></script></body></html>" % (port, port)
             )
             self._send(page, "text/html", extra=WEAK_HEADERS)
         elif path == "/hardened":
             self._send(b"<!doctype html><html><head><title>hardened</title></head><body>ok</body></html>",
                        "text/html", extra=HARDENED_HEADERS)
+        elif path == "/api/cached":
+            # Personal (it sets a cookie) yet cacheable by any CDN on the way.
+            self._send(b'{"me": 1}', "application/json", cache="public, max-age=600",
+                       extra=[("Set-Cookie", "visit=1; Path=/")])
+        elif path == "/api/token":
+            self._send(b'{"token": "tok-7f3a9"}', "application/json")
+        elif path == "/app.js":
+            self._send(APP_JS, "text/javascript")
+        elif path == "/initiator":
+            self._send(b"<!doctype html><html><body><script src='/app.js'></script></body></html>", "text/html")
         elif path == "/api/cors":
             self._send(b'{"cors": true}', "application/json", extra=[
                 ("Access-Control-Allow-Origin", "null"),

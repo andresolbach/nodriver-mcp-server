@@ -79,9 +79,34 @@ and no Set-Cookie, which makes a HAR useless for replaying a session — plus PO
 bodies, wall-clock start times, protocol, server IP and TLS details. Response
 bodies come from `capture_bodies` where it ran, otherwise from Chrome's buffer.
 
+### A network log with more to say
+
+`get_network_request` shows where a request's time went — queueing, DNS,
+connect, TLS, send, time to first byte, download — and leaves out a phase that
+did not happen rather than printing 0ms for it, since a reused connection has
+no DNS lookup to report. It also names what started the request: the parser,
+or the function, file and line of the script that called `fetch`, following
+the stack across async boundaries. Both go into `export_har` as HAR timings
+and the `_initiator` field DevTools reads back.
+
+Server-sent events are logged per message, the way WebSocket frames already
+were, so an EventSource feed is readable without `capture_bodies`.
+
+**`search_bodies`** searches a capture for a value and answers the question
+that usually comes next: which response did this ID or token first arrive in,
+and which request sent it back — URLs and POST data are searched as the sent
+side.
+
+`audit_security` gained two checks. `cache` flags responses a CDN or proxy
+could hand to the wrong user: one that sets a cookie, or answers a credentialed
+request, while marked `public` or `s-maxage`. `domains` lists every first and
+third party the page talks to, with requests, bytes, cookies in each direction
+and whether it runs scripts on the page, plus third-party scripts and
+stylesheets loaded without Subresource Integrity.
+
 nodriver stays at 0.50.3, which is still the newest release on PyPI.
 
-Tool count: 65 → 69.
+Tool count: 65 → 70.
 
 ## 2.4.0 — what a uid promises, and five tools that reported work they had not done
 
