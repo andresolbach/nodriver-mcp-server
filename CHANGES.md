@@ -1,5 +1,113 @@
 # Changelog
 
+## 2.5.0 — response bodies that cannot get lost, and a passive security review
+
+The flagship workflow — find the page's own API call, read the JSON it already
+received — had a hole the size of Chrome's buffer. `get_network_request` asks
+for a body only when you ask, and by then it is often gone. Measured on Chrome
+151: a 12 MB response was already "evicted from inspector cache" at its own
+`loadingFinished`, and a small JSON response that read fine a moment earlier
+answered "No resource with given identifier found" after one cross-site
+navigation.
+
+**`capture_bodies`** fixes that at the source. It runs in the background and
+takes every matching body while the response is still paused, before the page
+sees it, and writes it to a file. `capture.jsonl` beside the files records URL,
+method, POST data, status and headers for each one, so a GraphQL endpoint that
+answers every query at the same URL is still sorted out. `start`, `status` and
+`stop` are one tool, and `stop` says what was saved, what was skipped and why.
+
+It uses Fetch interception on a CDP connection of its own, not the tab's. On the
+tab's session it would have silently replaced the patterns `block_resources`
+and proxy authentication already rely on, because `Fetch.enable` overwrites
+its session's configuration; a separate session is chained by Chrome instead.
+Coverage was measured before anything was built, with a page fetch, a dedicated
+worker, a blob worker, a request a service worker passes through and one it
+makes itself: Network on the page saw 2 of the 5, Fetch on the page 3, Fetch on
+the browser target only the 2 workers. Fetch on each page plus Fetch on the
+service worker's own target saw all 5 — and browser-level auto-attach with
+`waitForDebuggerOnStart` reaches both, including tabs a page opens itself,
+armed before their first request.
+
+Event streams are the one thing Fetch cannot hold: `getResponseBody` waits for
+the end of a body, and an EventSource has none, so the page would have received
+nothing, ever. Those are released at once and written chunk by chunk as they
+arrive, through `Network.streamResourceContent`.
+
+`list_network_requests` marks captured requests `saved`, and
+`get_network_request` falls back to the file once Chrome has let its own copy
+go.
+
+Every test was also run against a broken capture to prove it catches one: with
+bodies not written, four of the five fail; with event streams handled like any
+other body, the stream test fails because the page starves.
+
+### Security review tools
+
+Three passive tools for testing a site you are authorised to test. They read
+what the browser already holds and send nothing beyond a normal page load.
+
+**`audit_security`** reviews the selected page: security headers with a CSP
+analysis that knows a nonce switches `'unsafe-inline'` off, that `strict-dynamic`
+voids host allowlists and that a weakness only counts if every policy has it;
+CORS on every recorded response; TLS protocol, cipher and certificate of every
+origin the page talked to; the flags of every cookie sent to those origins
+(names only, never values); and what Chrome's own Issues panel reports — CSP
+violations, mixed content, rejected cookies, CORS errors. Its test runs a
+deliberately weak page and a hardened one, and the hardened one must come back
+with zero warnings: a report that cries wolf gets ignored.
+
+Chrome's issues are collected live now, alongside the network log.
+`Audits.enable` does replay what the renderer reported earlier, but not the
+cookie issues the browser raises during a navigation — measured, a
+`SameSite=None` cookie without `Secure` was reported live and never again. They
+are kept per tab and dropped when its main frame loads a new document. nodriver's
+typed parser for these events raises on any issue code newer than its bindings
+(`LazyLoadImageIssue` on github.com filled the log with tracebacks), so the
+server parses them itself.
+
+**`inspect_storage`** lists localStorage, sessionStorage, IndexedDB, Cache
+Storage, service workers and quota for the page's origin, read through DevTools
+rather than page JavaScript. Values that look like credentials — by key name,
+JWT shape or a Bearer prefix, also inside JSON values — are flagged and masked
+unless `reveal_values` is set, and JWTs are decoded: algorithm, expiry, claims.
+
+**`export_har`** writes the network log as HAR 1.2 for Burp, ZAP or DevTools.
+The network log now also keeps the headers that went over the wire, from
+Chrome's ExtraInfo events — the renderer's copy it kept before has no Cookie
+and no Set-Cookie, which makes a HAR useless for replaying a session — plus POST
+bodies, wall-clock start times, protocol, server IP and TLS details. Response
+bodies come from `capture_bodies` where it ran, otherwise from Chrome's buffer.
+
+### A network log with more to say
+
+`get_network_request` shows where a request's time went — queueing, DNS,
+connect, TLS, send, time to first byte, download — and leaves out a phase that
+did not happen rather than printing 0ms for it, since a reused connection has
+no DNS lookup to report. It also names what started the request: the parser,
+or the function, file and line of the script that called `fetch`, following
+the stack across async boundaries. Both go into `export_har` as HAR timings
+and the `_initiator` field DevTools reads back.
+
+Server-sent events are logged per message, the way WebSocket frames already
+were, so an EventSource feed is readable without `capture_bodies`.
+
+**`search_bodies`** searches a capture for a value and answers the question
+that usually comes next: which response did this ID or token first arrive in,
+and which request sent it back — URLs and POST data are searched as the sent
+side.
+
+`audit_security` gained two checks. `cache` flags responses a CDN or proxy
+could hand to the wrong user: one that sets a cookie, or answers a credentialed
+request, while marked `public` or `s-maxage`. `domains` lists every first and
+third party the page talks to, with requests, bytes, cookies in each direction
+and whether it runs scripts on the page, plus third-party scripts and
+stylesheets loaded without Subresource Integrity.
+
+nodriver stays at 0.50.3, which is still the newest release on PyPI.
+
+Tool count: 65 → 70.
+
 ## 2.4.0 — what a uid promises, and five tools that reported work they had not done
 
 Black-box testing with a fleet of agents drove every tool the way an agent

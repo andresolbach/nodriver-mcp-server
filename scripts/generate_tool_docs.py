@@ -42,7 +42,8 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "evaluate_script", "get_computed_styles", "save_pdf",
     ]),
     ("Network & console", [
-        "list_network_requests", "get_network_request", "block_resources",
+        "list_network_requests", "get_network_request", "capture_bodies", "search_bodies", "export_har",
+        "block_resources",
         "list_console_messages", "get_console_message",
         "enable_console_collection", "disable_console_collection",
     ]),
@@ -60,6 +61,7 @@ CATEGORIES: list[tuple[str, list[str]]] = [
         "use_running_browser", "delete_profile", "set_browser_flags", "set_proxy",
         "manage_extensions",
     ]),
+    ("Security audit", ["audit_security", "inspect_storage"]),
     ("Anti-detection helpers", ["cf_verify", "bypass_insecure_warning"]),
 ]
 

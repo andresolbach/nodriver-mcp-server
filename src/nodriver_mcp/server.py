@@ -491,6 +491,13 @@ TimeoutMs = Annotated[
     Field(ge=0, description="Maximum wait in milliseconds. 0 uses the built-in default."),
 ]
 
+ResourceTypeName = Literal[
+    "Document", "Stylesheet", "Image", "Media", "Font", "Script",
+    "TextTrack", "XHR", "Fetch", "Prefetch", "EventSource", "WebSocket",
+    "Manifest", "SignedExchange", "Ping", "CSPViolationReport",
+    "Preflight", "FedCM", "Other",
+]
+
 
 async def _active_tab() -> uc.Tab:
     """Return the tab selected via select_page(), else the last-opened tab."""
@@ -531,6 +538,8 @@ _console_handlers: dict[int, tuple] = {}  # tab id -> the handlers we registered
 _named_browser_contexts: dict[str, Any] = {}  # isolated_context name -> BrowserContextID
 _selected_target_id: str | None = None  # target_id chosen via select_page(); honored by _active_tab()
 _request_counter: int = 0  # monotonic id assigned to each collected network request
+_extra_info_pending: dict[str, dict] = {}  # request id -> wire headers that arrived before their record
+_audit_issues: list[tuple[str, dict]] = []  # (target key, DevTools issue) since that tab's last navigation
 _console_counter: int = 0  # monotonic id assigned to each collected console message
 
 _DEVICE_PRESETS: dict[str, dict[str, Any]] = {
@@ -686,6 +695,12 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             # "XHR" — storing that made the resource_types filter in
             # list_network_requests unmatchable. Unwrap to the CDP value.
             resource_type = getattr(event.type_, "value", event.type_) or "unknown"
+            target = _target_key(tab)
+            if resource_type == "Document" and str(getattr(event, "frame_id", "")) == target:
+                # The main frame is loading a new document (its frame id is the
+                # target id): the previous page's issues no longer apply.
+                _audit_issues[:] = [i for i in _audit_issues if i[0] != target]
+            post_data = getattr(event.request, "post_data", None)
             _network_requests.append({
                 "seq": _request_counter,
                 "id": str(event.request_id),
@@ -693,6 +708,14 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                 "method": event.request.method,
                 "timestamp": str(event.timestamp),
                 "type": str(resource_type),
+                # For export_har: what was sent, and when on the wall clock (the
+                # timestamp above is monotonic and means nothing outside Chrome).
+                "wall_time": float(getattr(event, "wall_time", 0) or 0),
+                "request_headers": {
+                    str(k): str(v) for k, v in dict(getattr(event.request, "headers", None) or {}).items()
+                },
+                "post_data": post_data[:100_000] if post_data else None,
+                "initiator": _compact_initiator(getattr(event, "initiator", None)),
                 # Filled in by the response-side handlers below. Until then the
                 # request is genuinely still in flight, and saying so is the point:
                 # a pending request and a completed 200 used to look identical.
@@ -716,8 +739,14 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
                         rec["status"] = getattr(redirect, "status", None)
                         rec["status_text"] = getattr(redirect, "status_text", "") or ""
                         rec["redirect_to"] = event.request.url
+                        rec["response_headers"] = {
+                            str(k): str(v) for k, v in dict(getattr(redirect, "headers", None) or {}).items()
+                        }
                         break
             _request_counter += 1
+            early = _extra_info_pending.pop(str(event.request_id), None)
+            if early:
+                _network_requests[-1].update(early)
             if len(_network_requests) > 1000:
                 _network_requests.pop(0)
         except Exception:
@@ -730,6 +759,46 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             if rec["id"] == wanted and rec.get("redirect_to") is None:
                 return rec
         return None
+
+    # The headers above are the ones the renderer built. Cookie and Set-Cookie,
+    # and everything else the network stack adds, only appear in the ExtraInfo
+    # events — which can arrive before the event they belong to, so an early
+    # one waits in _extra_info_pending until its record exists.
+    def _attach_extra(request_id: Any, key: str, headers: Any) -> None:
+        values = {str(k): str(v) for k, v in dict(headers or {}).items()}
+        rec = _latest(request_id)
+        if rec is not None and key not in rec:
+            rec[key] = values
+            return
+        _extra_info_pending.setdefault(str(request_id), {})[key] = values
+        while len(_extra_info_pending) > 500:
+            _extra_info_pending.pop(next(iter(_extra_info_pending)))
+
+    async def _on_request_extra(event: cdp_net.RequestWillBeSentExtraInfo):
+        try:
+            _attach_extra(event.request_id, "request_headers_raw", event.headers)
+        except Exception:
+            pass
+
+    async def _on_response_extra(event: cdp_net.ResponseReceivedExtraInfo):
+        try:
+            _attach_extra(event.request_id, "response_headers_raw", event.headers)
+        except Exception:
+            pass
+
+    # What DevTools shows in its Issues panel: CSP violations, mixed content,
+    # rejected cookies, CORS errors. It has to be collected live — Audits.enable
+    # replays the renderer's issues, but not the cookie issues the browser
+    # raises during a navigation (measured: a SameSite=None cookie without
+    # Secure was reported live and never again). The domain has no effect on
+    # the page; it only reports.
+    async def _on_issue(event: _RawIssueAdded):
+        try:
+            _audit_issues.append((_target_key(tab), event.issue))
+            if len(_audit_issues) > 1000:
+                _audit_issues.pop(0)
+        except Exception:
+            pass
 
     async def _on_response(event: cdp_net.ResponseReceived):
         try:
@@ -749,6 +818,15 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             timing = getattr(r, "timing", None)
             if timing is not None:
                 rec["_request_time"] = getattr(timing, "request_time", None)
+                # Milliseconds relative to request_time, -1 where a phase did
+                # not happen (a reused connection has no DNS or connect).
+                rec["timing"] = {
+                    name: float(getattr(timing, name, -1) if getattr(timing, name, None) is not None else -1)
+                    for name in _TIMING_FIELDS
+                }
+            rec["protocol"] = getattr(r, "protocol", "") or ""
+            rec["remote_ip"] = getattr(r, "remote_ip_address", "") or ""
+            rec["security"] = _compact_security_details(getattr(r, "security_details", None))
         except Exception:
             pass
 
@@ -840,6 +918,27 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
         except Exception:
             pass
 
+    async def _on_es_message(event: cdp_net.EventSourceMessageReceived):
+        # Server-sent events, one entry per message, the way a socket's frames
+        # are kept — so a push stream is readable without capture_bodies.
+        try:
+            rec = _latest(event.request_id)
+            if rec is None:
+                return
+            data = getattr(event, "data", "") or ""
+            messages = rec.setdefault("messages", [])
+            messages.append({
+                "event": getattr(event, "event_name", "") or "message",
+                "id": getattr(event, "event_id", "") or "",
+                "data": data[:_WS_PAYLOAD_CHARS],
+                "truncated": len(data) > _WS_PAYLOAD_CHARS,
+            })
+            rec["messages_total"] = rec.get("messages_total", 0) + 1
+            if len(messages) > _WS_FRAME_CAP:
+                messages.pop(0)
+        except Exception:
+            pass
+
     async def _on_ws_closed(event: cdp_net.WebSocketClosed):
         try:
             rec = _socket(event.request_id)
@@ -894,9 +993,155 @@ async def _auto_enable_network_collection(tab: uc.Tab) -> None:
             tab.add_handler(cdp_net.WebSocketFrameReceived, _on_ws_received)
             tab.add_handler(cdp_net.WebSocketClosed, _on_ws_closed)
             tab.add_handler(cdp_net.WebSocketFrameError, _on_ws_error)
+            tab.add_handler(cdp_net.RequestWillBeSentExtraInfo, _on_request_extra)
+            tab.add_handler(cdp_net.ResponseReceivedExtraInfo, _on_response_extra)
+            tab.add_handler(_RawIssueAdded, _on_issue)
+            tab.add_handler(cdp_net.EventSourceMessageReceived, _on_es_message)
             _network_handler_targets.add(id(tab))
     except Exception:
         _network_collection_enabled_tabs.discard(session_key)
+        return
+    try:
+        await tab.send(_cdp("Audits.enable"))
+    except Exception:
+        pass  # the network log does not depend on it
+
+
+class _RawIssueAdded:
+    """Audits.issueAdded, left as the dict Chrome sent.
+
+    nodriver parses every event before it looks for a handler, and its typed
+    parser raises on any issue code newer than its bindings — measured on
+    github.com, where "LazyLoadImageIssue" filled the log with tracebacks and the
+    issue itself was lost. Registered in place of nodriver's parser below.
+    """
+
+    def __init__(self, issue: dict) -> None:
+        self.issue = issue
+
+    @classmethod
+    def from_json(cls, json: dict) -> "_RawIssueAdded":
+        return cls(json.get("issue") or {})
+
+
+def _install_raw_issue_parser() -> None:
+    import nodriver.cdp.util as cdp_util
+
+    cdp_util._event_parsers["Audits.issueAdded"] = _RawIssueAdded
+
+
+_install_raw_issue_parser()
+
+
+_TIMING_FIELDS = (
+    "proxy_start", "proxy_end", "dns_start", "dns_end", "connect_start", "connect_end",
+    "ssl_start", "ssl_end", "worker_start", "worker_ready", "send_start", "send_end",
+    "receive_headers_end",
+)
+
+
+def _timing_phases(req: dict) -> dict[str, float] | None:
+    """Where a request's time went, in ms: the phases DevTools' Timing tab shows.
+
+    A phase that did not happen is left out rather than reported as 0 — a
+    reused connection has no DNS lookup, and saying "dns 0ms" would claim one.
+    """
+    t = req.get("timing")
+    if not t:
+        return None
+
+    def span(start: str, end: str) -> float | None:
+        a, b = t.get(start, -1), t.get(end, -1)
+        return b - a if a >= 0 and b >= 0 else None
+
+    phases: dict[str, float] = {}
+    firsts = [t[k] for k in ("proxy_start", "dns_start", "connect_start", "send_start") if t.get(k, -1) >= 0]
+    if firsts:
+        phases["queued"] = min(firsts)
+    for name, (start, end) in {
+        "proxy": ("proxy_start", "proxy_end"), "dns": ("dns_start", "dns_end"),
+        "connect": ("connect_start", "connect_end"), "tls": ("ssl_start", "ssl_end"),
+        "service worker": ("worker_start", "worker_ready"), "send": ("send_start", "send_end"),
+        "wait": ("send_end", "receive_headers_end"),
+    }.items():
+        value = span(start, end)
+        if value is not None:
+            phases[name] = value
+    duration = req.get("duration_ms")
+    if duration is not None and t.get("receive_headers_end", -1) >= 0:
+        phases["download"] = max(float(duration) - t["receive_headers_end"], 0.0)
+    return phases
+
+
+def _format_timing(req: dict) -> str:
+    phases = _timing_phases(req)
+    if not phases:
+        return ""
+    parts = []
+    for name, ms in phases.items():
+        label = "wait (TTFB)" if name == "wait" else name
+        parts.append(f"{label} {ms:.1f}ms")
+    if "dns" not in phases and "connect" not in phases and "service worker" not in phases:
+        parts.append("connection reused")
+    return ", ".join(parts)
+
+
+def _compact_initiator(initiator: Any) -> dict | None:
+    """What caused a request: the parser, a script (which frame), a preload…"""
+    if initiator is None:
+        return None
+    kind = getattr(initiator, "type_", "") or ""
+    out: dict[str, Any] = {"type": str(getattr(kind, "value", kind))}
+    if getattr(initiator, "url", None):
+        out["url"] = initiator.url
+        line = getattr(initiator, "line_number", None)
+        if line is not None:
+            out["line"] = int(line) + 1  # CDP counts from 0; editors from 1
+    stack = getattr(initiator, "stack", None)
+    while stack is not None:
+        # The innermost frame with a URL is the code that made the call; an
+        # async boundary (fetch in a .then) moves it into a parent stack.
+        for frame in getattr(stack, "call_frames", None) or []:
+            if getattr(frame, "url", ""):
+                out["frame"] = {
+                    "url": frame.url,
+                    "function": getattr(frame, "function_name", "") or "(anonymous)",
+                    "line": int(getattr(frame, "line_number", 0)) + 1,
+                    "column": int(getattr(frame, "column_number", 0)) + 1,
+                }
+                return out
+        stack = getattr(stack, "parent", None)
+    return out
+
+
+def _format_initiator(req: dict) -> str:
+    init = req.get("initiator")
+    if not init:
+        return ""
+    frame = init.get("frame")
+    if frame:
+        return f"{init['type']} — {frame['function']}() at {frame['url']}:{frame['line']}:{frame['column']}"
+    if init.get("url"):
+        return f"{init['type']} — {init['url']}" + (f":{init['line']}" if init.get("line") else "")
+    return init["type"]
+
+
+def _compact_security_details(details: Any) -> dict | None:
+    """The TLS facts audit_security reports, from a response's securityDetails."""
+    if details is None:
+        return None
+    compliance = getattr(details, "certificate_transparency_compliance", None)
+    return {
+        "protocol": getattr(details, "protocol", "") or "",
+        "cipher": getattr(details, "cipher", "") or "",
+        "key_exchange": getattr(details, "key_exchange_group", None) or getattr(details, "key_exchange", "") or "",
+        "subject": getattr(details, "subject_name", "") or "",
+        "issuer": getattr(details, "issuer", "") or "",
+        "valid_from": float(getattr(details, "valid_from", 0) or 0),
+        "valid_to": float(getattr(details, "valid_to", 0) or 0),
+        "san": list(getattr(details, "san_list", None) or [])[:20],
+        "ct": str(getattr(compliance, "value", compliance) or ""),
+    }
 
 
 def _request_outcome(req: dict) -> str:
@@ -936,12 +1181,16 @@ def _request_timing(req: dict) -> str:
             parts.append("closed")
         return " " + " ".join(parts)
     parts = []
+    if req.get("messages_total"):
+        parts.append(f"{req['messages_total']} events")
     if req.get("duration_ms") is not None:
         parts.append(f"{req['duration_ms']:g}ms")
     if req.get("size"):
         parts.append(f"{req['size']}B")
     if req.get("from_cache"):
         parts.append("cached")
+    if req.get("captured_file"):
+        parts.append("saved")
     return " " + " ".join(parts) if parts else ""
 
 
@@ -2326,6 +2575,9 @@ async def _stop_browser() -> bool:
     # Same reason as in _get_browser: .stopped is meaningless for a browser we
     # did not spawn, so an attached one counts as running whenever we hold it.
     was_running = _browser is not None and (attached or not _browser.stopped)
+    # Its connection dies with the browser; finish it first, so what it wrote is
+    # indexed and the reason it ended is on record for the next status call.
+    await _end_body_capture("the browser was closed")
     if _browser is not None and not attached:
         try:
             await _close_browser_and_profile(_browser)
@@ -3847,6 +4099,12 @@ async def get_network_request(
     detail = _request_timing(req).strip()
     if detail:
         lines.append(f"  Transfer: {detail}")
+    phases = _format_timing(req)
+    if phases:
+        lines.append(f"  Timing: {phases}")
+    initiator = _format_initiator(req)
+    if initiator:
+        lines.append(f"  Initiator: {initiator}")
     headers = req.get("response_headers") or {}
     if headers:
         lines.append(f"  Response headers ({len(headers)}):")
@@ -3869,6 +4127,18 @@ async def get_network_request(
             lines.append(f"    {arrow}{kind} {frame['data']}{suffix}")
         # There is no response body for a socket, so stop before asking for one.
         return "\n".join(lines)
+
+    if req.get("messages_total"):
+        messages = req.get("messages") or []
+        dropped = req["messages_total"] - len(messages)
+        lines.append(
+            f"  Server-sent events ({req['messages_total']}"
+            + (f"; showing the last {len(messages)}" if dropped else "") + "):"
+        )
+        for m in messages:
+            label = "" if m["event"] == "message" else f"[{m['event']}] "
+            suffix = " …(truncated)" if m.get("truncated") else ""
+            lines.append(f"    <- {label}{m['data']}{suffix}")
 
     try:
         request_body = await tab.send(cdp_net.get_request_post_data(cdp_net.RequestId(req["id"])))
@@ -3898,7 +4168,26 @@ async def get_network_request(
         else:
             lines.append(f"  Response body ({len(body_content)} chars): {body_content[:5000]}")
     except Exception as e:
-        lines.append(f"  Response body: Error — {e}")
+        captured = req.get("captured_file")
+        if captured and os.path.isfile(captured):
+            # Chrome no longer has it, but capture_bodies took it on the way in.
+            if response_file_path:
+                shutil.copyfile(captured, response_file_path)
+                lines.append(f"  Response body saved to: {response_file_path} (from the capture)")
+            else:
+                with open(captured, "rb") as f:
+                    raw = f.read()
+                text = raw.decode("utf-8", errors="replace")
+                lines.append(
+                    f"  Response body ({len(raw)} bytes, from the capture at {captured}): {text[:5000]}"
+                )
+        else:
+            lines.append(f"  Response body: Error — {e}")
+            if captured:
+                lines.append(f"  Captured copy {captured} no longer exists.")
+        return "\n".join(lines)
+    if req.get("captured_file"):
+        lines.append(f"  Also captured to: {req['captured_file']}")
 
     return "\n".join(lines)
 
@@ -4114,15 +4403,7 @@ async def list_network_requests(
         int, Field(ge=0, description="0-based page number, used together with page_size.")
     ] = 0,
     resource_types: Annotated[
-        list[
-            Literal[
-                "Document", "Stylesheet", "Image", "Media", "Font", "Script",
-                "TextTrack", "XHR", "Fetch", "Prefetch", "EventSource", "WebSocket",
-                "Manifest", "SignedExchange", "Ping", "CSPViolationReport",
-                "Preflight", "FedCM", "Other",
-            ]
-        ]
-        | None,
+        list[ResourceTypeName] | None,
         Field(description=(
             'Only return these resource types. ["XHR", "Fetch"] is the useful filter '
             "for finding a page's own API calls. Matching is case-insensitive. Omit "
@@ -6332,6 +6613,1702 @@ async def block_resources(
     if unknown:
         base += f" Ignored unknown: {', '.join(unknown)} (valid: image, font, stylesheet, media)."
     return base
+
+
+# ---------------------------------------------------------------------------
+# Response-body capture
+# ---------------------------------------------------------------------------
+# get_network_request asks Chrome for a body only once someone asks, and by then
+# it is often gone. Measured on Chrome 151: a 12 MB response was already
+# "evicted from inspector cache" at its own loadingFinished, and a small JSON
+# response that read fine a moment earlier answered "No resource with given
+# identifier found" after one cross-site navigation. A body taken while the
+# response is still paused cannot be lost that way.
+#
+# Why a CDP connection of its own instead of the tab's sessions:
+#   * Fetch.enable replaces the Fetch configuration of its session, and
+#     block_resources and proxy authentication already use Fetch on the tab's.
+#     A separate session intercepts independently; Chrome chains the two.
+#   * Coverage, measured with a page fetch, a dedicated worker, a blob worker, a
+#     request a service worker passes through and one it makes itself: Network
+#     on the page saw 2 of 5, Fetch on the page 3 (not the service worker's),
+#     Fetch on the browser target only the 2 workers. Fetch on the page plus
+#     Fetch on the service worker's own target saw all 5 — and browser-level
+#     auto-attach is what reaches both, including tabs the page opens itself.
+#   * waitForDebuggerOnStart holds every new target until interception is
+#     armed, so the first request of a new tab or a freshly started service
+#     worker is not missed.
+
+_CAPTURE_ROOT = os.path.join(os.path.expanduser("~"), ".nodriver-mcp", "captures")
+
+# Responses that never really end. Fetch.getResponseBody waits for the end, so
+# the page would receive nothing until then — an EventSource never. These are
+# released at once and written chunk by chunk as they arrive instead.
+_STREAMING_MIME_TYPES = frozenset({"text/event-stream", "application/x-ndjson"})
+
+_CAPTURE_EXTENSIONS: dict[str, str] = {
+    "application/json": ".json", "text/html": ".html", "text/css": ".css",
+    "text/javascript": ".js", "application/javascript": ".js",
+    "text/plain": ".txt", "text/event-stream": ".txt", "application/x-ndjson": ".ndjson",
+    "text/xml": ".xml", "application/xml": ".xml", "application/pdf": ".pdf",
+    "application/wasm": ".wasm", "image/png": ".png", "image/jpeg": ".jpg",
+    "image/gif": ".gif", "image/webp": ".webp", "image/avif": ".avif",
+    "image/svg+xml": ".svg", "image/x-icon": ".ico", "font/woff": ".woff",
+    "font/woff2": ".woff2", "video/mp4": ".mp4", "audio/mpeg": ".mp3",
+}
+
+
+def _capture_filename(seq: int, url: str, mime: str) -> str:
+    """A name that says where the body came from: 0007_api.example.com_search.json"""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    host = parts.hostname or parts.scheme or "local"
+    stem, url_ext = os.path.splitext(parts.path.rstrip("/").rsplit("/", 1)[-1])
+    ext = _CAPTURE_EXTENSIONS.get(mime)
+    if ext is None and mime.endswith("+json"):
+        ext = ".json"
+    if ext is None and re.fullmatch(r"\.[A-Za-z0-9]{1,6}", url_ext):
+        ext = url_ext.lower()
+    if ext is None:
+        ext = ".txt" if mime.startswith("text/") else ".bin"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{host}_{stem or 'index'}").strip("_.")
+    return f"{seq:04d}_{slug[:80]}{ext}"
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _link_captured_body(network_id: str | None, path: str) -> None:
+    """Tell the network log where a request's body went, so the lazy lookup
+    (get_network_request) can fall back to it once Chrome has dropped its copy."""
+    if not network_id:
+        return
+    for batch in (_network_requests, *reversed(_preserved_network_requests)):
+        for rec in reversed(batch):
+            if rec.get("id") == network_id and rec.get("redirect_to") is None:
+                rec["captured_file"] = path
+                return
+
+
+class _BodyCapture:
+    """One running capture: a CDP connection of its own, and what it saved.
+
+    Speaks raw CDP over its own websocket rather than through a nodriver
+    Connection, because it has to know which session every event came from, and
+    nodriver's dispatcher drops the sessionId.
+    """
+
+    def __init__(
+        self,
+        ws_url: str,
+        pattern: str,
+        types: list[str],
+        out_dir: str,
+        max_bytes: int,
+    ) -> None:
+        self.ws_url = ws_url
+        self.pattern = pattern
+        self.types = types
+        self.out_dir = out_dir
+        self.manifest = os.path.join(out_dir, "capture.jsonl")
+        self.max_bytes = max_bytes
+        self.started = time.time()
+        self.ws: Any = None
+        self.reader: asyncio.Task | None = None
+        self.msg_id = 0
+        self.replies: dict[int, asyncio.Future] = {}
+        self.sessions: dict[str, dict] = {}  # sessionId -> {"type", "url"}
+        self.arm_errors: list[str] = []
+        self.seq = 0
+        self.recent: list[dict] = []  # newest last, capped
+        self.saved = 0
+        self.saved_bytes = 0
+        self.skipped: dict[str, int] = {}
+        self.failed = 0
+        self.failures: list[str] = []
+        # (sessionId, network requestId) -> an event stream being written.
+        self.streams: dict[tuple[str, str], dict] = {}
+        self.tasks: set[asyncio.Task] = set()
+        self.ended: str | None = None  # why it stopped, once it has
+
+    # -- transport -------------------------------------------------------------
+
+    async def open(self) -> None:
+        import websockets
+
+        # No keepalive pings: a multi-megabyte body can hold the loop long enough
+        # to miss one, and a dropped capture connection is exactly the silent
+        # loss this exists to prevent. nodriver sets the same size ceiling.
+        self.ws = await websockets.connect(self.ws_url, max_size=2**28, ping_interval=None)
+        self.reader = asyncio.create_task(self._read())
+
+    async def send(
+        self,
+        method: str,
+        params: dict | None = None,
+        session: str | None = None,
+        timeout: float | None = 30,
+    ) -> dict:
+        self.msg_id += 1
+        mid = self.msg_id
+        message: dict[str, Any] = {"id": mid, "method": method, "params": params or {}}
+        if session:
+            message["sessionId"] = session
+        future = asyncio.get_running_loop().create_future()
+        self.replies[mid] = future
+        try:
+            await self.ws.send(json.dumps(message))
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            self.replies.pop(mid, None)
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self.ws:
+                message = json.loads(raw)
+                if "id" in message:
+                    future = self.replies.get(message["id"])
+                    if future is None or future.done():
+                        continue
+                    if "error" in message:
+                        future.set_exception(RuntimeError(message["error"].get("message", "CDP error")))
+                    else:
+                        future.set_result(message.get("result") or {})
+                else:
+                    self._dispatch(
+                        message.get("method", ""), message.get("params") or {}, message.get("sessionId", "")
+                    )
+        except Exception:
+            pass
+        finally:
+            if self.ended is None:
+                self.ended = "the connection to the browser closed (was the browser closed?)"
+            for future in self.replies.values():
+                if not future.done():
+                    future.set_exception(ConnectionError("capture connection closed"))
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def _dispatch(self, method: str, params: dict, session: str) -> None:
+        if method == "Fetch.requestPaused":
+            self._spawn(self._on_paused(params, session))
+        elif method == "Target.attachedToTarget":
+            self._spawn(self._on_attached(params))
+        elif method == "Target.detachedFromTarget":
+            self.sessions.pop(params.get("sessionId", ""), None)
+        elif method.startswith("Network.") and self.streams:
+            key = (session, params.get("requestId", ""))
+            if key not in self.streams:
+                return
+            if method == "Network.dataReceived":
+                # Handled inline, not as a task: chunks must land in arrival order.
+                self._on_stream_data(key, params)
+            elif method == "Network.responseReceived":
+                self._spawn(self._start_stream(key, session))
+            elif method == "Network.loadingFinished":
+                self._end_stream(key, "complete")
+            elif method == "Network.loadingFailed":
+                self._end_stream(
+                    key,
+                    "stream closed by the page" if params.get("canceled")
+                    else f"stream broke off: {params.get('errorText') or 'error'}",
+                )
+
+    # -- arming ------------------------------------------------------------------
+
+    def _patterns(self) -> list[dict]:
+        base = {"urlPattern": self.pattern, "requestStage": "Response"}
+        if not self.types:
+            return [base]
+        return [{**base, "resourceType": t} for t in self.types]
+
+    async def start(self) -> None:
+        await self.open()
+        await self.send("Target.setAutoAttach", {
+            "autoAttach": True,
+            "waitForDebuggerOnStart": True,
+            "flatten": True,
+            # Pages and the workers that are targets of their own. Dedicated
+            # workers are not listed: the page's Fetch session already sees
+            # their requests (measured), and they are not top-level targets.
+            "filter": [
+                {"type": "page"}, {"type": "service_worker"}, {"type": "shared_worker"},
+                {"exclude": True},
+            ],
+        })
+
+    async def _on_attached(self, params: dict) -> None:
+        session = params.get("sessionId", "")
+        info = params.get("targetInfo") or {}
+        kind = info.get("type", "")
+        # Registered before arming: a request can be paused the instant Fetch is
+        # on, and its handler needs to know what kind of target it came from.
+        self.sessions[session] = {"type": kind, "url": info.get("url", ""), "armed": False}
+        try:
+            await self.send("Fetch.enable", {"patterns": self._patterns()}, session)
+            if kind == "page":
+                # Only for event streams, which are read through Network. It has to
+                # be on before their request starts, or Chrome keeps no record of
+                # it to stream from.
+                await self.send("Network.enable", {
+                    "maxTotalBufferSize": 10_000_000,
+                    "maxResourceBufferSize": 5_000_000,
+                }, session)
+            self.sessions[session]["armed"] = True
+        except Exception as e:  # noqa: BLE001
+            self.sessions.pop(session, None)
+            self.arm_errors.append(f"{kind} {info.get('url', '')[:80]}: {e}")
+        finally:
+            if params.get("waitingForDebugger"):
+                try:
+                    await self.send("Runtime.runIfWaitingForDebugger", {}, session)
+                except Exception:
+                    pass
+
+    # -- bodies ------------------------------------------------------------------
+
+    async def _on_paused(self, params: dict, session: str) -> None:
+        try:
+            await self._take_body(params, session)
+        except Exception as e:  # noqa: BLE001
+            self._fail((params.get("request") or {}).get("url", ""), str(e))
+        finally:
+            # Always let the response go on to the page, whatever happened here.
+            try:
+                await self.send("Fetch.continueRequest", {"requestId": params["requestId"]}, session)
+            except Exception:
+                pass
+
+    async def _take_body(self, params: dict, session: str) -> None:
+        request = params.get("request") or {}
+        status = params.get("responseStatusCode")
+        if params.get("responseErrorReason") or status is None:
+            self._skip("failed before a response arrived")
+            return
+        headers = {h["name"].lower(): h["value"] for h in params.get("responseHeaders") or []}
+        if 300 <= status < 400 and "location" in headers:
+            self._skip("redirect (no body)")
+            return
+        if status == 304:
+            self._skip("304: body came from Chrome's cache")
+            return
+        if status == 204 or request.get("method") == "HEAD":
+            self._skip("no body (204 or HEAD)")
+            return
+        mime = headers.get("content-type", "").split(";")[0].strip().lower()
+        entry = self._entry(params, session, status, mime, headers)
+
+        if mime in _STREAMING_MIME_TYPES:
+            network_id = params.get("networkId")
+            if self.sessions.get(session, {}).get("type") == "page" and network_id:
+                self.streams[(session, network_id)] = {"entry": entry, "state": "released", "chunks": []}
+            else:
+                self._skip("event stream outside a page (not readable there)")
+            return
+
+        length = headers.get("content-length", "")
+        if length.isdigit() and int(length) > self.max_bytes:
+            self._skip("larger than max_body_mb")
+            return
+
+        body = await self.send(
+            "Fetch.getResponseBody", {"requestId": params["requestId"]}, session, timeout=None
+        )
+        if body.get("base64Encoded"):
+            data = base64.b64decode(body.get("body") or "")
+        else:
+            data = (body.get("body") or "").encode("utf-8")
+        path = self._path_for(entry)
+        await asyncio.to_thread(_write_bytes, path, data)
+        self._finish(entry, path, len(data), "complete")
+
+    def _entry(self, params: dict, session: str, status: int, mime: str, headers: dict) -> dict:
+        self.seq += 1
+        request = params.get("request") or {}
+        entry: dict[str, Any] = {
+            "seq": self.seq,
+            "time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "url": request.get("url", ""),
+            "method": request.get("method", ""),
+            "status": status,
+            "mime_type": mime,
+            "resource_type": params.get("resourceType", ""),
+            "source": self.sessions.get(session, {}).get("type", ""),
+            "network_id": params.get("networkId"),
+        }
+        if request.get("postData"):
+            entry["post_data"] = request["postData"]
+        elif request.get("hasPostData"):
+            entry["post_data"] = None  # sent, but too large for Chrome to include
+        entry["response_headers"] = headers
+        return entry
+
+    def _path_for(self, entry: dict) -> str:
+        name = _capture_filename(entry["seq"], entry["url"], entry["mime_type"])
+        path = os.path.join(self.out_dir, name)
+        stem, ext = os.path.splitext(path)
+        n = 1
+        while os.path.exists(path):  # never overwrite an earlier capture's file
+            path = f"{stem}-{n}{ext}"
+            n += 1
+        return path
+
+    def _finish(self, entry: dict, path: str, size: int, outcome: str) -> None:
+        entry["file"] = os.path.basename(path)
+        entry["bytes"] = size
+        entry["outcome"] = outcome
+        try:
+            with open(self.manifest, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as e:
+            self._fail(entry["url"], f"manifest not written: {e}")
+        self.saved += 1
+        self.saved_bytes += size
+        self.recent.append(entry)
+        if len(self.recent) > 200:
+            self.recent.pop(0)
+        _link_captured_body(entry.get("network_id"), path)
+
+    def _skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+    def _fail(self, url: str, reason: str) -> None:
+        self.failed += 1
+        if len(self.failures) < 20:
+            self.failures.append(f"{url[:120]} — {reason}")
+
+    # -- event streams -------------------------------------------------------------
+
+    async def _start_stream(self, key: tuple[str, str], session: str) -> None:
+        stream = self.streams.get(key)
+        if stream is None or stream["state"] != "released":
+            return
+        stream["state"] = "starting"
+        try:
+            reply = await self.send("Network.streamResourceContent", {"requestId": key[1]}, session)
+            buffered = base64.b64decode(reply.get("bufferedData") or "")
+        except Exception as e:  # noqa: BLE001
+            # Chrome refuses once the response has finished; then the whole body
+            # is in its buffer and can be read the ordinary way.
+            self.streams.pop(key, None)
+            try:
+                body = await self.send("Network.getResponseBody", {"requestId": key[1]}, session)
+                data = (
+                    base64.b64decode(body.get("body") or "") if body.get("base64Encoded")
+                    else (body.get("body") or "").encode("utf-8")
+                )
+                path = self._path_for(stream["entry"])
+                await asyncio.to_thread(_write_bytes, path, data)
+                self._finish(stream["entry"], path, len(data), "complete")
+            except Exception:  # noqa: BLE001
+                self._fail(stream["entry"]["url"], f"event stream not readable: {e}")
+            return
+        path = self._path_for(stream["entry"])
+        handle = open(path, "wb")
+        written = 0
+        for chunk in (buffered, *stream["chunks"]):
+            handle.write(chunk)
+            written += len(chunk)
+        handle.flush()
+        stream.update(state="streaming", path=path, handle=handle, bytes=written, chunks=[])
+        if stream.get("end"):
+            self._end_stream(key, stream["end"])
+
+    def _on_stream_data(self, key: tuple[str, str], params: dict) -> None:
+        stream = self.streams[key]
+        if not params.get("data"):
+            return
+        chunk = base64.b64decode(params["data"])
+        if stream["state"] == "streaming":
+            stream["handle"].write(chunk)
+            stream["handle"].flush()  # readable on disk while the stream is still open
+            stream["bytes"] += len(chunk)
+        else:
+            stream["chunks"].append(chunk)
+
+    def _end_stream(self, key: tuple[str, str], outcome: str) -> None:
+        stream = self.streams.get(key)
+        if stream is None:
+            return
+        if stream["state"] == "starting":
+            stream["end"] = outcome  # _start_stream finishes it
+            return
+        self.streams.pop(key, None)
+        if stream["state"] == "released":
+            self._fail(stream["entry"]["url"], f"{outcome} before any of it arrived")
+            return
+        stream["handle"].close()
+        self._finish(stream["entry"], stream["path"], stream["bytes"], outcome)
+
+    # -- lifecycle -------------------------------------------------------------------
+
+    async def stop(self, reason: str) -> None:
+        if self.ended is None:
+            self.ended = reason
+        # Bodies already being read get a moment to land on disk.
+        if self.tasks:
+            await asyncio.wait(set(self.tasks), timeout=3)
+        try:
+            # Turning auto-attach off detaches every session it made, which ends
+            # their interception; Chrome releases anything still paused.
+            await self.send("Target.setAutoAttach", {"autoAttach": False, "waitForDebuggerOnStart": False}, timeout=5)
+        except Exception:
+            pass
+        for key in list(self.streams):
+            if self.streams[key]["state"] == "streaming":
+                self._end_stream(key, "still streaming when the capture stopped")
+            else:
+                self.streams.pop(key, None)
+        for task in list(self.tasks):
+            task.cancel()
+        try:
+            await asyncio.wait_for(self.ws.close(), timeout=5)
+        except Exception:
+            pass
+        if self.reader is not None:
+            self.reader.cancel()
+
+    def summary(self) -> str:
+        types = ", ".join(self.types) if self.types else "all types"
+        kinds: dict[str, int] = {}
+        for s in self.sessions.values():
+            if s["armed"]:
+                kinds[s["type"]] = kinds.get(s["type"], 0) + 1
+        armed = ", ".join(f"{n} {k.replace('_', ' ')}{'s' if n != 1 else ''}" for k, n in sorted(kinds.items()))
+        lines = [
+            f'Pattern "{self.pattern}" ({types}) -> {self.out_dir}',
+            f"{'Running' if self.ended is None else 'Ran'} {time.time() - self.started:.0f}s"
+            + (f", intercepting on {armed}." if armed and self.ended is None else "."),
+            f"Saved {self.saved} bod{'y' if self.saved == 1 else 'ies'} "
+            f"({self.saved_bytes / 1_048_576:.2f} MB)"
+            + (f"; {len(self.streams)} event stream(s) still open." if self.streams else "."),
+        ]
+        if self.skipped:
+            lines.append("Skipped: " + ", ".join(f"{r} ({n})" for r, n in sorted(self.skipped.items())) + ".")
+        if self.failed:
+            lines.append(f"Failed {self.failed}:")
+            lines += [f"  {f}" for f in self.failures]
+        if self.arm_errors:
+            lines.append("Could not intercept on:")
+            lines += [f"  {e}" for e in self.arm_errors[:10]]
+        if self.saved:
+            lines.append(f"Index of every file: {self.manifest}")
+            lines.append("Latest:")
+            for e in self.recent[-10:]:
+                done = "" if e["outcome"] == "complete" else f" [{e['outcome']}]"
+                lines.append(
+                    f"  {e['file']}  {e['status']} {e['mime_type'] or '?'} {e['bytes']}B{done}  {e['url'][:100]}"
+                )
+        return "\n".join(lines)
+
+
+_body_capture: _BodyCapture | None = None
+_last_capture_summary: str = ""
+# Set when a capture ended without the agent being told — the browser closed
+# under it — so the next stop reports that instead of "nothing is running".
+_last_capture_unseen: bool = False
+_last_capture_dir: str = ""  # where the most recent capture wrote, for search_bodies
+
+
+async def _end_body_capture(reason: str) -> str:
+    """Stop the running capture, if any, and return its final summary."""
+    global _body_capture, _last_capture_summary, _last_capture_unseen
+    capture = _body_capture
+    if capture is None:
+        return ""
+    _body_capture = None
+    try:
+        await capture.stop(reason)
+    except Exception:
+        logger.warning("stopping the body capture failed", exc_info=True)
+    _last_capture_summary = f"Ended: {capture.ended}.\n{capture.summary()}"
+    _last_capture_unseen = True
+    return _last_capture_summary
+
+
+@tool(title="Capture response bodies to disk")
+async def capture_bodies(
+    action: Annotated[
+        Literal["start", "status", "stop"],
+        Field(description=(
+            '"start" begins capturing in the background, "status" reports progress '
+            'while it runs, "stop" ends it and reports what was saved.'
+        )),
+    ] = "start",
+    url_pattern: Annotated[
+        str,
+        Field(description=(
+            'Which responses to keep, matched against the full URL — required for '
+            'start. "*" matches any run of characters and "?" exactly one, as in '
+            'Chrome\'s own interception patterns: "*/api/*", "*graphql*". A pattern '
+            'without "*" matches anywhere in the URL. "*" keeps everything.'
+        )),
+    ] = "",
+    out_dir: Annotated[
+        str,
+        Field(description=(
+            "Folder to write into, created if missing. Empty uses "
+            "~/.nodriver-mcp/captures/<timestamp>."
+        )),
+    ] = "",
+    resource_types: Annotated[
+        list[ResourceTypeName] | None,
+        Field(description=(
+            'Only these resource types, e.g. ["XHR", "Fetch"] for a page\'s own API '
+            "calls. Omit for all."
+        )),
+    ] = None,
+    max_body_mb: Annotated[
+        int,
+        Field(ge=1, le=150, description=(
+            "Skip a response whose Content-Length announces more than this many MB. "
+            "A captured body is held in memory whole on its way to disk."
+        )),
+    ] = 100,
+) -> str:
+    """Save every matching response body to disk the moment it arrives, in the background.
+
+    get_network_request asks Chrome for a body only when you ask — by then it is
+    often gone: Chrome drops bodies over ~10 MB at once, and a navigation to
+    another site drops the rest. This takes each body while the response is
+    still paused, before the page even sees it, and writes it to a file.
+
+    Covers the whole browser until stopped: every tab, including ones the page
+    opens itself, plus dedicated workers and service workers. Each body is its
+    own file; capture.jsonl beside them records URL, method, POST data, status
+    and headers per file. list_network_requests marks captured requests "saved",
+    and get_network_request falls back to the file.
+
+    Not captured: responses from Chrome's cache (they never touch the network —
+    reload with ignore_cache), redirects, and event streams inside workers.
+    Event streams on a page are written as they arrive; every other matching
+    response reaches the page only once complete, so keep the pattern off
+    long-running downloads.
+    """
+    global _body_capture, _last_capture_unseen, _last_capture_dir
+    if _body_capture is not None and _body_capture.ended is not None:
+        # Its connection died under it: the browser crashed or was closed from
+        # outside. Say so, rather than report a capture that is not running.
+        await _end_body_capture(_body_capture.ended)
+    if action == "status":
+        if _body_capture is not None:
+            return f"Capture running.\n{_body_capture.summary()}"
+        if _last_capture_summary:
+            _last_capture_unseen = False
+            return f"No capture running. The last one:\n{_last_capture_summary}"
+        return "No capture running."
+    if action == "stop":
+        if _body_capture is None:
+            if _last_capture_unseen:
+                _last_capture_unseen = False
+                return f"No capture was running any more; it had already ended.\n{_last_capture_summary}"
+            raise ToolFailure("No capture is running.")
+        summary = await _end_body_capture("stopped by request")
+        _last_capture_unseen = False
+        return "Capture stopped. " + summary
+
+    pattern = url_pattern.strip()
+    if not pattern:
+        raise ToolFailure('url_pattern is required to start a capture; pass "*" for everything.')
+    note = ""
+    if "*" not in pattern:
+        pattern = f"*{pattern}*"
+        note = f' (no "*" in the pattern, so it matches anywhere in the URL: "{pattern}")'
+    if _body_capture is not None:
+        raise ToolFailure("A capture is already running — stop it first.\n" + _body_capture.summary())
+
+    directory = os.path.abspath(os.path.expanduser(out_dir.strip())) if out_dir.strip() else os.path.join(
+        _CAPTURE_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as e:
+        raise ToolFailure(f"Cannot create {directory}: {e}")
+
+    browser = await _get_browser()
+    ws_url = getattr(browser, "websocket_url", None) or getattr(getattr(browser, "info", None), "webSocketDebuggerUrl", None)
+    if not ws_url:
+        raise ToolFailure("The browser exposes no DevTools websocket to capture through.")
+
+    capture = _BodyCapture(ws_url, pattern, list(resource_types or []), directory, max_body_mb * 1_048_576)
+    try:
+        await capture.start()
+        # Auto-attach reaches the pages that already exist asynchronously. Wait
+        # until each one is actually intercepting before saying so.
+        pages = [
+            t for t in (await capture.send("Target.getTargets")).get("targetInfos", [])
+            if t.get("type") == "page"
+        ]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while loop.time() < deadline:
+            armed = sum(1 for s in capture.sessions.values() if s["type"] == "page" and s["armed"])
+            if armed + len(capture.arm_errors) >= len(pages):
+                break
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        await capture.stop(f"failed to start: {e}")
+        raise ToolFailure(f"Could not start the capture: {e}")
+
+    armed_pages = sum(1 for s in capture.sessions.values() if s["type"] == "page" and s["armed"])
+    if pages and armed_pages == 0:
+        await capture.stop("could not intercept on any page")
+        raise ToolFailure("Could not intercept on any open page.\n" + capture.summary())
+    _body_capture = capture
+    _last_capture_dir = directory
+    return (
+        f"Capturing{note}. Tabs opened from now on are included from their first "
+        f"request. Check with action=\"status\", end with action=\"stop\".\n{capture.summary()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security inspection: HAR export, audit, storage inventory
+# ---------------------------------------------------------------------------
+# All three are passive: they read what the browser already holds or was already
+# sent. The one request any of them makes is audit_security's fallback when the
+# page load itself was not recorded, and its answer says so when that happens.
+
+
+def _cdp(method: str, params: dict | None = None):
+    """A raw CDP command for tab.send(), answered with the plain JSON result.
+
+    For Audits, IndexedDB, CacheStorage and friends, whose nodriver bindings parse
+    replies into dataclasses that break on any field newer than the bindings. A
+    dict survives a Chrome update.
+    """
+    result = yield {"method": method, "params": params or {}}
+    return result
+
+
+def _lower_headers(headers: dict | None) -> dict[str, str]:
+    return {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+
+
+def _is_loopback(host: str) -> bool:
+    host = (host or "").strip("[]").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost")
+
+
+def _origin_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme in ("http", "https") else ""
+
+
+# Names that usually mean "this is a credential". Deliberately loose: a false
+# hit costs a line in a report, a miss costs a finding.
+_SENSITIVE_NAME = re.compile(
+    r"sess|(^|[^a-z])sid|auth|token|jwt|login|remember|refresh|secret|passw|api[-_]?key|bearer|credential",
+    re.IGNORECASE,
+)
+_CSRF_NAME = re.compile(r"csrf|xsrf", re.IGNORECASE)
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+
+def _jwt_summary(token: str) -> tuple[str, list[str]]:
+    """Decode a JWT's header and claims — no signature check, it is a read-out."""
+    def decode(segment: str) -> Any:
+        return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+
+    try:
+        head_b64, body_b64 = token.split(".")[:2]
+        header, claims = decode(head_b64), decode(body_b64)
+    except Exception:
+        return "", []
+    if not isinstance(header, dict) or not isinstance(claims, dict):
+        return "", []
+    parts = [f"alg={header.get('alg')}"]
+    warnings: list[str] = []
+    if str(header.get("alg", "")).lower() == "none":
+        warnings.append("unsigned (alg=none)")
+    for claim in ("iss", "aud", "scope", "role"):
+        if claim in claims:
+            parts.append(f"{claim}={str(claims[claim])[:60]}")
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)):
+        days = (exp - time.time()) / 86400
+        when = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%d")
+        parts.append(f"exp={when} ({'expired' if days < 0 else f'{days:.0f}d left'})")
+        if days > 30:
+            warnings.append(f"valid for another {days:.0f} days")
+    else:
+        warnings.append("no exp claim, never expires")
+    parts.append("claims: " + ", ".join(sorted(claims)[:12]))
+    return "JWT " + ", ".join(parts), warnings
+
+
+# -- HAR ---------------------------------------------------------------------------
+
+_TEXTUAL_MIME = re.compile(r"^text/|json|javascript|xml|html|svg|x-www-form-urlencoded|event-stream|ndjson")
+
+
+def _har_body(raw: bytes, mime: str) -> dict:
+    if _TEXTUAL_MIME.search(mime or ""):
+        try:
+            return {"text": raw.decode("utf-8")}
+        except UnicodeDecodeError:
+            pass
+    return {"text": base64.b64encode(raw).decode("ascii"), "encoding": "base64"}
+
+
+def _har_entry(req: dict, body: dict | None) -> dict:
+    from urllib.parse import parse_qsl, urlsplit
+
+    url = req["url"]
+    started = req.get("wall_time") or 0
+    started_iso = (
+        datetime.fromtimestamp(started, tz=timezone.utc).isoformat(timespec="milliseconds")
+        if started else "1970-01-01T00:00:00.000+00:00"
+    )
+    duration = float(req.get("duration_ms") or 0)
+    http_version = req.get("protocol") or "http/1.1"
+    # The wire headers (ExtraInfo) carry Cookie and Set-Cookie; the renderer's
+    # copy does not. A HAR without them is useless for replaying a session.
+    request_headers = req.get("request_headers_raw") or req.get("request_headers") or {}
+    response_headers = req.get("response_headers_raw") or req.get("response_headers") or {}
+    post = req.get("post_data")
+    request: dict[str, Any] = {
+        "method": req.get("method") or "GET",
+        "url": url,
+        "httpVersion": http_version,
+        "cookies": [],
+        "headers": [{"name": k, "value": v} for k, v in request_headers.items()],
+        "queryString": [
+            {"name": k, "value": v} for k, v in parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        ],
+        "headersSize": -1,
+        "bodySize": len(post.encode("utf-8")) if post else 0,
+    }
+    if post:
+        request["postData"] = {
+            "mimeType": _lower_headers(request_headers).get("content-type", ""),
+            "text": post,
+        }
+    content: dict[str, Any] = {"size": 0, "mimeType": req.get("mime_type") or "x-unknown"}
+    if body is not None:
+        body = dict(body)
+        content["size"] = body.pop("_size", 0)
+        content.update(body)
+    entry: dict[str, Any] = {
+        "startedDateTime": started_iso,
+        "time": duration,
+        "request": request,
+        "response": {
+            "status": req.get("status") or 0,
+            "statusText": req.get("status_text") or "",
+            "httpVersion": http_version,
+            "cookies": [],
+            "headers": [{"name": k, "value": v} for k, v in response_headers.items()],
+            "content": content,
+            "redirectURL": req.get("redirect_to") or "",
+            "headersSize": -1,
+            "bodySize": req["size"] if req.get("size") is not None else -1,
+        },
+        "cache": {},
+        "timings": {"blocked": -1, "dns": -1, "connect": -1, "ssl": -1, "send": 0, "wait": duration, "receive": 0},
+        "_resourceType": str(req.get("type") or "other").lower(),
+    }
+    phases = _timing_phases(req)
+    if phases:
+        # HAR's connect includes ssl, as Chrome's does; -1 means "did not happen".
+        entry["timings"] = {
+            "blocked": round(phases.get("queued", -1), 3),
+            "dns": round(phases.get("dns", -1), 3),
+            "connect": round(phases.get("connect", -1), 3),
+            "ssl": round(phases.get("tls", -1), 3),
+            "send": round(phases.get("send", 0), 3),
+            "wait": round(phases.get("wait", 0), 3),
+            "receive": round(phases.get("download", 0), 3),
+        }
+    initiator = req.get("initiator")
+    if initiator:
+        # The field Chrome DevTools itself writes and reads back on import.
+        entry["_initiator"] = {"type": initiator["type"]}
+        frame = initiator.get("frame")
+        if frame:
+            entry["_initiator"].update(url=frame["url"], lineNumber=frame["line"] - 1)
+        elif initiator.get("url"):
+            entry["_initiator"].update(url=initiator["url"], lineNumber=initiator.get("line", 1) - 1)
+    if req.get("messages"):
+        entry["_eventSourceMessages"] = [
+            {"eventName": m["event"], "eventId": m["id"], "data": m["data"]} for m in req["messages"]
+        ]
+    if req.get("remote_ip"):
+        entry["serverIPAddress"] = req["remote_ip"].strip("[]")
+    if req.get("failed") and req.get("status") is None:
+        entry["_error"] = req.get("status_text") or "failed"
+    if req.get("type") == "WebSocket":
+        entry["_webSocketMessages"] = [
+            {"type": "send" if f["dir"] == "sent" else "receive", "time": 0,
+             "opcode": 1 if f["kind"] == "text" else 2, "data": f["data"]}
+            for f in req.get("frames") or []
+        ]
+    return entry
+
+
+@tool(title="Export network log as HAR")
+async def export_har(
+    file_path: Annotated[str, Field(description="Where to write the .har file.")],
+    include_bodies: Annotated[
+        bool,
+        Field(description=(
+            "Embed response bodies: from capture_bodies' files where there is one, "
+            "otherwise whatever Chrome still holds. Off gives headers and timing only."
+        )),
+    ] = True,
+    include_preserved_requests: Annotated[
+        bool,
+        Field(description="Also export the previous 3 navigations' requests, not just the current page's."),
+    ] = True,
+    url_filter: Annotated[
+        str,
+        Field(description='Only requests whose URL contains this substring, e.g. "/api/". Empty exports all.'),
+    ] = "",
+) -> str:
+    """Write the network log to a HAR 1.2 file — importable into Burp, ZAP,
+    Chrome DevTools, Charles and anything else that reads HAR.
+
+    Headers are the ones that went over the wire, Cookie and Set-Cookie
+    included, with POST bodies, status, timing, server IP and WebSocket frames.
+    Response bodies come from capture_bodies' files where available — start a
+    capture first for a HAR that has every body — and otherwise from Chrome's
+    buffer, which only still holds recent ones on the current tab.
+
+    The file holds live session cookies and tokens; treat it like a password.
+    """
+    tab = await _active_tab()
+    import nodriver.cdp.network as cdp_net
+
+    requests = list(_all_network_requests() if include_preserved_requests else _network_requests)
+    if url_filter:
+        requests = [r for r in requests if url_filter in r["url"]]
+    if not requests:
+        raise ToolFailure("No network requests collected to export." + (" (url_filter matched none)" if url_filter else ""))
+
+    entries = []
+    from_capture = from_chrome = without = 0
+    for req in requests:
+        body = None
+        if include_bodies and req.get("type") != "WebSocket" and req.get("status") and not req.get("redirect_to"):
+            path = req.get("captured_file")
+            if path and os.path.isfile(path):
+                with open(path, "rb") as f:
+                    raw = f.read()
+                body = {**_har_body(raw, req.get("mime_type", "")), "_size": len(raw)}
+                from_capture += 1
+            else:
+                try:
+                    text, is_b64 = await tab.send(cdp_net.get_response_body(cdp_net.RequestId(req["id"])))
+                    raw = base64.b64decode(text) if is_b64 else text.encode("utf-8")
+                    body = {**_har_body(raw, req.get("mime_type", "")), "_size": len(raw)}
+                    from_chrome += 1
+                except Exception:
+                    without += 1
+        entries.append(_har_entry(req, body))
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        own_version = version("nodriver-mcp")
+    except PackageNotFoundError:
+        own_version = "dev"
+    har = {"log": {
+        "version": "1.2",
+        "creator": {"name": "nodriver-mcp", "version": own_version},
+        "pages": [],
+        "entries": entries,
+    }}
+    target = os.path.abspath(os.path.expanduser(file_path))
+    try:
+        os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+        data = json.dumps(har, ensure_ascii=False, indent=1)
+        await asyncio.to_thread(_write_bytes, target, data.encode("utf-8"))
+    except OSError as e:
+        raise ToolFailure(f"Could not write {target}: {e}")
+    lines = [f"Wrote {len(entries)} requests to {target} ({len(data) / 1_048_576:.2f} MB)."]
+    if include_bodies:
+        lines.append(
+            f"Response bodies: {from_capture} from capture_bodies, {from_chrome} from Chrome's buffer, "
+            f"{without} no longer available."
+        )
+        if without and not from_capture:
+            lines.append("Start capture_bodies before browsing to get every body into the next export.")
+    return "\n".join(lines)
+
+
+# -- audit ---------------------------------------------------------------------------
+
+def _csp_policies(value: str) -> list[dict[str, list[str]]]:
+    """Parse one or more CSP headers. Chrome joins repeated headers with a newline."""
+    policies = []
+    for policy in re.split(r"[,\n]", value or ""):
+        directives: dict[str, list[str]] = {}
+        for part in policy.split(";"):
+            tokens = part.strip().split()
+            if tokens:
+                directives.setdefault(tokens[0].lower(), [t.lower() for t in tokens[1:]])
+        if directives:
+            policies.append(directives)
+    return policies
+
+
+def _csp_findings(csp: str, report_only: str, has_xfo: bool) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    policies = _csp_policies(csp)
+    if not policies:
+        if report_only:
+            findings.append(("WARN", "Content-Security-Policy is Report-Only — violations are logged, nothing is blocked."))
+        else:
+            findings.append(("WARN", "No Content-Security-Policy: an injected script runs with nothing to stop it."))
+        if not has_xfo:
+            findings.append(("WARN", "Neither X-Frame-Options nor CSP frame-ancestors: any site can frame this page (clickjacking)."))
+        return findings
+
+    def weak_everywhere(check) -> bool:
+        # With several policies a source must pass all of them, so a weakness
+        # only matters if every policy has it.
+        return all(check(p) for p in policies)
+
+    def script_sources(p: dict) -> list[str] | None:
+        return p.get("script-src", p.get("default-src"))
+
+    def unrestricted(p: dict) -> bool:
+        return script_sources(p) is None
+
+    def allows_inline(p: dict) -> bool:
+        src = script_sources(p) or []
+        hashed = any(s.startswith(("'nonce-", "'sha256-", "'sha384-", "'sha512-")) for s in src)
+        return "'unsafe-inline'" in src and not hashed  # a nonce or hash switches unsafe-inline off
+
+    def allows_eval(p: dict) -> bool:
+        return "'unsafe-eval'" in (script_sources(p) or [])
+
+    def allows_any_host(p: dict) -> bool:
+        src = script_sources(p) or []
+        if "'strict-dynamic'" in src:
+            return False  # host and scheme sources are ignored under strict-dynamic
+        return any(s in ("*", "http:", "https:", "data:", "blob:") for s in src)
+
+    if weak_everywhere(unrestricted):
+        findings.append(("WARN", "CSP has neither script-src nor default-src, so scripts are not restricted at all."))
+    else:
+        if weak_everywhere(allows_inline):
+            findings.append(("WARN", "CSP script-src allows 'unsafe-inline' without a nonce or hash — injected inline scripts run."))
+        if weak_everywhere(allows_eval):
+            findings.append(("WARN", "CSP script-src allows 'unsafe-eval'."))
+        if weak_everywhere(allows_any_host):
+            findings.append(("WARN", "CSP script-src allows any host or scheme (*, https:, data: or blob:)."))
+    if weak_everywhere(lambda p: "object-src" not in p and "default-src" not in p):
+        findings.append(("INFO", "CSP does not restrict object-src (plugins)."))
+    if weak_everywhere(lambda p: "base-uri" not in p):
+        findings.append(("INFO", "CSP has no base-uri: an injected <base> tag can redirect relative script URLs."))
+    if weak_everywhere(lambda p: "frame-ancestors" not in p) and not has_xfo:
+        findings.append(("WARN", "Neither X-Frame-Options nor CSP frame-ancestors: any site can frame this page (clickjacking)."))
+    return findings
+
+
+def _header_findings(url: str, headers: dict[str, str]) -> list[tuple[str, str]]:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    findings: list[tuple[str, str]] = []
+    https = parts.scheme == "https"
+    if not https and not _is_loopback(parts.hostname or ""):
+        findings.append(("WARN", "The page is served over plain HTTP — everything on it can be read and changed in transit."))
+    if https:
+        hsts = headers.get("strict-transport-security", "")
+        if not hsts:
+            findings.append(("WARN", "No Strict-Transport-Security: a first visit over http:// can be downgraded."))
+        else:
+            match = re.search(r"max-age\s*=\s*\"?(\d+)", hsts, re.IGNORECASE)
+            age = int(match.group(1)) if match else 0
+            if age < 15_552_000:
+                findings.append(("WARN", f"HSTS max-age is {age}s, under the 180 days browsers' preload list asks for."))
+            if "includesubdomains" not in hsts.lower():
+                findings.append(("INFO", "HSTS does not cover subdomains (no includeSubDomains)."))
+    xfo = headers.get("x-frame-options", "")
+    if xfo and xfo.strip().lower() not in ("deny", "sameorigin"):
+        findings.append(("INFO", f"X-Frame-Options {xfo!r} is not a value browsers honour (only DENY or SAMEORIGIN)."))
+    has_xfo = xfo.strip().lower() in ("deny", "sameorigin")
+    findings += _csp_findings(
+        headers.get("content-security-policy", ""),
+        headers.get("content-security-policy-report-only", ""),
+        has_xfo,
+    )
+    if headers.get("x-content-type-options", "").strip().lower() != "nosniff":
+        findings.append(("INFO", "No X-Content-Type-Options: nosniff — the browser may sniff content types."))
+    referrer = headers.get("referrer-policy", "").lower()
+    if any(p in referrer for p in ("unsafe-url", "no-referrer-when-downgrade")):
+        findings.append(("WARN", f"Referrer-Policy {referrer!r} sends the full URL, query string included, to other sites."))
+    elif not referrer:
+        findings.append(("INFO", "No Referrer-Policy (browsers default to strict-origin-when-cross-origin)."))
+    if not headers.get("permissions-policy"):
+        findings.append(("INFO", "No Permissions-Policy."))
+    if not headers.get("cross-origin-opener-policy"):
+        findings.append(("INFO", "No Cross-Origin-Opener-Policy: pages this one opens keep a handle to it."))
+    for name in ("server", "x-powered-by", "x-aspnet-version", "x-aspnetmvc-version", "x-generator"):
+        value = headers.get(name, "")
+        if value and re.search(r"\d", value):
+            findings.append(("INFO", f"{name} discloses a version: {value[:80]}"))
+    return findings
+
+
+def _cors_findings(requests: list[dict]) -> list[tuple[str, str]]:
+    seen: dict[str, tuple[str, str]] = {}
+    for req in requests:
+        headers = _lower_headers(req.get("response_headers_raw") or req.get("response_headers"))
+        allow_origin = headers.get("access-control-allow-origin", "").strip()
+        if not allow_origin:
+            continue
+        credentials = headers.get("access-control-allow-credentials", "").strip().lower() == "true"
+        where = _origin_of(req["url"]) or req["url"][:80]
+        if allow_origin == "null":
+            # Any sandboxed iframe or data: page has origin "null", so this is
+            # reachable from an attacker's page — with credentials, readably.
+            seen.setdefault(f"null:{where}", (
+                "WARN" if credentials else "INFO",
+                f"{where} allows the origin 'null' (sandboxed iframes, data: and file: pages)"
+                + (" with credentials." if credentials else "."),
+            ))
+        elif allow_origin == "*" and credentials:
+            seen.setdefault(f"star:{where}", (
+                "INFO",
+                f"{where} sends Access-Control-Allow-Origin: * with Allow-Credentials: true — browsers "
+                "refuse that pair, so it is a misconfiguration rather than an open door.",
+            ))
+    return list(seen.values())
+
+
+def _cookie_findings(cookies: list[dict], page_host: str, https: bool) -> list[tuple[str, str]]:
+    findings: list[tuple[str, str]] = []
+    unflagged = []
+    for c in cookies:
+        name, domain = c.get("name", ""), c.get("domain", "")
+        label = f"{name} ({domain})"
+        sensitive = bool(_SENSITIVE_NAME.search(name)) and not _CSRF_NAME.search(name)
+        if https and not c.get("secure"):
+            findings.append(("WARN", f"{label} has no Secure flag — it is also sent over plain http://."))
+        if not c.get("httpOnly"):
+            if sensitive:
+                findings.append(("WARN", f"{label} looks like a session or auth cookie and has no HttpOnly — page scripts, and so any XSS, can read it."))
+            else:
+                unflagged.append(name)
+        same_site = c.get("sameSite")
+        if same_site == "None" and sensitive:
+            findings.append(("INFO", f"{label} is SameSite=None: sent on cross-site requests, so CSRF protection must come from elsewhere."))
+        if domain.startswith(".") and sensitive and page_host.endswith(domain.lstrip(".")):
+            findings.append(("INFO", f"{label} is scoped to every subdomain of {domain.lstrip('.')}."))
+        expires = c.get("expires") or -1
+        if sensitive and expires > 0 and (expires - time.time()) > 30 * 86400:
+            findings.append(("INFO", f"{label} lives {(expires - time.time()) / 86400:.0f} more days."))
+    if unflagged:
+        findings.append(("INFO", f"Readable by page scripts (no HttpOnly): {', '.join(sorted(set(unflagged))[:15])}"))
+    return findings
+
+
+# The issue kinds a security review cares about, listed in full and in this
+# order. Everything else (performance, quirks mode, contrast, lazy loading…)
+# is summed up in one line.
+_ISSUE_TITLES = {
+    "MixedContentIssue": "Mixed content",
+    "ContentSecurityPolicyIssue": "CSP violations",
+    "CookieIssue": "Cookie problems",
+    "CorsIssue": "CORS errors",
+    "BlockedByResponseIssue": "Blocked by a response header (COEP/CORP)",
+    "SRIMessageSignatureIssue": "Subresource integrity",
+    "SharedArrayBufferIssue": "SharedArrayBuffer without cross-origin isolation",
+    "GenericIssue": "Other reported problems",
+    "DeprecationIssue": "Deprecated features in use",
+}
+
+
+def _issue_line(code: str, details: dict) -> str:
+    if code == "CookieIssue":
+        cookie = details.get("cookie") or {}
+        name = cookie.get("name") or (details.get("rawCookieLine") or "")[:40]
+        reasons = details.get("cookieExclusionReasons") or details.get("cookieWarningReasons") or []
+        return f"{name} ({cookie.get('domain', '')}): {', '.join(reasons)} on {details.get('operation', '')}"
+    if code == "ContentSecurityPolicyIssue":
+        kind = {
+            "kInlineViolation": "an inline script or style",
+            "kEvalViolation": "eval()",
+            "kWasmEvalViolation": "WebAssembly compilation",
+            "kTrustedTypesSinkViolation": "a Trusted Types sink",
+            "kTrustedTypesPolicyViolation": "a Trusted Types policy",
+        }.get(details.get("contentSecurityPolicyViolationType", ""), "")
+        blocked = details.get("blockedURL") or kind or "?"
+        where = (details.get("sourceCodeLocation") or {}).get("url", "")
+        mode = "would block (report-only)" if details.get("isReportOnly") else "blocked"
+        return f"{details.get('violatedDirective', '?')} {mode} {blocked}" + (f" in {where}" if where else "")
+    if code == "MixedContentIssue":
+        return f"{details.get('resolutionStatus', '')}: {details.get('insecureURL', '')} on {details.get('mainResourceURL', '')}"
+    if code == "CorsIssue":
+        status = details.get("corsErrorStatus") or {}
+        return f"{status.get('corsError', '?')} {(details.get('request') or {}).get('url', '')}"
+    if code == "BlockedByResponseIssue":
+        return f"{details.get('reason', '?')} {(details.get('request') or {}).get('url', '')}"
+    if code == "DeprecationIssue":
+        return str(details.get("type", "?"))
+    values = [f"{k}={v}" for k, v in details.items() if isinstance(v, (str, int, bool)) and k not in ("frameId", "loaderId")]
+    return ", ".join(values[:4]) or code
+
+
+
+# Second-level labels under which registrations happen (example.co.uk). An
+# approximation of the public suffix list, which is not worth a dependency for
+# a grouping that only has to be right for the common cases.
+_SECOND_LEVEL_LABELS = frozenset({"co", "com", "org", "net", "gov", "ac", "edu", "or", "ne", "go", "gv"})
+
+
+def _site_of(host: str) -> str:
+    """The registrable domain a host belongs to: cdn.example.co.uk -> example.co.uk."""
+    host = (host or "").strip("[]").lower()
+    if not host or re.fullmatch(r"[\d.]+", host) or ":" in host:
+        return host  # an IP address is its own site
+    labels = host.split(".")
+    if len(labels) >= 3 and labels[-2] in _SECOND_LEVEL_LABELS and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _domain_findings(page_url: str, requests: list[dict], no_sri: list[str]) -> tuple[str, list[tuple[str, str]]]:
+    """Who this page talks to: first party versus every third party, by site."""
+    from urllib.parse import urlsplit
+
+    own = _site_of(urlsplit(page_url).hostname or "")
+    stats: dict[str, dict] = {}
+    for rec in requests:
+        host = urlsplit(rec["url"]).hostname or ""
+        if not host:
+            continue  # data:, blob:
+        s = stats.setdefault(_site_of(host), {"requests": 0, "bytes": 0, "types": {}, "hosts": set(),
+                                               "cookies_in": False, "cookies_out": False})
+        s["requests"] += 1
+        s["bytes"] += rec.get("size") or 0
+        s["types"][rec.get("type", "?")] = s["types"].get(rec.get("type", "?"), 0) + 1
+        s["hosts"].add(host)
+        if "cookie" in _lower_headers(rec.get("request_headers_raw")):
+            s["cookies_out"] = True
+        if "set-cookie" in _lower_headers(rec.get("response_headers_raw")):
+            s["cookies_in"] = True
+    findings: list[tuple[str, str]] = []
+    for site, s in sorted(stats.items(), key=lambda kv: (kv[0] != own, -kv[1]["requests"])):
+        types = ", ".join(f"{t} {n}" for t, n in sorted(s["types"].items(), key=lambda kv: -kv[1])[:4])
+        extras = []
+        if s["cookies_out"]:
+            extras.append("receives cookies")
+        if s["cookies_in"]:
+            extras.append("sets cookies")
+        if site != own and s["types"].get("Script"):
+            extras.append("runs its own scripts here, with full access to the page")
+        hosts = f" [{', '.join(sorted(s['hosts'])[:3])}{', …' if len(s['hosts']) > 3 else ''}]"
+        findings.append(("INFO", (
+            f"{'first party' if site == own else 'third party'} {site}{hosts}: {s['requests']} requests, "
+            f"{s['bytes'] / 1024:.0f} KB ({types})" + (f"; {'; '.join(extras)}" if extras else "")
+        )))
+    if no_sri:
+        findings.append(("INFO", (
+            f"{len(no_sri)} script(s)/stylesheet(s) from other origins load without Subresource "
+            f"Integrity, so whoever controls those hosts controls this page: "
+            + ", ".join(u[:80] for u in no_sri[:5]) + (" …" if len(no_sri) > 5 else "")
+        )))
+    third = len(stats) - (1 if own in stats else 0)
+    return f"Domains ({third} third part{'y' if third == 1 else 'ies'}, sites approximated without a suffix list)", findings
+
+
+def _cache_findings(requests: list[dict], doc: dict | None) -> list[tuple[str, str]]:
+    """Responses a shared cache (CDN, proxy) could store and hand to someone else."""
+    findings: list[tuple[str, str]] = []
+    flagged: set[str] = set()
+    uncached_static = 0
+    from_cache = 0
+    for rec in requests:
+        if not rec.get("status") or rec.get("redirect_to"):
+            continue
+        if rec.get("from_cache"):
+            from_cache += 1
+        response = _lower_headers(rec.get("response_headers_raw") or rec.get("response_headers"))
+        request = _lower_headers(rec.get("request_headers_raw") or rec.get("request_headers"))
+        cc = response.get("cache-control", "").lower()
+        shared = (
+            ("public" in cc or "s-maxage" in cc)
+            and "private" not in cc and "no-store" not in cc
+        )
+        where = rec["url"].split("?")[0][:100]
+        if shared and "set-cookie" in response and where not in flagged:
+            flagged.add(where)
+            findings.append(("WARN", (
+                f"{where} sets a cookie and is cacheable by shared caches (Cache-Control: {cc}) — a CDN or "
+                "proxy could serve that cookie to other users."
+            )))
+        elif (shared and ("cookie" in request or "authorization" in request)
+              and rec.get("type") in ("Document", "XHR", "Fetch") and where not in flagged):
+            flagged.add(where)
+            findings.append(("WARN", (
+                f"{where} was requested with credentials and is cacheable by shared caches "
+                f"(Cache-Control: {cc}) — one user's response could be served to another."
+            )))
+        if rec.get("type") in ("Script", "Stylesheet", "Font", "Image") and not (
+            cc or response.get("expires") or response.get("etag") or response.get("last-modified")
+        ):
+            uncached_static += 1
+    if doc is not None:
+        response = _lower_headers(doc.get("response_headers_raw") or doc.get("response_headers"))
+        request = _lower_headers(doc.get("request_headers_raw") or doc.get("request_headers"))
+        cc = response.get("cache-control", "").lower()
+        if ("cookie" in request or "authorization" in request) and "no-store" not in cc and "private" not in cc:
+            findings.append(("INFO", (
+                "The page was requested with credentials and sends neither Cache-Control: no-store nor "
+                "private, so it may stay in the browser's disk cache after logout"
+                + (f" (Cache-Control: {cc})." if cc else ".")
+            )))
+    if uncached_static:
+        findings.append(("INFO", f"{uncached_static} static asset(s) with no caching headers at all (no Cache-Control, Expires, ETag or Last-Modified)."))
+    if from_cache:
+        findings.append(("INFO", f"{from_cache} response(s) came from Chrome's cache; reload with ignore_cache to see what the server sends."))
+    return findings
+
+
+AuditCheck = Literal["headers", "tls", "cookies", "cache", "domains", "issues"]
+
+
+@tool(title="Audit page security", read_only=True)
+async def audit_security(
+    checks: Annotated[
+        list[AuditCheck] | None,
+        Field(description=(
+            'Which parts to run: "headers" (security headers, CSP analysis, CORS on '
+            'every recorded response, version disclosure), "tls" (protocol, cipher, '
+            'certificate of every origin the page talked to), "cookies" (flags of '
+            'every cookie sent to those origins), "cache" (responses a CDN or proxy '
+            'could serve to the wrong user), "domains" (first and third parties the '
+            'page talks to, and third-party code loaded without integrity checks) and '
+            '"issues" (what Chrome itself flagged: CSP violations, mixed content, '
+            "rejected cookies, CORS errors). Omit for all."
+        )),
+    ] = None,
+) -> str:
+    """Passive security review of the selected page, from what the browser
+    already has — a starting point for a manual test, not a verdict.
+
+    WARN marks a concrete weakness, INFO context worth a look. Headers come from
+    the recorded page load; if it was not recorded (a tab the server did not
+    open), the page URL is fetched once from the page and the answer says so.
+    Chrome's issues are collected from the moment the server first touches a
+    tab, so on a tab it had not touched, reload the page for a full list.
+    Cookie values are never printed — use get_cookies for those.
+    """
+    from urllib.parse import urlsplit
+
+    tab = await _active_tab()
+    fresh = (getattr(tab, "target_id", None), getattr(tab, "session_id", None)) not in _network_collection_enabled_tabs
+    await _auto_enable_network_collection(tab)
+    if fresh:
+        await asyncio.sleep(0.5)  # Audits.enable replays what the renderer already reported
+    await _refresh_targets(await _get_browser())
+    page_url = tab.target.url if tab.target else ""
+    parts = urlsplit(page_url or "")
+    if parts.scheme not in ("http", "https"):
+        raise ToolFailure(f"Nothing to audit on {page_url or 'this tab'} — navigate to an http(s) page first.")
+    wanted = set(checks or ["headers", "tls", "cookies", "cache", "domains", "issues"])
+    page_requests = list(_network_requests)
+
+    def _is_page(rec: dict) -> bool:
+        return rec["url"].split("#")[0] == page_url.split("#")[0] and bool(rec.get("status")) and not rec.get("redirect_to")
+
+    doc = next((r for r in reversed(page_requests) if _is_page(r) and r.get("type") == "Document"), None)
+    source = "the recorded page load"
+    if doc is None and wanted & {"headers", "tls"}:
+        # The load happened before collection was on (a tab opened by the page
+        # itself, say). One same-origin fetch of the same URL gets the headers
+        # through the network log, Set-Cookie and TLS details included.
+        try:
+            await _evaluate_value(
+                tab,
+                "fetch(location.href, {credentials: 'include', cache: 'no-store'}).then(r => r.status)",
+                await_promise=True,
+            )
+            await asyncio.sleep(0.3)
+            doc = next((r for r in reversed(_network_requests) if _is_page(r)), None)
+            source = "a fresh fetch() of the page URL (the page load itself was not recorded)"
+        except Exception as e:
+            source = f"nothing — the page load was not recorded and re-fetching it failed: {e}"
+
+    sections: list[tuple[str, list[tuple[str, str]]]] = []
+    headers = _lower_headers((doc or {}).get("response_headers_raw") or (doc or {}).get("response_headers"))
+
+    if "headers" in wanted:
+        findings = _header_findings(page_url, headers) if doc else [("WARN", "No response headers to audit.")]
+        findings += _cors_findings(page_requests)
+        sections.append((f"Headers (from {source})", findings))
+
+    if "tls" in wanted:
+        findings = []
+        by_origin: dict[str, dict] = {}
+        for rec in ([doc] if doc else []) + page_requests:
+            origin = _origin_of(rec["url"])
+            if origin and origin not in by_origin and rec.get("status"):
+                by_origin[origin] = rec
+        for origin, rec in by_origin.items():
+            host = urlsplit(origin).hostname or ""
+            sec = rec.get("security")
+            if origin.startswith("http://"):
+                if not _is_loopback(host):
+                    findings.append(("WARN", f"{origin}: plain HTTP, no TLS."))
+                continue
+            if not sec:
+                continue
+            valid_to = sec.get("valid_to") or 0
+            days = (valid_to - time.time()) / 86400 if valid_to else None
+            line = (
+                f"{origin}: {sec['protocol']}, {sec['cipher']}"
+                + (f", {sec['key_exchange']}" if sec.get("key_exchange") else "")
+                + f"; cert {sec['subject']} by {sec['issuer']}"
+                + (f", valid until {datetime.fromtimestamp(valid_to, tz=timezone.utc):%Y-%m-%d}" if valid_to else "")
+            )
+            level = "INFO"
+            if sec["protocol"] in ("TLS 1.0", "TLS 1.1", "SSL 3.0"):
+                level, line = "WARN", line + f" — {sec['protocol']} is deprecated and broken"
+            # Certificates are short-lived now and renewed with weeks to spare, so
+            # only the last week is worth a warning.
+            if days is not None and days < 0:
+                level, line = "WARN", line + " — the certificate has EXPIRED"
+            elif days is not None and days < 7:
+                level, line = "WARN", line + f" — expires in {days:.0f} days"
+            if sec.get("ct") == "not-compliant":
+                level, line = "WARN", line + " — not Certificate Transparency compliant"
+            findings.append((level, line))
+        sections.append(("TLS", findings or [("INFO", "No TLS details recorded (plain HTTP or nothing loaded).")]))
+
+    if "cookies" in wanted:
+        urls = sorted({_origin_of(r["url"]) + "/" for r in page_requests if _origin_of(r["url"])} | {page_url})[:50]
+        try:
+            cookies = (await tab.send(_cdp("Network.getCookies", {"urls": urls}))).get("cookies", [])
+            findings = _cookie_findings(cookies, parts.hostname or "", parts.scheme == "https")
+            title = f"Cookies ({len(cookies)} sent to {len(urls)} origin(s) of this page)"
+        except Exception as e:
+            findings, title = [("WARN", f"Could not read cookies: {e}")], "Cookies"
+        sections.append((title, findings or [("INFO", "Nothing to flag.")]))
+
+    if "cache" in wanted:
+        sections.append(("Caching", _cache_findings(page_requests, doc) or [("INFO", "Nothing to flag.")]))
+
+    if "domains" in wanted:
+        try:
+            no_sri = await _evaluate_value(tab, (
+                "[...document.querySelectorAll('script[src], link[rel~=stylesheet][href]')]"
+                ".filter(el => !el.integrity && new URL(el.src || el.href, location.href).origin !== location.origin)"
+                ".map(el => el.src || el.href)"
+            )) or []
+        except Exception:
+            no_sri = []
+        title, findings = _domain_findings(page_url, page_requests, no_sri)
+        sections.append((title, findings or [("INFO", "No requests recorded.")]))
+
+    issue_lines: list[str] = []
+    if "issues" in wanted:
+        grouped: dict[str, list[str]] = {}
+        target = _target_key(tab)
+        for issue in [i for t, i in _audit_issues if t == target]:
+            code = issue.get("code", "")
+            details = next(iter((issue.get("details") or {}).values()), {}) or {}
+            grouped.setdefault(code, []).append(_issue_line(code, details))
+        for code in [c for c in _ISSUE_TITLES if c in grouped]:
+            lines = list(dict.fromkeys(grouped[code]))
+            issue_lines.append(f"  {_ISSUE_TITLES[code]} ({len(grouped[code])}):")
+            issue_lines += [f"    {line[:200]}" for line in lines[:8]]
+            if len(lines) > 8:
+                issue_lines.append(f"    … {len(lines) - 8} more")
+        others = sorted(c for c in grouped if c not in _ISSUE_TITLES)
+        if others:
+            issue_lines.append("  Not security-related: " + ", ".join(f"{c} ({len(grouped[c])})" for c in others))
+        if not grouped:
+            issue_lines.append("  none")
+
+    warn = sum(1 for _, f in sections for level, _ in f if level == "WARN")
+    info = sum(1 for _, f in sections for level, _ in f if level == "INFO")
+    summary = f"{warn} WARN, {info} INFO"
+    if "issues" in wanted:
+        relevant = sum(len(v) for c, v in grouped.items() if c in _ISSUE_TITLES)
+        summary += f", {relevant} security-related issue{'s' if relevant != 1 else ''} reported by Chrome"
+    out = [f"Security audit of {page_url}", f"{summary}. Passive checks only; confirm before reporting."]
+    for title, findings in sections:
+        out.append(f"\n{title}")
+        for level in ("WARN", "INFO"):
+            out += [f"  {level}  {text}" for lvl, text in findings if lvl == level]
+    if "issues" in wanted:
+        out.append("\nReported by Chrome (DevTools Issues)")
+        out += issue_lines
+    return "\n".join(out)
+
+
+# -- storage ---------------------------------------------------------------------------
+
+def _storage_findings(area: str, items: list[list[str]], reveal: bool) -> tuple[list[str], list[tuple[str, str]]]:
+    lines: list[str] = []
+    findings: list[tuple[str, str]] = []
+
+    def show(value: str, sensitive: bool) -> str:
+        if reveal or not sensitive:
+            return value[:120] + ("…" if len(value) > 120 else "")
+        return f"{value[:6]}… ({len(value)} chars, reveal_values=true shows it)"
+
+    def inspect_value(path: str, value: str) -> bool:
+        """Flag credentials by name or shape; returns whether this one is."""
+        jwt = _JWT_RE.search(value)
+        named = bool(_SENSITIVE_NAME.search(path)) and not _CSRF_NAME.search(path)
+        if not (jwt or named or value.lower().startswith("bearer ")):
+            return False
+        text = f"{area}[{path}] holds what looks like a credential — any script on this origin, so any XSS, can read it."
+        if jwt:
+            summary, warnings = _jwt_summary(jwt.group(0))
+            if summary:
+                text += f" {summary}."
+            if warnings:
+                text += " " + "; ".join(warnings).capitalize() + "."
+        findings.append(("WARN", text))
+        return True
+
+    def walk(prefix: str, node: Any, depth: int) -> None:
+        if depth > 3:
+            return
+        if isinstance(node, dict):
+            for k, v in list(node.items())[:200]:
+                walk(f"{prefix}.{k}", v, depth + 1)
+        elif isinstance(node, list):
+            for i, v in enumerate(node[:50]):
+                walk(f"{prefix}[{i}]", v, depth + 1)
+        elif isinstance(node, str):
+            inspect_value(prefix, node)
+
+    for key, value in items:
+        sensitive = inspect_value(key, value)
+        if not sensitive and value[:1] in "{[":
+            try:
+                before = len(findings)
+                walk(key, json.loads(value), 0)
+                sensitive = len(findings) > before
+            except ValueError:
+                pass
+        lines.append(f"    {key} = {show(value, sensitive)}")
+    return lines, findings
+
+
+@tool(title="Inspect page storage", read_only=True)
+async def inspect_storage(
+    reveal_values: Annotated[
+        bool,
+        Field(description=(
+            "Print values that look like credentials in full (up to 120 characters). "
+            "Default false shows their first characters and length only."
+        )),
+    ] = False,
+) -> str:
+    """Everything the selected page's origin keeps in the browser: localStorage,
+    sessionStorage, IndexedDB, Cache Storage, service workers and quota usage.
+
+    Flags values that look like credentials — by key name, JWT shape or a
+    "Bearer" prefix, also inside JSON values — because anything in web storage
+    is readable by every script on the origin. JWTs are decoded (algorithm,
+    expiry, claims; the signature is not checked).
+
+    Read through DevTools, not page JavaScript, except for the list of service
+    worker registrations. IndexedDB and Cache Storage are listed with their
+    sizes, not dumped; use evaluate_script to read records.
+    """
+    tab = await _active_tab()
+    await _refresh_targets(await _get_browser())
+    page_url = tab.target.url if tab.target else ""
+    origin = _origin_of(page_url or "")
+    if not origin:
+        raise ToolFailure(f"{page_url or 'This tab'} has no web origin — navigate to an http(s) page first.")
+
+    out = [f"Storage for {origin}"]
+    findings: list[tuple[str, str]] = []
+    errors: list[str] = []
+
+    try:
+        quota = await tab.send(_cdp("Storage.getUsageAndQuota", {"origin": origin}))
+        used = ", ".join(
+            f"{u['storageType']} {u['usage'] / 1024:.1f} KB" for u in quota.get("usageBreakdown", []) if u.get("usage")
+        )
+        out.append(f"Usage: {quota.get('usage', 0) / 1024:.1f} KB" + (f" ({used})" if used else ""))
+    except Exception as e:
+        errors.append(f"quota: {e}")
+
+    for area, is_local in (("localStorage", True), ("sessionStorage", False)):
+        try:
+            items = (await tab.send(_cdp("DOMStorage.getDOMStorageItems", {
+                "storageId": {"securityOrigin": origin, "isLocalStorage": is_local},
+            }))).get("entries", [])
+        except Exception as e:
+            errors.append(f"{area}: {e}")
+            continue
+        out.append(f"\n{area} ({len(items)} key{'s' if len(items) != 1 else ''})")
+        lines, found = _storage_findings(area, items, reveal_values)
+        out += lines[:60]
+        if len(lines) > 60:
+            out.append(f"    … {len(lines) - 60} more")
+        findings += found
+
+    try:
+        names = (await tab.send(_cdp("IndexedDB.requestDatabaseNames", {"securityOrigin": origin}))).get("databaseNames", [])
+        out.append(f"\nIndexedDB ({len(names)} database{'s' if len(names) != 1 else ''})")
+        for db_name in names[:20]:
+            db = (await tab.send(_cdp("IndexedDB.requestDatabase", {
+                "securityOrigin": origin, "databaseName": db_name,
+            }))).get("databaseWithObjectStores", {})
+            stores = []
+            for store in db.get("objectStores", [])[:30]:
+                try:
+                    count = (await tab.send(_cdp("IndexedDB.getMetadata", {
+                        "securityOrigin": origin, "databaseName": db_name, "objectStoreName": store["name"],
+                    }))).get("entriesCount", "?")
+                except Exception:
+                    count = "?"
+                stores.append(f"{store['name']} ({count:g} entries)" if isinstance(count, (int, float)) else f"{store['name']} (? entries)")
+                if _SENSITIVE_NAME.search(store["name"]):
+                    findings.append(("INFO", f"IndexedDB {db_name}/{store['name']} may hold credentials — read it with evaluate_script."))
+            out.append(f"    {db_name} v{db.get('version', '?')}: {', '.join(stores) or 'no object stores'}")
+    except Exception as e:
+        errors.append(f"IndexedDB: {e}")
+
+    try:
+        caches = (await tab.send(_cdp("CacheStorage.requestCacheNames", {"securityOrigin": origin}))).get("caches", [])
+        out.append(f"\nCache Storage ({len(caches)} cache{'s' if len(caches) != 1 else ''})")
+        for cache in caches[:20]:
+            entries = await tab.send(_cdp("CacheStorage.requestEntries", {
+                "cacheId": cache["cacheId"], "skipCount": 0, "pageSize": 5,
+            }))
+            urls = [e.get("requestURL", "") for e in entries.get("cacheDataEntries", [])]
+            out.append(f"    {cache.get('cacheName')}: {entries.get('returnCount', len(urls))} entries" + (f", e.g. {', '.join(u[:80] for u in urls[:3])}" if urls else ""))
+            if any(re.search(r"/api/|auth|token|user|account", u, re.IGNORECASE) for u in urls):
+                findings.append(("INFO", f"Cache {cache.get('cacheName')!r} holds API or account responses — readable offline, and after logout unless cleared."))
+    except Exception as e:
+        errors.append(f"Cache Storage: {e}")
+
+    try:
+        registrations = await _evaluate_value(tab, (
+            "navigator.serviceWorker ? navigator.serviceWorker.getRegistrations().then(rs => rs.map(r => ({"
+            " scope: r.scope, script: (r.active || r.waiting || r.installing || {}).scriptURL || '',"
+            " state: r.active ? 'active' : r.waiting ? 'waiting' : 'installing' }))) : []"
+        ), await_promise=True) or []
+        out.append(f"\nService workers ({len(registrations)})")
+        out += [f"    {r['scope']} -> {r['script']} ({r['state']})" for r in registrations]
+    except Exception as e:
+        errors.append(f"service workers: {e}")
+
+    try:
+        cookies = (await tab.send(_cdp("Network.getCookies", {"urls": [page_url]}))).get("cookies", [])
+        out.append(f"\nCookies sent to this page: {len(cookies)} (audit_security checks their flags)")
+    except Exception as e:
+        errors.append(f"cookies: {e}")
+
+    if findings:
+        out.append("\nFindings")
+        out += [f"  {level}  {text}" for level, text in sorted(findings, key=lambda f: f[0] != "WARN")]
+    if errors:
+        out.append("\nCould not read: " + "; ".join(errors))
+    return "\n".join(out)
+
+
+@tool(title="Search captured bodies", read_only=True)
+async def search_bodies(
+    query: Annotated[str, Field(min_length=1, description="Text to look for, or a regular expression with regex=true.")],
+    regex: Annotated[bool, Field(description="Treat query as a Python regular expression.")] = False,
+    case_sensitive: Annotated[bool, Field(description="Match case exactly. Default false.")] = False,
+    directory: Annotated[
+        str,
+        Field(description=(
+            "A capture_bodies folder to search. Empty uses the running capture, or "
+            "the most recent one."
+        )),
+    ] = "",
+    max_results: Annotated[int, Field(ge=1, le=500, description="Stop after this many matches.")] = 50,
+) -> str:
+    """Find where a value shows up in the traffic capture_bodies recorded — in
+    which response it first arrived, and which later requests sent it back.
+
+    The usual question when following data through an app: where did this ID,
+    token or price come from, and where does it go next. Results are in capture
+    order, so the first hit is the first response that carried it; POST data
+    and URLs from capture.jsonl are searched too, as the "sent" side.
+    """
+    folder = directory.strip()
+    if not folder:
+        folder = _body_capture.out_dir if _body_capture is not None else _last_capture_dir
+    if not folder:
+        raise ToolFailure("No capture to search yet — run capture_bodies first, or pass directory.")
+    folder = os.path.abspath(os.path.expanduser(folder))
+    manifest_path = os.path.join(folder, "capture.jsonl")
+    if not os.path.isfile(manifest_path):
+        raise ToolFailure(f"{folder} holds no capture.jsonl — not a capture_bodies folder.")
+    try:
+        pattern = re.compile(query if regex else re.escape(query), 0 if case_sensitive else re.IGNORECASE)
+    except re.error as e:
+        raise ToolFailure(f"Invalid regular expression: {e}")
+
+    entries = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+    entries.sort(key=lambda e: e.get("seq", 0))
+
+    def snippet(text: str, match: re.Match) -> str:
+        start, end = max(match.start() - 60, 0), min(match.end() + 60, len(text))
+        return ("…" if start else "") + text[start:end].replace("\n", " ") + ("…" if end < len(text) else "")
+
+    received: list[str] = []
+    sent: list[str] = []
+    bodies_hit = 0
+    for entry in entries:
+        if len(received) + len(sent) >= max_results:
+            break
+        label = f"{entry.get('file', '?')}  {entry.get('method', '')} {entry.get('url', '')[:120]}  {entry.get('status', '')}"
+        for field in ("url", "post_data"):
+            value = entry.get(field) or ""
+            m = pattern.search(value)
+            if m:
+                where = "URL" if field == "url" else "POST data"
+                sent.append(f"  #{entry.get('seq')} {entry.get('method', '')} {entry.get('url', '')[:120]}\n    in {where}: {snippet(value, m)}")
+        path = os.path.join(folder, entry.get("file", ""))
+        if not entry.get("file") or not os.path.isfile(path):
+            continue
+        with open(path, "rb") as f:
+            raw = f.read(50_000_000)
+        text = raw.decode("utf-8", errors="replace")
+        matches = list(pattern.finditer(text))
+        if not matches:
+            continue
+        bodies_hit += 1
+        received.append(f"  {label}  ({len(matches)} match{'es' if len(matches) != 1 else ''})")
+        for m in matches[:3]:
+            line_no = text.count("\n", 0, m.start()) + 1
+            received.append(f"    line {line_no}: {snippet(text, m)}")
+
+    if not received and not sent:
+        return f"{query!r} does not appear in the {len(entries)} captured responses in {folder}, nor in their URLs or POST data."
+    out = [f"{query!r} in {folder}:"]
+    if received:
+        out.append(f"Received in {bodies_hit} of {len(entries)} response bodies (first arrival first):")
+        out += received
+    if sent:
+        out.append("Sent in requests:")
+        out += sent
+    if len(received) + len(sent) >= max_results:
+        out.append(f"(stopped at max_results={max_results})")
+    return "\n".join(out)
 
 
 @tool(title="Wait for element", read_only=True, open_world=True)
