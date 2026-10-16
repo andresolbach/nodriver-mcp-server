@@ -5,10 +5,10 @@ The card advertises "N tools"; that number went stale once already. This patches
 just that pill in place, taking N from the server itself, so the card cannot
 disagree with the code.
 
-The original card was rendered with Segoe UI Regular at 27px — verified by
-matching glyph ink boxes against the existing pixels — so the patch is
-invisible. Windows-only for that reason; it is a maintainer script, not part of
-the build.
+The layout uses Segoe UI Regular at 27px on a 1280x640 reference canvas.
+Coordinates and type scale with the exported card resolution. This is a
+maintainer script, not part of the build; review the resulting image before
+publishing it.
 
     python scripts/update_social_preview.py
 """
@@ -44,10 +44,10 @@ FONT_CANDIDATES = [
 FONT_SIZE = 27
 
 
-def _font() -> ImageFont.FreeTypeFont:
+def _font(size: int = FONT_SIZE) -> ImageFont.FreeTypeFont:
     for path in FONT_CANDIDATES:
         if Path(path).exists():
-            return ImageFont.truetype(path, FONT_SIZE)
+            return ImageFont.truetype(path, size)
     raise SystemExit(
         "Segoe UI not found — the card was rendered with it, and any other face "
         "would be visible next to the untouched text. Run this on Windows."
@@ -68,16 +68,23 @@ def main() -> None:
     label = f"{count} tools"
 
     card = Image.open(CARD).convert("RGB")
-    font = _font()
+    if card.width != 2 * card.height:
+        raise SystemExit("Expected the social card's 2:1 layout; review coordinates first.")
+    scale = card.width / 1280
+    font = _font(round(FONT_SIZE * scale))
+    clear_box = tuple(round(value * scale) for value in CLEAR_BOX)
+    ink_origin = tuple(round(value * scale) for value in INK_ORIGIN)
 
     # Render the label to a mask first, so it can be positioned by its ink rather
     # than by the font's own bearings.
-    mask = Image.new("L", (300, 90), 0)
+    mask = Image.new("L", (round(300 * scale), round(90 * scale)), 0)
     ImageDraw.Draw(mask).text((20, 20), label, font=font, fill=255)
     ink = mask.crop(_ink_box(mask))
 
-    ImageDraw.Draw(card).rectangle(CLEAR_BOX, fill=PILL_BG)
-    card.paste(Image.new("RGB", ink.size, TEXT_RGB), INK_ORIGIN, ink)
+    if ink.width > clear_box[2] - ink_origin[0] or ink.height > clear_box[3] - ink_origin[1]:
+        raise SystemExit("Tool-count label no longer fits its pill; update the card layout.")
+    ImageDraw.Draw(card).rectangle(clear_box, fill=PILL_BG)
+    card.paste(Image.new("RGB", ink.size, TEXT_RGB), ink_origin, ink)
     x1, y1 = ink.size
 
     card.save(CARD)
