@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from capture_site import BIG_SHA256, CaptureSite
 from nodriver_mcp.server import _capture_filename
@@ -199,17 +200,17 @@ def test_capture_and_block_resources_leave_each_other_alone(tmp_path):
 def test_the_capture_reports_what_actually_happened(tmp_path):
     async def scenario():
         await _call("capture_bodies", action="status")  # clear what earlier tests left
-        nothing = await _call("capture_bodies", action="stop")
-        assert "No capture is running" in nothing, nothing
-        no_pattern = await _call("capture_bodies", out_dir=str(tmp_path))
-        assert "url_pattern is required" in no_pattern, no_pattern
+        with pytest.raises(ToolError, match="No capture is running"):
+            await _call("capture_bodies", action="stop")
+        with pytest.raises(ToolError, match="url_pattern is required"):
+            await _call("capture_bodies", out_dir=str(tmp_path))
 
         with CaptureSite() as site:
             await _call("new_page", url=site.base + "/")
             first = await _call("capture_bodies", url_pattern="api/fo", out_dir=str(tmp_path))
             assert '"*api/fo*"' in first, f"a bare pattern must be widened, and say so:\n{first}"
-            second = await _call("capture_bodies", url_pattern="*", out_dir=str(tmp_path))
-            assert "already running" in second, second
+            with pytest.raises(ToolError, match="already running"):
+                await _call("capture_bodies", url_pattern="*", out_dir=str(tmp_path))
 
             await _call("close_browser")
             stop = await _call("capture_bodies", action="stop")
