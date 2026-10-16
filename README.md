@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/andresolbach/nodriver-mcp-server/main/assets/logo.png" alt="nodriver-mcp-server — undetected browser automation MCP server" width="130" height="130">
+  <img src="https://raw.githubusercontent.com/andresolbach/nodriver-mcp-server/main/assets/logo.png" alt="nodriver-mcp — browser-tab monogram" width="130" height="130">
 </p>
 
 # nodriver-mcp-server
