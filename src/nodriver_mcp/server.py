@@ -221,23 +221,19 @@ def _apply_profile_startup(profile_dir: str) -> None:
 async def _browser_alive(b: uc.Browser) -> bool:
     """Cheap CDP probe to confirm the browser is still usable.
 
-    Probes over a tab connection (what the tools actually use), not the
-    browser-level object, so a dropped tab websocket is detected too.
+    Probe the browser connection: a tab session can disappear during navigation
+    while Chrome is healthy. Treating that as a browser crash kills the entire
+    session and loses tabs and captured traffic.
     """
     try:
         import nodriver.cdp.target as cdp_target
-        conn = None
-        if b.tabs:
-            conn = b.tabs[0]
-        elif getattr(b, "main_tab", None) is not None:
-            conn = b.main_tab
-        elif getattr(b, "connection", None) is not None:
-            conn = b.connection
+        conn = b if callable(getattr(b, "send", None)) else getattr(b, "connection", None)
         if conn is None:
             return False
         await asyncio.wait_for(conn.send(cdp_target.get_targets()), timeout=5)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning("Browser liveness probe failed: %s", exc)
         return False
 
 
@@ -432,15 +428,16 @@ mcp = FastMCP(
     "nodriver-mcp",
     instructions=inspect.cleandoc(
         """
-        Undetected Chrome browser automation via nodriver — a drop-in replacement for
-        chrome-devtools-mcp that does not expose the CDP/WebDriver fingerprints those
-        drivers leak, so sites that reject other automation stacks generally load here.
+        Give your agent a full Chrome workspace: browser automation via nodriver,
+        with navigation, extraction, network capture and passive security checks.
+        Reuse logins through persistent profiles and run isolated browsers side by
+        side. Direct CDP control requires no ChromeDriver binary.
 
         A clean fingerprint is only part of what anti-bot systems weigh: IP reputation,
         request history and behaviour count too, so a challenge from Cloudflare, DataDome
         or similar is still possible. When one appears, first wait_for(["text from the
-        real page"]) — many clear on their own within seconds. cf_verify solves a
-        Cloudflare checkbox, but needs the optional `nodriver-mcp[cf]` extra.
+        real page"]) — some clear on their own within seconds. cf_verify attempts
+        supported Cloudflare checkboxes and needs the optional `nodriver-mcp[cf]` extra.
 
         Reading a page
           * take_snapshot is the default way to see a page. It returns the accessibility
@@ -466,6 +463,10 @@ mcp = FastMCP(
         Staying logged in
           The browser starts on a throwaway profile that is deleted on exit. To keep a
           login, create_profile(name) + use_profile(name), or save_session/load_session.
+          For persistent profiles, set_browser_flags(startup_mode="restore") resumes
+          previous tabs; "urls" opens startup_urls and "new_tab" is the default.
+          Use restart=False to save the choice without closing current tabs. After an
+          MCP restart, select the same profile again with use_profile(name).
 
         Note: Chrome is launched lazily on the very first tool call, so that one call can
         take a few seconds longer than the rest. That is expected.
@@ -4793,7 +4794,13 @@ async def new_page(
     if not isolated_context and len(browser.tabs) == 1:
         only_tab = browser.tabs[0]
         if only_tab.target and _is_blank_url(only_tab.target.url):
-            reuse_tab = only_tab
+            # TargetInfo events may lag behind a completed navigation. Confirm
+            # against the actual document before replacing what looks blank in
+            # the cache, or two rapid new_page calls can overwrite the first.
+            import nodriver.cdp.page as cdp_page
+            frame_tree = await only_tab.send(cdp_page.get_frame_tree())
+            if _is_blank_url(frame_tree.frame.url):
+                reuse_tab = only_tab
 
     try:
         if reuse_tab is not None:

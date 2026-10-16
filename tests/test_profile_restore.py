@@ -30,6 +30,8 @@ def test_chrome_continue_setting_restores_tabs_after_two_restarts(tmp_path, monk
                 await _call("set_browser_flags", startup_mode="restore", restart=False)
             for url in urls:
                 await _call("new_page", url=url)
+            before_restart = await _call("list_pages")
+            assert sorted(t.url for t in server._browser.tabs) == sorted(urls), before_restart
             await _call("evaluate_script", function="() => {sessionStorage.setItem('restore-test', 'kept'); return true}")
             for _ in range(2):
                 await _call("close_browser")

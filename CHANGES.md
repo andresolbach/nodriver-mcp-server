@@ -13,6 +13,10 @@ Fixed graceful shutdown with nodriver 0.50.x: the browser object itself is the
 CDP connection. The old shutdown path skipped `Browser.close` and could lose
 recent tabs, session storage and cookies when Chrome was terminated on Windows.
 Startup no longer adds an unwanted blank tab when restoring a persistent session.
+Browser liveness now uses the browser connection, so a detached tab session does
+not trigger a destructive restart. Opening a page also verifies the real document
+before reusing a startup tab, preventing a delayed URL update from replacing an
+already opened page.
 
 The minimum nodriver version is now 0.50.6, tested with Chrome 155 on Windows.
 Added regression coverage for repeated browser restarts, all three startup modes,
