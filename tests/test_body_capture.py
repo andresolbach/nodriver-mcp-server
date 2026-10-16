@@ -20,7 +20,7 @@ import pytest
 
 from capture_site import BIG_SHA256, CaptureSite
 from nodriver_mcp.server import _capture_filename
-from test_browser_behaviour import _call, _run
+from test_browser_behaviour import _call_checked as _call, _run
 
 
 def _manifest(directory: Path) -> list[dict]:

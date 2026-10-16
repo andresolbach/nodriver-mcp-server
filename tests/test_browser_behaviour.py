@@ -32,11 +32,21 @@ async def _call(tool, /, **arguments) -> str:
     does not collide with this function's own parameter.
     """
     try:
-        result = await mcp.call_tool(tool, arguments)
+        return await _call_checked(tool, **arguments)
     except ToolError as e:
         # A failing tool raises now, so that the routing layer can mark the
         # result isError. The text is the same; these tests still assert on it.
         return str(e)
+
+
+async def _call_checked(tool, /, **arguments) -> str:
+    """Invoke a successful tool; fail at the original error instead of continuing.
+
+    _call keeps returning errors as text for the negative behavior tests.
+    Workflows that require success must not turn a failed browser launch into
+    a later, misleading assertion about missing network traffic.
+    """
+    result = await mcp.call_tool(tool, arguments)
     # Every tool here declares an output schema, so FastMCP hands back a
     # (content, structured) pair rather than content alone.
     if isinstance(result, tuple):
