@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import re
 import time
@@ -232,12 +233,32 @@ def test_audit_reports_the_weak_page_and_passes_the_hardened_one():
 
 
 @pytest.mark.slow
-def test_audit_gets_headers_when_the_page_load_was_not_recorded():
+def test_audit_gets_headers_when_the_page_load_was_not_recorded(monkeypatch):
+    from nodriver.cdp import network
+    from nodriver.core.connection import Connection
+
+    add_handler = Connection.add_handler
+
+    def delayed_fetch_headers(self, event_type, callback):
+        if event_type is network.ResponseReceived:
+            async def delayed(event):
+                if event.type_ == network.ResourceType.FETCH:
+                    # The fetch promise can resolve before Python records the
+                    # response event. Exceed the old fixed 300 ms grace period.
+                    await asyncio.sleep(.8)
+                result = callback(event)
+                if inspect.isawaitable(result):
+                    await result
+            return add_handler(self, event_type, delayed)
+        return add_handler(self, event_type, callback)
+
+    monkeypatch.setattr(Connection, "add_handler", delayed_fetch_headers)
+
     async def scenario():
         with CaptureSite() as site:
-            await _call("new_page", url=site.base + "/audit")
+            await _call_checked("new_page", url=site.base + "/audit")
             server._network_requests.clear()  # as for a tab the page opened itself
-            report = await _call("audit_security", checks=["headers"])
+            report = await _call_checked("audit_security", checks=["headers"])
         assert "fresh fetch()" in report, report
         assert "'unsafe-eval'" in report, f"the fallback headers were not audited:\n{report}"
 
