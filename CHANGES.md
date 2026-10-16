@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.6.0 — configurable profile startup and reliable tab restoration
+
+Persistent profiles now support three startup modes through `set_browser_flags`:
+`new_tab` (the default), `urls` with one or more HTTP(S) addresses, and `restore`
+to reopen the previous tabs without clicking a recovery prompt. The choice is
+saved per profile and survives MCP server restarts. Set `restart=False` to save
+it without closing the current tabs; select the same profile again after an MCP
+server restart. `create_profile(restore_tabs=True)` opts in when creating a profile.
+
+Fixed graceful shutdown with nodriver 0.50.x: the browser object itself is the
+CDP connection. The old shutdown path skipped `Browser.close` and could lose
+recent tabs, session storage and cookies when Chrome was terminated on Windows.
+Startup no longer adds an unwanted blank tab when restoring a persistent session.
+Browser liveness now uses the browser connection, so a detached tab session does
+not trigger a destructive restart. Opening a page also verifies the real document
+before reusing a startup tab, preventing a delayed URL update from replacing an
+already opened page.
+Startup also waits for Chrome's first page target and opens an empty tab if a
+new profile has no previous session to restore.
+
+The minimum nodriver version is now 0.50.6, tested with Chrome 155 on Windows.
+Added regression coverage for repeated browser restarts, all three startup modes,
+saved configuration across an MCP process restart, and invalid URL rejection.
+Descriptions now distinguish measured behavior from guarantees and document the
+current installation requirements and startup defaults.
+
+Tool count: 70 (existing tools extended).
+
 ## 2.5.0 — response bodies that cannot get lost, and a passive security review
 
 The flagship workflow — find the page's own API call, read the JSON it already

@@ -6,7 +6,7 @@
 
 <!-- mcp-name: io.github.andresolbach/nodriver-mcp-server -->
 
-**An undetected, anti-bot-resistant browser automation MCP server** — a drop-in, stealth alternative to [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) for AI agents like **Claude**, **Claude Code**, **Cursor**, **Windsurf**, and any [Model Context Protocol](https://modelcontextprotocol.io) client. Powered by [nodriver](https://github.com/ultrafunkamsterdam/nodriver) so your agent can browse, scrape, and automate real Chrome **without tripping Cloudflare, hCaptcha, or WebDriver fingerprint detection**.
+**Give your AI agent a full Chrome workspace.** Browse, fill forms, extract data and inspect the requests behind a page with **70 MCP tools**, powered by [nodriver](https://github.com/ultrafunkamsterdam/nodriver). Keep your logins, run isolated browsers side by side, and pick up where you left off with automatic tab restoration. One-command setup for **Claude, Claude Code, Cursor, Windsurf, Codex** and other [Model Context Protocol](https://modelcontextprotocol.io) clients.
 
 [![PyPI](https://img.shields.io/pypi/v/nodriver-mcp.svg)](https://pypi.org/project/nodriver-mcp/)
 [![CI](https://github.com/andresolbach/nodriver-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/andresolbach/nodriver-mcp-server/actions/workflows/ci.yml)
@@ -18,26 +18,15 @@
 
 > **Keywords:** MCP server · browser automation · undetected chromedriver · anti-bot · Cloudflare bypass · web scraping · Claude · Cursor · nodriver · chrome-devtools-mcp alternative · Playwright/Puppeteer alternative · AI agent tools.
 
-## Is this the problem you have?
+## More browsing, less setup
 
-If you drive a browser from an AI agent, you have probably run into one of these:
+- **Log in once, come back ready.** Persistent profiles keep cookies and logins between sessions.
+- **Start your way.** Open a fresh tab, a set of favorite URLs, or the tabs you left open — configurable through MCP, per profile.
+- **Give each task its own browser.** Run up to 12 isolated browser sessions without sharing tabs, cookies or the selected page.
+- **Get the data behind the page.** Read accessibility snapshots, inspect API traffic and save response bodies for later search.
+- **Automate real Chrome directly.** nodriver, the successor of `undetected-chromedriver`, uses CDP without Selenium or a ChromeDriver binary and is designed to reduce common automation signals.
 
-- The page sits on **"Just a moment…"** or **"Checking your browser before accessing"** and never loads
-- A **"Verify you are human"** checkbox that reappears every single time you click it
-- **"Unusual Activity Detected"**, **"Access Denied"**, or a plain **HTTP 403** — from a site that opens perfectly in your normal browser
-- `navigator.webdriver` returns `true`, and the site quietly serves you different content because of it
-- The login works when you do it by hand, and fails the moment automation does the same steps
-- It all worked for weeks, then the site started returning an empty page or a captcha wall
-
-None of that is your script being wrong. It is anti-bot detection — Cloudflare, DataDome, PerimeterX, Akamai, hCaptcha — recognising the **automation stack itself**. It shows up with `chrome-devtools-mcp`, `playwright-mcp`, Puppeteer, Selenium and `browser-use` alike, because they all drive Chrome in ways that leave a detectable signature: a ChromeDriver binary, WebDriver markers, CDP artifacts.
-
-## Why this fixes it
-
-[`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) is the successor of `undetected-chromedriver`. It speaks **the CDP protocol directly** — no ChromeDriver binary, no Selenium/WebDriver markers — so `navigator.webdriver` reads `false` rather than `true`, and a session looks like a person using Chrome.
-
-This server exposes that through the **same tool surface as `chrome-devtools-mcp`** (70 tools), so your agent keeps a familiar API and simply stops getting blocked. Swapping is a config change, not a rewrite.
-
-**What it will not do**, so you can judge before installing: it does not solve image or text captchas for you, it cannot defeat every protection on every site, and it will not rescue a scraper that hammers a server. If a site blocks you for *what you do* rather than *what you are*, no driver fixes that. `cf_verify` handles the common Cloudflare checkbox challenge; it is not a captcha-solving service.
+Explore the [70-tool reference](https://github.com/andresolbach/nodriver-mcp-server/blob/main/docs/TOOLS.md), or get started with `uvx nodriver-mcp`.
 
 ## Does it actually pass? Here is the evidence
 
@@ -56,15 +45,15 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 | `navigator.languages` | 4 entries |
 | User agent | no `Headless` token |
 
-**What this does and does not prove.** It shows the browser presents no automation artifacts to client-side fingerprinting, which is what these suites test and what most blocks key off. It does not prove any particular site will let you in: server-side signals such as IP reputation and request rate are outside what any driver controls, and captchas are not solved (see above). Measured on Chrome 151 / Windows 11, headful, with the default profile.
+Measured on Chrome 151 / Windows 11, headful, with the default profile. The current functional test suite uses Chrome 155 and nodriver 0.50.6. See [Scope and limitations](#scope-and-limitations) for how to interpret the fingerprint result.
 
 ## Features
 
-- 🕵️ **Undetected by design** — `navigator.webdriver` reads `false`, exactly as in a browser a person is using, and there are no CDP or WebDriver artifacts to find.
-- ☁️ **Built-in Cloudflare challenge solver** (`cf_verify`, needs the `[cf]` extra).
+- 🕵️ **Direct CDP automation** — nodriver avoids Selenium and a ChromeDriver binary and is designed to reduce common automation signals.
+- ☁️ **Cloudflare checkbox helper** (`cf_verify`, needs the `[cf]` extra); success depends on the challenge and browser configuration.
 - 🖼️ **Frames are not a blind spot** — `list_frames` plus a `frame` argument on the readers, and `take_snapshot` splices each iframe's tree in under the element hosting it, so a payment field or consent wall inside one gets a uid and can be clicked and filled like anything else.
 - 🔍 **A network log that says what happened** — status, response headers, a DevTools-style timing breakdown (DNS, connect, TLS, time to first byte, download), the script and line that started each request, transfer size, redirect hops and failures, plus WebSocket frames and server-sent events. A 500, a 404, a redirect and a DNS failure are different lines, not the same one.
-- 💾 **Response bodies that cannot get lost** — `capture_bodies` writes every matching response to disk the moment it arrives, from every tab, worker and service worker, before Chrome's buffer or the next navigation can drop it. A JSON index records URL, POST data, status and headers for each file, and `search_bodies` finds which response a value first arrived in and which request sent it back.
+- 💾 **Response capture to disk** — `capture_bodies` captures matching responses from tabs, workers and service workers before later navigation or buffer eviction can discard them. A JSON index records URL, POST data, status and headers; `search_bodies` searches saved traffic. Capture status reports saved bodies, skips and errors.
 - 🛡️ **Passive security review built in** — `audit_security` checks security headers (with a real CSP analysis: nonces, `strict-dynamic`, multiple policies), CORS, TLS and certificates of every origin, cookie flags, responses a CDN could serve to the wrong user, every first and third party the page talks to, and lists what Chrome's own Issues panel reports: CSP violations, mixed content, rejected cookies. `inspect_storage` inventories localStorage, sessionStorage, IndexedDB, Cache Storage and service workers, and decodes tokens it finds there. `export_har` writes everything to a HAR file for Burp, ZAP or DevTools — with the wire headers, Cookie and Set-Cookie included.
 - 👥 **Several isolated browsers at once** — pass `browser: "agent-a"` to any tool and that name gets its own Chrome, in its own process, with its own cookies, tabs and uids. Parallel agents stop stealing each other's selected tab. Omit it and nothing changes: the default browser runs in the server process, exactly as before. [How it works](#several-agents-several-browsers)
 - 🧩 **70 tools** covering navigation, input, snapshots, screenshots, content/PDF export, network + console inspection, device emulation, cookies/storage, sessions, profiles, and performance tracing.
@@ -74,7 +63,7 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 - 📱 **Device emulation** (Pixel 7, iPad) with correct UA / client hints.
 - ✅ **Actions that verify themselves** — `fill` reads the value back, `set_checked` reads the checked state back, and `click`, `press_key` and `type_text` report when no input event reached the page. A tool that cannot confirm what it did says so instead of reporting success.
 - 💾 **Session save/restore** — persist logins across runs.
-- 🧬 **Ephemeral by default, run many at once** — each session gets its own temp Chrome profile (auto-deleted), so Claude Desktop, Claude Code and VS Code can all drive nodriver **simultaneously without colliding**. Named **persistent profiles** are available on demand for reusable logins.
+- 🧬 **Ephemeral by default, persistent when needed** — each session gets its own temporary Chrome profile. Named persistent profiles retain logins and offer configurable startup: a new tab (default), specified URLs, or the previous tabs without a restore-button click.
 - ⚡ **One-command setup** for 15+ MCP clients.
 
 ## Installation
@@ -98,7 +87,7 @@ uv tool install "nodriver-mcp @ git+https://github.com/andresolbach/nodriver-mcp
 
 Also listed in the [official MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.andresolbach/nodriver-mcp-server`, so clients and marketplaces that read the registry can find and install it directly.
 
-> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.3`, which contains the Chrome 146+ CDP fixes (`sameParty` removed from `Cookie`, `privateNetworkRequestPolicy` → `localNetworkAccessRequestPolicy`) — **verified working against Chrome 151**. `pip install` also works, but `uv tool install` keeps it isolated.
+> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.6`, tested against Chrome 155. `uv tool install` keeps dependencies isolated from your global Python environment.
 
 You'll also need a local installation of **Google Chrome** (auto-detected).
 
@@ -110,19 +99,19 @@ uv tool upgrade nodriver-mcp
 
 ## Requirements & tested versions
 
-Every tool in this server was tested **end-to-end against Google Chrome 151** with **nodriver 0.50.3** on **Python 3.12.11 / Windows 11** (macOS and Linux are supported too). Because nodriver talks to Chrome directly over CDP and tracks upstream Chrome changes, it keeps working as Chrome auto-updates.
+The automated suite runs schema, documentation and behavior checks plus real-browser integration tests. The current Windows browser test environment is **Chrome 155 / nodriver 0.50.6 / Python 3.12.11**. CI also runs the non-browser suite on macOS and Linux. Future Chrome or nodriver releases can require compatibility updates.
 
 | Component | Requirement | Verified version |
 |-----------|-------------|------------------|
 | Python | 3.12+ | 3.12.11 |
-| Google Chrome | any recent stable | 151.0.7922.174 |
+| Google Chrome | any recent stable | 155.0.8059.79 |
 | Operating system | Windows / macOS / Linux | Windows 11 |
-| `nodriver` | >= 0.50.3 | 0.50.3 |
+| `nodriver` | >= 0.50.6 | 0.50.6 |
 | `mcp` (MCP SDK) | >= 1.26.0, < 2 | 1.26.0 |
 | `pillow` | >= 12.1.1 | 12.1.1 |
 | `tomli-w` | >= 1.0.0 | 1.2.0 |
 
-The pip packages/versions are also listed in [`requirements.txt`](https://github.com/andresolbach/nodriver-mcp-server/blob/main/requirements.txt) (`pip install -r requirements.txt`), though `uv tool install` is recommended for a fully pinned, reproducible install.
+Runtime dependency ranges and tested versions are listed in [`requirements.txt`](https://github.com/andresolbach/nodriver-mcp-server/blob/main/requirements.txt). `uv tool install` creates an isolated installation; contributors can use `uv sync --locked --group dev` in this repository to reproduce the committed dependency set.
 
 ## One-command MCP client setup
 
@@ -179,7 +168,7 @@ If you'd rather paste it yourself, this works in any MCP client (`claude_desktop
 
 By default the browser starts clean for automation: the **Google Translate popup is suppressed** and **externally-installed Chrome extensions are blocked** (so you don't get "an extension requires your attention" prompts). Re-enable either via the env vars above **or at runtime with the `set_browser_flags` tool** — which can also set **any other Chrome launch flags** (e.g. `--lang=de-DE`, `--window-size=1280,800`) via its `extra_args` parameter. The browser also **auto-recovers** if Chrome is closed or crashes between calls — tools relaunch it instead of failing.
 
-Chrome also starts on `about:blank` rather than the New Tab page, so the NTP's own Google requests never show up in `list_network_requests`, and `new_page` **reuses that empty startup tab** instead of leaving a stray blank page behind.
+Ephemeral browsers start on `about:blank`, keeping New Tab page traffic out of the network log. Persistent profiles default to a new tab and can instead open specified URLs or restore their previous tabs; see [Profiles](#profiles). `new_page` reuses an empty startup tab.
 
 ## Extensions
 
@@ -223,12 +212,21 @@ By default every browser launches Chrome with a **fresh temporary profile** that
 When you want to **reuse a login across sessions**, create a named persistent profile and switch to it:
 
 - `list_profiles` — list persistent profiles and show the active one
-- `create_profile(name, activate=false)` — create a reusable profile
+- `create_profile(name, activate=false, restore_tabs=false)` — create a reusable profile; starts with a new tab by default
 - `use_profile(name)` — switch to a persistent profile (`""`/`"temp"` returns to ephemeral)
 - `use_temp_profile` — switch back to a fresh ephemeral profile
 - `delete_profile(name)` — remove a persistent profile
 
-Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
+Persistent profiles live under `~/.nodriver-mcp/profiles/<name>`. Startup defaults to a new tab. Select a profile with `use_profile(name)`, then choose its startup behavior through MCP:
+
+```python
+set_browser_flags(startup_mode="new_tab", restart=False)
+set_browser_flags(startup_mode="urls", startup_urls=["https://example.com", "https://example.org"], restart=False)
+set_browser_flags(startup_mode="restore", restart=False)
+set_browser_flags()  # read the saved choice without changing anything
+```
+
+Each setting is saved in that profile's `nodriver-startup.json`, survives MCP restarts, and takes precedence over Chrome's startup preference. `restart=False` leaves current tabs open and applies the choice on the next browser launch; the default `restart=True` closes Chrome immediately so the next action uses the new setting. `restore` resumes the last open tabs without clicking a recovery prompt or adding an extra blank tab. With no saved MCP choice, explicit Chrome startup preferences are respected. Temporary profiles still start blank and cannot save these startup settings. After restarting the MCP server itself, select the same profile again with `use_profile(name)`; profile selection is per server session. You can still force a fixed profile globally with the `NODRIVER_USER_DATA_DIR` env var.
 
 ## Drive a browser you are already signed into
 
@@ -287,26 +285,15 @@ Here, the schema does that work:
 - **Every tool declares behaviour hints** (`readOnlyHint`, `destructiveHint`, `idempotentHint`). Clients use these to group permissions — so a client can auto-approve `take_snapshot` while still prompting for `delete_profile`.
 - **Descriptions say when *not* to use a tool**, and point at the better one. `take_screenshot` tells the model to prefer `take_snapshot`; `click_at` points back to `click`.
 
-## Comparison with chrome-devtools-mcp
+## Relationship to chrome-devtools-mcp
 
-| Feature | chrome-devtools-mcp | nodriver-mcp-server |
-|---------|---------------------|---------------------|
-| Browser backend | Puppeteer (ChromeDriver) | nodriver (direct CDP) |
-| WebDriver fingerprint | ❌ Exposed | ✅ None |
-| `navigator.webdriver` | ❌ `true` | ✅ `false`, as in a normal browser |
-| Cloudflare bypass | ❌ | ✅ Built-in `cf_verify` |
-| Install method | npx | uvx / pip |
-| Language | TypeScript / Node.js | Python |
-| Parallel browsers | one | up to 12, isolated |
-| Tool coverage | 29 tools | 70 tools |
-| Per-parameter schema docs | partial | ✅ all 70 tools |
-| Tool behaviour hints | ❌ | ✅ read-only / destructive |
+This project uses nodriver and Python. [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) is a separate implementation with its own evolving tool API. Compare the current tool references when choosing a server; matching names do not imply identical arguments or behavior.
 
-Tools not implemented: `performance_analyze_insight` (needs the DevTools frontend trace parser), `lighthouse_audit` (needs the Lighthouse Node API), `screencast_start/stop` (needs ffmpeg + Puppeteer), extension management (experimental).
+This server does not implement `performance_analyze_insight`, `lighthouse_audit` or `screencast_start/stop`. Extension management is available through `manage_extensions`, subject to the Chrome build restrictions described above.
 
 ## Use cases
 
-- **Scrape sites that reject other automation** (Cloudflare, DataDome, PerimeterX, hCaptcha) without leaking a CDP/WebDriver fingerprint. Fingerprinting is only part of what those systems weigh — IP reputation and behaviour count too — so a challenge is still possible; `cf_verify` handles a Cloudflare checkbox.
+- **Browse and extract structured content** using a real Chrome session, with network and response-body inspection when the data comes from an API.
 - **Let an AI agent browse the real web** — Claude, Cursor, Windsurf and other LLM agents can log in, fill forms, click, read pages, and screenshot.
 - **Automate authenticated workflows** and reuse the login across sessions with persistent profiles.
 - **LLM-driven web research & data extraction** using compact accessibility-tree snapshots instead of brittle screenshots.
@@ -316,19 +303,19 @@ Tools not implemented: `performance_analyze_insight` (needs the DevTools fronten
 ## FAQ
 
 **Is this an undetected alternative to chrome-devtools-mcp?**
-Yes. It exposes the same tool surface but drives Chrome through nodriver (direct CDP), so `navigator.webdriver` reads `false` — the same value a browser a person is using reports — and there are no WebDriver/CDP fingerprints for anti-bot systems to detect.
+It is an alternative built on nodriver, with familiar browser tools and additional profile and network features. It is not an exact API replacement and does not guarantee that sites cannot detect automation.
 
 **Can it bypass Cloudflare?**
-It ships a `cf_verify` tool that solves the Cloudflare "verify you are human" challenge, and its undetected profile avoids most bot checks. (No tool can guarantee bypassing every protection.)
+The optional `cf_verify` helper attempts supported Cloudflare checkbox challenges. Success is not guaranteed, and it does not solve image or text CAPTCHA puzzles.
 
 **I already use `chrome-devtools-mcp` or `playwright-mcp` and keep getting blocked. How do I switch?**
-Replace the server entry in your MCP config with the one under [Manual config](#manual-config) — that is the whole migration. The tool names and arguments match `chrome-devtools-mcp`, so existing prompts, scripts and agent instructions keep working unchanged. You can also run both side by side and point the agent at whichever suits the site.
+Add the server entry under [Manual config](#manual-config), then review the [tool reference](https://github.com/andresolbach/nodriver-mcp-server/blob/main/docs/TOOLS.md) and adapt any tool-specific prompts or scripts. You can run both servers side by side.
 
 **The site works in my normal browser but not under automation. Why?**
-Because anti-bot systems fingerprint the *driver*, not your behaviour: a ChromeDriver binary in the process tree, `navigator.webdriver === true`, CDP artifacts in the page. Your manual browser has none of those, so it is served the real page. nodriver drives Chrome without leaving them.
+Possible causes include profile or cookie differences, automation signals, IP reputation, request rates and application errors. Compare the network log and browser state before assuming the driver is the cause.
 
 **Does it help with captchas?**
-Only the Cloudflare "verify you are human" checkbox, via `cf_verify`. Image grids, text captchas and hCaptcha puzzles are not solved — this is a stealth driver, not a captcha service. In practice, staying undetected means far fewer captchas are shown in the first place.
+The optional `cf_verify` helper supports some Cloudflare checkbox challenges. Image grids, text CAPTCHAs and hCaptcha puzzles are not solved.
 
 **Which clients are supported?**
 One command installs it into 15+ MCP clients: Claude Desktop, Claude Code, Cursor, Windsurf, Codex, Gemini CLI, Copilot CLI, Kiro, VS Code, Cline, Roo Code, Amazon Q, Warp, Opencode, Trae.
@@ -343,15 +330,22 @@ A real Chrome window by default; set `NODRIVER_HEADLESS=true` for headless.
 Create a persistent profile with `create_profile` and switch to it with `use_profile`, or use `save_session` / `load_session`.
 
 **Does it work on Windows / macOS / Linux?**
-Yes, all three. Tested on Windows 11 with Chrome 151 and Python 3.12.
+The project supports all three. Browser integration tests run on Windows 11 with Chrome 155; CI runs the non-browser suite on Windows, macOS and Linux.
+
+## Scope and limitations
+
+- Detection resistance is site- and configuration-dependent. The fingerprint result above documents those checks in that environment; it does not guarantee access to every site. IP reputation, request rates and session state also matter.
+- `cf_verify` is an optional helper for supported Cloudflare checkbox challenges, not a general CAPTCHA service. Image grids, text CAPTCHAs and hCaptcha puzzles are not solved.
+- This is an independent tool API, not an exact replacement for `chrome-devtools-mcp`. Check the tool reference when migrating scripts or prompts.
+- Persistent profiles can be used by only one running browser at a time. After a complete MCP server restart, select the same profile again with `use_profile` to resume it.
 
 ## Changelog
 
-See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Highlights: ephemeral-by-default Chrome profiles so multiple instances run at once (+ named persistent profiles), migrated to upstream `nodriver 0.50.3` (Chrome 151 verified), and fixed several previously-broken tools — `fill`/`fill_form`, `evaluate_script` with element args, `select_page` tab switching, `press_key` modifier chords (Ctrl+A/C/V), network/console lookup indexing, and Windows installer crashes.
+See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Version 2.6.0 adds per-profile startup modes, fixes graceful browser shutdown and tab restoration, and updates nodriver to 0.50.6. Existing network capture, passive security checks and isolated browser sessions remain available.
 
 ## Credits
 
-Based on [`nodriver-mcp`](https://github.com/Saber-CC/nodriver-mcp) by **Saber-CC** (MIT). Browser backend by [`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) (ultrafunkamsterdam). Tool surface mirrors [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp).
+Based on [`nodriver-mcp`](https://github.com/Saber-CC/nodriver-mcp) by **Saber-CC** (MIT). Browser backend by [`nodriver`](https://github.com/ultrafunkamsterdam/nodriver) (ultrafunkamsterdam). Some tool names and workflows are inspired by [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp).
 
 ## License
 

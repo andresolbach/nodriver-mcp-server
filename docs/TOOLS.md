@@ -1237,7 +1237,9 @@ return to ephemeral with use_temp_profile.
 Create a named persistent Chrome profile — a reusable user-data dir.
 
 A persistent profile keeps cookies, logins and Web Store extensions between
-runs, so a site you log into once stays logged in. It is the sturdier
+runs. By default it starts with a new tab. Set restore_tabs=True to resume
+the last tabs, or configure new_tab / urls / restore later with
+set_browser_flags(startup_mode=...). It is the sturdier
 alternative to save_session / load_session.
 
 Creating one is harmless by itself: nothing changes until you activate it,
@@ -1253,6 +1255,7 @@ concurrent setups different names.
 |---|---|---|---|
 | `name` | `string` | yes | Profile name, e.g. "google-login". Only letters, digits, "-" and "_" are kept; any other character is stripped out. |
 | `activate` | `boolean` | — | Switch to the new profile straight away. That restarts the browser and closes all open pages. Default false, which only creates the directory. *(default: `false`)* |
+| `restore_tabs` | `boolean` | — | Restore the last open tabs automatically when this profile restarts. Default false (new tab). Only applies when creating a new profile; existing Chrome settings are preserved. *(default: `false`)* |
 | `browser` | `string` | — | Which browser to act on. Each name is an independent Chrome, created on first use. Omit for the shared default; parallel agents each need their own name. *(default: `default`)* |
 
 ### `use_profile`
@@ -1260,7 +1263,9 @@ concurrent setups different names.
 Switch the browser to a named persistent profile.
 
 Use it to pick up the cookies, logins and extensions stored in an earlier
-session, so a run starts out already authenticated.
+session. Startup defaults to a new tab; set_browser_flags(startup_mode=...)
+saves a different choice per profile. After an MCP server
+restart, select this same profile again to resume it.
 
 Restarts the browser and closes every open page. The profile has to exist
 already — create it first with create_profile. Only one browser may use a
@@ -1352,7 +1357,12 @@ that form changes nothing.
 
 These are launch-time flags, so applying them restarts Chrome and closes
 every open page; on an ephemeral profile that also drops its cookies. Values
-set here override the NODRIVER_ENABLE_* environment variables.  
+set here override the NODRIVER_ENABLE_* environment variables.
+
+Startup mode is saved per persistent profile: new_tab, urls or restore.
+With restart=False, current tabs stay open and the saved choice applies next
+time. Unlike the other flags, this choice survives MCP server restarts.
+Saved MCP startup choices take precedence over Chrome's startup setting.  
 <sub>destructive</sub>
 
 | Parameter | Type | Required | Description |
@@ -1361,6 +1371,8 @@ set here override the NODRIVER_ENABLE_* environment variables.
 | `extensions` | `boolean` | — | True allows externally-installed Chrome extensions, false blocks them. Omit to leave unchanged. Blocked by default, so no "an extension requires your attention" prompt appears. manage_extensions offers the same switch plus listing and loading. |
 | `extra_args` | array of `string` | — | Replace the set of extra Chrome launch flags with this list, e.g. ["--lang=de-DE", "--window-size=1280,800"]. A leading "--" is added if missing. Pass [] to clear them, omit to leave unchanged. This replaces the list rather than appending to it. |
 | `restart` | `boolean` | — | Restart Chrome now so the flags take effect, closing all open pages. Default true; false defers them to the next browser start. *(default: `true`)* |
+| `startup_mode` | `new_tab` \| `urls` \| `restore` | — | Save this persistent profile's startup mode: new_tab (default), urls (open startup_urls), or restore (resume the last open tabs automatically). Select a persistent profile with use_profile first. Omit to leave unchanged. The choice survives MCP restarts; restart=False applies it on the next launch. |
+| `startup_urls` | array of `string` | — | One or more absolute HTTP(S) URLs, required with startup_mode='urls'. Only valid together with that mode. |
 | `browser` | `string` | — | Which browser to act on. Each name is an independent Chrome, created on first use. Omit for the shared default; parallel agents each need their own name. *(default: `default`)* |
 
 ### `set_proxy`

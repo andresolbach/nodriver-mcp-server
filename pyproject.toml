@@ -1,7 +1,7 @@
 [project]
 name = "nodriver-mcp"
-version = "2.5.0"
-description = "Undetected Chrome automation MCP server powered by nodriver — a stealth, anti-bot-resistant alternative to chrome-devtools-mcp for Claude, Cursor and other AI agents"
+version = "2.6.0"
+description = "Chrome automation via nodriver: 70 MCP tools, isolated browsers, configurable profile startup, network capture and passive security checks"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
@@ -26,8 +26,8 @@ dependencies = [
     "mcp>=1.26.0,<2",
     # Chrome 146+ CDP fixes (sameParty removal, localNetworkAccessRequestPolicy
     # rename) that once required the Saber-CC fork are upstream as of 0.50.x.
-    # Verified working against Chrome 151.
-    "nodriver>=0.50.3",
+    # Tested with nodriver 0.50.6 and Chrome 155.
+    "nodriver>=0.50.6",
     "pillow>=12.1.1",
     "tomli-w>=1.0.0",
 ]
