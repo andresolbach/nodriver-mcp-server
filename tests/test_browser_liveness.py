@@ -29,6 +29,26 @@ def test_browser_liveness_detects_a_closed_browser_connection():
     assert not asyncio.run(server._browser_alive(browser))
 
 
+@pytest.mark.parametrize("restored", [False, True])
+def test_startup_handles_missing_or_pending_page_targets(restored):
+    page = object()
+    browser = SimpleNamespace(tabs=[])
+    opened = []
+
+    async def refresh():
+        if restored:
+            browser.tabs = [page]
+
+    async def open_page(url, new_tab):
+        opened.append((url, new_tab))
+        return page
+
+    browser.update_targets = refresh
+    browser.get = open_page
+    assert asyncio.run(server._ensure_startup_tab(browser, timeout=0)) is page
+    assert opened == ([] if restored else [("about:blank", True)])
+
+
 @pytest.mark.slow
 def test_stale_blank_target_does_not_overwrite_an_open_page(tmp_path):
     urls = []

@@ -237,6 +237,23 @@ async def _browser_alive(b: uc.Browser) -> bool:
         return False
 
 
+async def _ensure_startup_tab(browser: uc.Browser, timeout: float = 5.0) -> uc.Tab:
+    """Chrome can expose CDP before it creates/restores its first page.
+
+    A brand-new profile with --restore-last-session can also have no session to
+    restore. Wait for pending targets first, then provide its empty startup tab.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not browser.tabs:
+        await browser.update_targets()
+        if browser.tabs:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            return await browser.get("about:blank", new_tab=True)
+        await asyncio.sleep(0.05)
+    return browser.tabs[0]
+
+
 async def _get_browser() -> uc.Browser:
     """Start the browser on first tool call (lazy init, protected by mutex).
 
@@ -413,7 +430,7 @@ async def _get_browser() -> uc.Browser:
 
             # Auto-enable network collection on the first tab.
             # Console collection is opt-in because Runtime.enable() can be detected.
-            await _auto_enable_network_collection(_browser.main_tab)
+            await _auto_enable_network_collection(await _ensure_startup_tab(_browser))
             if startup_config and startup_config["mode"] == "urls":
                 for url in startup_config["urls"][1:]:
                     tab = await _browser.get(url, new_tab=True)
