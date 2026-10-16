@@ -27,7 +27,7 @@ from nodriver_mcp.server import (
     _site_of,
     _timing_phases,
 )
-from test_browser_behaviour import _call, _run
+from test_browser_behaviour import _call, _call_checked, _run
 
 
 def _jwt(header: dict, claims: dict) -> str:
@@ -153,17 +153,23 @@ def test_timing_and_initiator_reach_get_network_request():
 def test_server_sent_events_are_logged_like_socket_frames():
     async def scenario():
         with CaptureSite() as site:
-            await _call("new_page", url="about:blank")
-            await _call("navigate_page", url=site.base + "/")
-            await _call("evaluate_script", function=(
+            await _call_checked("new_page", url="about:blank")
+            await _call_checked("navigate_page", url=site.base + "/")
+            await _call_checked("evaluate_script", function=(
                 "() => new Promise(resolve => { const es = new EventSource('/api/fo/sse'); let n = 0;"
                 " es.onmessage = () => { if (++n === 3) { es.close(); resolve(n); } }; })"
             ))
-            await asyncio.sleep(0.3)
-            listing = await _call("list_network_requests", resource_types=["EventSource"])
-            assert "3 events" in listing, listing
+            # The page receiving its third message does not mean the Python
+            # CDP event handlers have finished recording those messages yet.
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
+                listing = await _call_checked("list_network_requests", resource_types=["EventSource"])
+                if "3 events" in listing:
+                    break
+                assert asyncio.get_running_loop().time() < deadline, listing
+                await asyncio.sleep(.05)
             reqid = int(re.search(r"\[(\d+)\]", listing).group(1))
-            detail = await _call("get_network_request", reqid=reqid)
+            detail = await _call_checked("get_network_request", reqid=reqid)
         assert "Server-sent events (3)" in detail, detail
         assert all(f"<- tick {i}" in detail for i in range(3)), detail
 

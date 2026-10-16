@@ -768,30 +768,44 @@ def test_a_dialog_can_be_answered_on_a_tab_that_never_navigated():
     new_page alone answered "No dialog is showing" while being blocked by one.
     """
 
+    from nodriver_mcp import server
+
     async def scenario():
-        await _call("new_page", url=(
+        await _call_checked("new_page", url=(
             "data:text/html,<button onclick=\"alert('blocking')\" "
             "aria-label=Boom style='padding:30px'>Go</button>"
         ))
-        snap = await _call("take_snapshot")
+        snap = await _call_checked("take_snapshot")
         button = re.search(r'uid=(\S+) button "Boom"', snap).group(1)
 
         # The click blocks in the renderer for as long as the alert is up, so it
         # cannot be awaited — that is the whole shape of the bug.
-        clicking = asyncio.create_task(_call("click", uid=button))
-        await asyncio.sleep(1.5)
+        tab = await server._active_tab()
+        clicking = asyncio.create_task(_call_checked("click", uid=button))
+        try:
+            # Dispatching the click and receiving JavascriptDialogOpening are
+            # separate events. A fixed sleep can answer before the text arrives.
+            async with asyncio.timeout(10):
+                while server._target_key(tab) not in server._open_dialogs:
+                    if clicking.done() and clicking.exception() is not None:
+                        await clicking
+                    await asyncio.sleep(.05)
 
-        answered = await asyncio.wait_for(
-            _call("handle_dialog", action="accept"), timeout=20
-        )
-        assert "accepted" in answered, answered
-        assert "blocking" in answered, f"the dialog's own text was not reported:\n{answered}"
+            answered = await asyncio.wait_for(
+                _call_checked("handle_dialog", action="accept"), timeout=20
+            )
+            assert "accepted" in answered, answered
+            assert "blocking" in answered, f"the dialog's own text was not reported:\n{answered}"
 
-        recovered = await asyncio.wait_for(
-            _call("evaluate_script", function="() => 'recovered'"), timeout=20
-        )
-        assert "recovered" in recovered, f"the page is still wedged:\n{recovered}"
-        await asyncio.gather(clicking, return_exceptions=True)
+            recovered = await asyncio.wait_for(
+                _call_checked("evaluate_script", function="() => 'recovered'"), timeout=20
+            )
+            assert "recovered" in recovered, f"the page is still wedged:\n{recovered}"
+            await asyncio.wait_for(clicking, timeout=20)
+        finally:
+            if not clicking.done():
+                clicking.cancel()
+                await asyncio.gather(clicking, return_exceptions=True)
 
     _run(scenario)
 
