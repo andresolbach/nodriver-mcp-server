@@ -127,6 +127,97 @@ def _feature_enabled(override: bool | None, env_name: str) -> bool:
     return os.environ.get(env_name, "").lower() in ("1", "true", "yes")
 
 
+def _restore_profile_tabs(profile_dir: str | None) -> bool:
+    """Restore only when a persistent profile explicitly requests it.
+
+    Read on every launch so changes in chrome://settings/onStartup also apply.
+    Ephemeral profiles have no previous session to restore.
+    """
+    if not profile_dir:
+        return False
+    try:
+        with open(os.path.join(profile_dir, "Default", "Preferences"), encoding="utf-8") as f:
+            prefs = json.load(f)
+        return prefs.get("session", {}).get("restore_on_startup", 5) == 1
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, TypeError, AttributeError):
+        logger.warning("Could not read Chrome startup preferences in %s", profile_dir)
+        return False
+
+
+def _write_profile_json(path: str, data: dict) -> None:
+    """Replace a settings file atomically, preserving its previous copy on error."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _profile_startup_config(profile_dir: str | None) -> dict | None:
+    if not profile_dir:
+        return None
+    try:
+        with open(os.path.join(profile_dir, "nodriver-startup.json"), encoding="utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict) or config.get("mode") not in ("new_tab", "urls", "restore"):
+            raise ValueError("unknown startup mode")
+        if config["mode"] == "urls":
+            _validate_startup_urls(config.get("urls"))
+        return config
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ToolFailure(f"Cannot read profile startup configuration: {e}") from e
+
+
+def _validate_startup_urls(urls: list[str] | None) -> list[str]:
+    from urllib.parse import urlsplit
+
+    if not isinstance(urls, list) or not urls:
+        raise ToolFailure("startup_mode='urls' requires at least one startup_urls entry.")
+    result = []
+    for url in urls:
+        if not isinstance(url, str) or any(ord(c) < 32 for c in url):
+            raise ToolFailure("Startup URLs must be HTTP(S) URLs without control characters.")
+        value = url.strip()
+        try:
+            parsed = urlsplit(value)
+            valid = parsed.scheme in ("http", "https") and parsed.hostname
+            parsed.port  # validate a supplied port as well
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ToolFailure(f"Invalid startup URL: {value!r}. Use an absolute HTTP(S) URL.")
+        if value not in result:
+            result.append(value)
+    return result
+
+
+def _apply_profile_startup(profile_dir: str) -> None:
+    """Apply saved MCP choices only before Chrome opens Preferences."""
+    config = _profile_startup_config(profile_dir)
+    if config is None:
+        return
+    path = os.path.join(profile_dir, "Default", "Preferences")
+    try:
+        with open(path, encoding="utf-8") as f:
+            prefs = json.load(f)
+    except FileNotFoundError:
+        prefs = {}
+    session = prefs.setdefault("session", {})
+    # MCP opens its configured URLs itself: Chrome protects startup_urls against
+    # external edits, and headless Chrome accepts only one launch URL.
+    session["restore_on_startup"] = 1 if config["mode"] == "restore" else 5
+    session["startup_urls"] = []
+    _write_profile_json(path, prefs)
+
+
 async def _browser_alive(b: uc.Browser) -> bool:
     """Cheap CDP probe to confirm the browser is still usable.
 
@@ -206,6 +297,7 @@ async def _get_browser() -> uc.Browser:
             data_dir = _selected_profile_dir or os.environ.get("NODRIVER_USER_DATA_DIR")
             if data_dir:
                 os.makedirs(data_dir, exist_ok=True)
+                _apply_profile_startup(data_dir)
                 kwargs["user_data_dir"] = data_dir
                 logger.info("Using persistent profile dir: %s", data_dir)
             else:
@@ -267,10 +359,22 @@ async def _get_browser() -> uc.Browser:
                 if bypass:
                     browser_args.append(f"--proxy-bypass-list={bypass}")
                 logger.info("Proxy configured: %s", proxy)
-            # Start on about:blank rather than the New Tab page: the NTP fires
-            # its own Google requests, which pollute list_network_requests and
-            # cost a page load nobody asked for.
-            browser_args.append("about:blank")
+            # An explicit startup URL overrides Chrome's previous session (and
+            # adds an unwanted blank tab). Honor the profile's startup choice.
+            # The switch also restores after a client/process crash without a
+            # recovery-bubble click. A temp profile still starts on a blank tab.
+            startup_config = _profile_startup_config(data_dir)
+            if startup_config and startup_config["mode"] != "restore":
+                browser_args = [arg for arg in browser_args if arg != "--restore-last-session"]
+            if startup_config and startup_config["mode"] == "urls":
+                # Chrome can reset externally changed startup_urls as a
+                # protected preference. Explicit validated URLs are reliable.
+                browser_args.append(startup_config["urls"][0])
+            elif _restore_profile_tabs(data_dir) or "--restore-last-session" in browser_args:
+                if "--restore-last-session" not in browser_args:
+                    browser_args.append("--restore-last-session")
+            elif not data_dir:
+                browser_args.append("about:blank")
             kwargs["browser_args"] = browser_args
 
             if unpacked:
@@ -314,6 +418,10 @@ async def _get_browser() -> uc.Browser:
             # Auto-enable network collection on the first tab.
             # Console collection is opt-in because Runtime.enable() can be detected.
             await _auto_enable_network_collection(_browser.main_tab)
+            if startup_config and startup_config["mode"] == "urls":
+                for url in startup_config["urls"][1:]:
+                    tab = await _browser.get(url, new_tab=True)
+                    await _auto_enable_network_collection(tab)
     return _browser
 
 
@@ -2487,7 +2595,12 @@ async def _close_browser_and_profile(b: uc.Browser) -> None:
     #    different backend, written eagerly) survived and made it look like the
     #    profile had worked. Browser.close lets it write and exit on its own.
     proc_handle = getattr(b, "_process", None)
+    # nodriver 0.50.x makes Browser itself a Connection; .connection remains
+    # None. Using only that legacy attribute skipped graceful shutdown and
+    # TerminateProcess discarded the latest session/cookies on Windows.
     main_conn = getattr(b, "connection", None)
+    if main_conn is None and callable(getattr(b, "send", None)):
+        main_conn = b
     if main_conn is not None:
         try:
             import nodriver.cdp.browser as cdp_browser
@@ -2504,7 +2617,7 @@ async def _close_browser_and_profile(b: uc.Browser) -> None:
     # 1. Close the CDP websockets we hold, awaited rather than scheduled. Tabs
     #    first: each is its own connection, and a live one keeps Chrome busy.
     connections = [t for t in (getattr(b, "tabs", None) or [])]
-    main = getattr(b, "connection", None)
+    main = main_conn
     if main is not None:
         connections.append(main)
     for conn in connections:
@@ -8453,6 +8566,22 @@ async def set_browser_flags(
             "Default true; false defers them to the next browser start."
         )),
     ] = True,
+    startup_mode: Annotated[
+        Literal["new_tab", "urls", "restore"] | None,
+        Field(description=(
+            "Save this persistent profile's startup mode: new_tab (default), urls "
+            "(open startup_urls), or restore (resume the last open tabs automatically). "
+            "Select a persistent profile with use_profile first. Omit to leave unchanged. "
+            "The choice survives MCP restarts; restart=False applies it on the next launch."
+        )),
+    ] = None,
+    startup_urls: Annotated[
+        list[str] | None,
+        Field(description=(
+            "One or more absolute HTTP(S) URLs, required with startup_mode='urls'. "
+            "Only valid together with that mode."
+        )),
+    ] = None,
 ) -> str:
     """Change Chrome's launch flags at runtime, and show the current ones.
 
@@ -8462,9 +8591,27 @@ async def set_browser_flags(
     These are launch-time flags, so applying them restarts Chrome and closes
     every open page; on an ephemeral profile that also drops its cookies. Values
     set here override the NODRIVER_ENABLE_* environment variables.
+
+    Startup mode is saved per persistent profile: new_tab, urls or restore.
+    With restart=False, current tabs stay open and the saved choice applies next
+    time. Unlike the other flags, this choice survives MCP server restarts.
+    Saved MCP startup choices take precedence over Chrome's startup setting.
     """
     global _enable_translate, _enable_extensions, _extra_browser_args
     changed = []
+    profile_dir = _active_profile_dir()
+    if startup_urls is not None and startup_mode != "urls":
+        raise ToolFailure("Pass startup_urls only with startup_mode='urls'.")
+    if startup_mode is not None:
+        if _connect_target() is not None or not profile_dir:
+            raise ToolFailure("Select a persistent profile with use_profile before configuring startup.")
+        urls = _validate_startup_urls(startup_urls) if startup_mode == "urls" else []
+        # Validate before saving or changing any runtime flags. Never rewrite a
+        # running Chrome's Preferences: it would overwrite those changes later.
+        config = {"mode": startup_mode, "urls": urls}
+        _write_profile_json(os.path.join(profile_dir, "nodriver-startup.json"), config)
+        changed.append(f"startup_mode={startup_mode} (saved for this profile)")
+    startup = _profile_startup_config(profile_dir)
     if translate is not None:
         _enable_translate = translate
         changed.append(f"translate={'on' if translate else 'off'}")
@@ -8495,11 +8642,12 @@ async def set_browser_flags(
         f"Google Translate popup: {'enabled' if eff_t else 'disabled'} | "
         f"External extensions: {'enabled' if eff_e else 'disabled'}\n"
         f"Extra flags: {_extra_browser_args or '(none)'}\n"
-        f"Effective launch flags: {effective or '(none)'}"
+        f"Effective launch flags: {effective or '(none)'}\n"
+        f"Saved startup: {json.dumps(startup) if startup else '(Chrome profile setting; default new_tab)'}"
     )
 
     if not changed:
-        return f"Current browser flags:\n{status}\n(Pass translate= / extensions= / extra_args= to change.)"
+        return f"Current browser flags:\n{status}\n(Pass startup_mode= / translate= / extensions= / extra_args= to change.)"
 
     msg = "Updated: " + ", ".join(changed) + f"\n{status}"
     if restart:
@@ -8939,11 +9087,21 @@ async def create_profile(
             "closes all open pages. Default false, which only creates the directory."
         )),
     ] = False,
+    restore_tabs: Annotated[
+        bool,
+        Field(description=(
+            "Restore the last open tabs automatically when this profile restarts. "
+            "Default false (new tab). Only applies when creating "
+            "a new profile; existing Chrome settings are preserved."
+        )),
+    ] = False,
 ) -> str:
     """Create a named persistent Chrome profile — a reusable user-data dir.
 
     A persistent profile keeps cookies, logins and Web Store extensions between
-    runs, so a site you log into once stays logged in. It is the sturdier
+    runs. By default it starts with a new tab. Set restore_tabs=True to resume
+    the last tabs, or configure new_tab / urls / restore later with
+    set_browser_flags(startup_mode=...). It is the sturdier
     alternative to save_session / load_session.
 
     Creating one is harmless by itself: nothing changes until you activate it,
@@ -8960,6 +9118,11 @@ async def create_profile(
     path = os.path.join(_PROFILES_DIR, safe)
     existed = os.path.isdir(path)
     os.makedirs(path, exist_ok=True)
+    if not existed:
+        default_dir = os.path.join(path, "Default")
+        os.makedirs(default_dir, exist_ok=True)
+        with open(os.path.join(default_dir, "Preferences"), "w", encoding="utf-8") as f:
+            json.dump({"session": {"restore_on_startup": 1 if restore_tabs else 5}}, f)
     msg = f"Profile '{safe}' {'already exists' if existed else 'created'} at {path}."
     if activate:
         await _restart_browser_with(path, safe)
@@ -9122,7 +9285,9 @@ async def use_profile(
     """Switch the browser to a named persistent profile.
 
     Use it to pick up the cookies, logins and extensions stored in an earlier
-    session, so a run starts out already authenticated.
+    session. Startup defaults to a new tab; set_browser_flags(startup_mode=...)
+    saves a different choice per profile. After an MCP server
+    restart, select this same profile again to resume it.
 
     Restarts the browser and closes every open page. The profile has to exist
     already — create it first with create_profile. Only one browser may use a
