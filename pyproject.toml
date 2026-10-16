@@ -1,6 +1,6 @@
 [project]
 name = "nodriver-mcp"
-version = "2.6.0"
+version = "2.6.1"
 description = "Chrome automation via nodriver: 70 MCP tools, isolated browsers, configurable profile startup, network capture and passive security checks"
 readme = "README.md"
 requires-python = ">=3.12"

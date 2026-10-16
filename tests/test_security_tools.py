@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import re
 import time
@@ -27,7 +28,7 @@ from nodriver_mcp.server import (
     _site_of,
     _timing_phases,
 )
-from test_browser_behaviour import _call, _run
+from test_browser_behaviour import _call, _call_checked, _run
 
 
 def _jwt(header: dict, claims: dict) -> str:
@@ -153,17 +154,23 @@ def test_timing_and_initiator_reach_get_network_request():
 def test_server_sent_events_are_logged_like_socket_frames():
     async def scenario():
         with CaptureSite() as site:
-            await _call("new_page", url="about:blank")
-            await _call("navigate_page", url=site.base + "/")
-            await _call("evaluate_script", function=(
+            await _call_checked("new_page", url="about:blank")
+            await _call_checked("navigate_page", url=site.base + "/")
+            await _call_checked("evaluate_script", function=(
                 "() => new Promise(resolve => { const es = new EventSource('/api/fo/sse'); let n = 0;"
                 " es.onmessage = () => { if (++n === 3) { es.close(); resolve(n); } }; })"
             ))
-            await asyncio.sleep(0.3)
-            listing = await _call("list_network_requests", resource_types=["EventSource"])
-            assert "3 events" in listing, listing
+            # The page receiving its third message does not mean the Python
+            # CDP event handlers have finished recording those messages yet.
+            deadline = asyncio.get_running_loop().time() + 10
+            while True:
+                listing = await _call_checked("list_network_requests", resource_types=["EventSource"])
+                if "3 events" in listing:
+                    break
+                assert asyncio.get_running_loop().time() < deadline, listing
+                await asyncio.sleep(.05)
             reqid = int(re.search(r"\[(\d+)\]", listing).group(1))
-            detail = await _call("get_network_request", reqid=reqid)
+            detail = await _call_checked("get_network_request", reqid=reqid)
         assert "Server-sent events (3)" in detail, detail
         assert all(f"<- tick {i}" in detail for i in range(3)), detail
 
@@ -226,12 +233,32 @@ def test_audit_reports_the_weak_page_and_passes_the_hardened_one():
 
 
 @pytest.mark.slow
-def test_audit_gets_headers_when_the_page_load_was_not_recorded():
+def test_audit_gets_headers_when_the_page_load_was_not_recorded(monkeypatch):
+    from nodriver.cdp import network
+    from nodriver.core.connection import Connection
+
+    add_handler = Connection.add_handler
+
+    def delayed_fetch_headers(self, event_type, callback):
+        if event_type is network.ResponseReceived:
+            async def delayed(event):
+                if event.type_ == network.ResourceType.FETCH:
+                    # The fetch promise can resolve before Python records the
+                    # response event. Exceed the old fixed 300 ms grace period.
+                    await asyncio.sleep(.8)
+                result = callback(event)
+                if inspect.isawaitable(result):
+                    await result
+            return add_handler(self, event_type, delayed)
+        return add_handler(self, event_type, callback)
+
+    monkeypatch.setattr(Connection, "add_handler", delayed_fetch_headers)
+
     async def scenario():
         with CaptureSite() as site:
-            await _call("new_page", url=site.base + "/audit")
+            await _call_checked("new_page", url=site.base + "/audit")
             server._network_requests.clear()  # as for a tab the page opened itself
-            report = await _call("audit_security", checks=["headers"])
+            report = await _call_checked("audit_security", checks=["headers"])
         assert "fresh fetch()" in report, report
         assert "'unsafe-eval'" in report, f"the fallback headers were not audited:\n{report}"
 

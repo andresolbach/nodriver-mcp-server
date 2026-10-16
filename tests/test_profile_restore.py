@@ -1,11 +1,42 @@
 """Persistent profiles must resume their tabs without a recovery prompt."""
 import asyncio
 import json
+import threading
 
 import pytest
 
 from nodriver_mcp import server
 from test_browser_behaviour import _call
+
+
+async def _wait_for_restored_document(tab, url, timeout=10):
+    """TargetInfo can contain the saved URL before its document has loaded.
+
+    The initial about:blank document can even report readyState='complete',
+    but has an opaque origin and cannot access sessionStorage. Check both the
+    actual document URL and readiness; keep the storage assertion separate.
+    """
+    state = None
+    try:
+        async with asyncio.timeout(timeout):
+            while True:
+                try:
+                    state = await server._evaluate_value(
+                        tab, "({href: location.href, ready: document.readyState})"
+                    )
+                except Exception as exc:
+                    # A navigation can replace the context between CDP calls.
+                    # Do not hide real JavaScript errors (including SecurityError).
+                    if not any(message in str(exc) for message in (
+                        "Execution context was destroyed", "Cannot find context with specified id",
+                    )):
+                        raise
+                else:
+                    if state["href"] == url and state["ready"] in ("interactive", "complete"):
+                        return
+                await asyncio.sleep(.05)
+    except TimeoutError:
+        raise AssertionError(f"Restored document {url!r} did not load; last state: {state!r}") from None
 
 
 @pytest.mark.slow
@@ -32,7 +63,9 @@ def test_chrome_continue_setting_restores_tabs_after_two_restarts(tmp_path, monk
                 await _call("new_page", url=url)
             before_restart = await _call("list_pages")
             assert sorted(t.url for t in server._browser.tabs) == sorted(urls), before_restart
-            await _call("evaluate_script", function="() => {sessionStorage.setItem('restore-test', 'kept'); return true}")
+            tab = next(t for t in server._browser.tabs if t.url == urls[1])
+            await _wait_for_restored_document(tab, urls[1])
+            assert await server._evaluate_value(tab, "sessionStorage.setItem('restore-test', 'kept'); true") is True
             for _ in range(2):
                 await _call("close_browser")
                 data = json.loads(prefs.read_text(encoding="utf-8"))
@@ -48,12 +81,81 @@ def test_chrome_continue_setting_restores_tabs_after_two_restarts(tmp_path, monk
                     listing = await _call("list_pages")
                 assert actual == sorted(urls), listing
                 tab = next(t for t in browser.tabs if t.url == urls[1])
+                await _wait_for_restored_document(tab, urls[1])
                 value = await server._evaluate_value(tab, "sessionStorage.getItem('restore-test')")
                 assert value == "kept", value
         finally:
             await _call("use_temp_profile")
 
     asyncio.run(scenario())
+
+
+@pytest.mark.slow
+def test_restored_target_url_does_not_mean_its_document_is_ready(tmp_path, monkeypatch):
+    """Hold a real HTTP response to reproduce the post-merge CI failure."""
+    from capture_site import CaptureSite
+
+    monkeypatch.setattr(server, "_PROFILES_DIR", str(tmp_path / "profiles"))
+    hold = threading.Event()
+    release = threading.Event()
+    requested = threading.Event()
+
+    with CaptureSite() as site:
+        original_handler = site._server.RequestHandlerClass
+
+        class DelayedRestoreHandler(original_handler):
+            def do_GET(self):
+                if self.path == "/second" and hold.is_set():
+                    requested.set()
+                    if not release.wait(15):
+                        self.send_error(504, "Test did not release restored document")
+                        return
+                super().do_GET()
+
+        site._server.RequestHandlerClass = DelayedRestoreHandler
+
+        async def scenario():
+            waiter = None
+            try:
+                await _call("create_profile", name="delayed", activate=True, restore_tabs=True)
+                urls = [site.base + "/first", site.base + "/second"]
+                for url in urls:
+                    await _call("new_page", url=url)
+                await _call("list_pages")
+                tab = next(t for t in server._browser.tabs if t.url == urls[1])
+                await _wait_for_restored_document(tab, urls[1])
+                assert await server._evaluate_value(tab, "sessionStorage.setItem('restore-test', 'kept'); true") is True
+                await _call("close_browser")
+                hold.set()
+                async with asyncio.timeout(10):
+                    while True:
+                        await _call("list_pages")
+                        browser = await server._get_browser()
+                        if requested.is_set() and sorted(t.url for t in browser.tabs) == sorted(urls):
+                            break
+                        await asyncio.sleep(.05)
+                tab = next(t for t in browser.tabs if t.url == urls[1])
+                state = await server._evaluate_value(tab, "({href: location.href, ready: document.readyState})")
+                assert state == {"href": "about:blank", "ready": "complete"}, state
+                with pytest.raises(RuntimeError, match="SecurityError.*sessionStorage"):
+                    await server._evaluate_value(tab, "sessionStorage.getItem('restore-test')")
+
+                # The new readiness check must not accept the saved TargetInfo
+                # URL or the initial document's misleading 'complete' state.
+                waiter = asyncio.create_task(_wait_for_restored_document(tab, urls[1]))
+                await asyncio.sleep(.15)
+                assert not waiter.done(), "Readiness check accepted the initial document"
+                release.set()
+                await waiter
+                assert await server._evaluate_value(tab, "sessionStorage.getItem('restore-test')") == "kept"
+            finally:
+                release.set()
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+                await _call("use_temp_profile")
+
+        asyncio.run(scenario())
 
 
 @pytest.mark.slow

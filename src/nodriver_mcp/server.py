@@ -8073,8 +8073,15 @@ async def audit_security(
                 "fetch(location.href, {credentials: 'include', cache: 'no-store'}).then(r => r.status)",
                 await_promise=True,
             )
-            await asyncio.sleep(0.3)
-            doc = next((r for r in reversed(_network_requests) if _is_page(r)), None)
+            # The renderer's fetch promise can resolve before the Python CDP
+            # handlers record its response. Wait for that record, not a fixed
+            # grace period that produces false "no headers" warnings under load.
+            deadline = asyncio.get_running_loop().time() + 5
+            while True:
+                doc = next((r for r in reversed(_network_requests) if _is_page(r)), None)
+                if doc is not None or asyncio.get_running_loop().time() >= deadline:
+                    break
+                await asyncio.sleep(.05)
             source = "a fresh fetch() of the page URL (the page load itself was not recorded)"
         except Exception as e:
             source = f"nothing — the page load was not recorded and re-fetching it failed: {e}"

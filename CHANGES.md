@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.6.1 — reliable audit headers and browser regression checks
+
+`audit_security` now waits up to five seconds for the response headers of its
+fallback fetch to reach the network recorder. Previously, delayed CDP events
+could produce a false "no response headers" warning after only 300 ms.
+
+Browser regression checks now wait for restored documents and recorded dialog
+and SSE events, instead of treating target URLs or fixed sleeps as proof of
+readiness. Added controlled-delay coverage to verify the restored document and
+audit fallback behavior. Capture tests now report unexpected tool errors at
+the failing call rather than continuing with incomplete browser state.
+
+Tool count: 70 (unchanged).
+
 ## 2.6.0 — configurable profile startup and reliable tab restoration
 
 Persistent profiles now support three startup modes through `set_browser_flags`:
