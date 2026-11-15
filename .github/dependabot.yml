@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # SDK v2 needs a deliberate migration; keep update PRs on the supported API.
+    ignore:
+      - dependency-name: "mcp"
+        versions: [">=2"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

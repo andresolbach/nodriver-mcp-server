@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.6.2 — refreshed browser dependencies and regular compatibility checks
+
+Updated the runtime requirements and lockfile to nodriver 0.50.99, MCP SDK
+1.30.0 and Pillow 13.0.0. The SDK remains on the supported 1.x API; SDK 2.x
+requires a separate migration. The tool interface is unchanged.
+
+Verified on Windows 11 with Chrome 157.0.8103.52 and Python 3.12.11: 131
+non-browser tests and all 66 browser tests pass. PNG, JPEG and WebP screenshot
+output was also checked with the updated image library.
+
+Refreshed checkout, uv setup and artifact upload actions for the current GitHub
+runner runtime. Dependabot now proposes weekly Python dependency and GitHub
+Actions updates.
+CI uses the committed lockfile without silently resolving changes and runs
+weekly as well as on pull requests, so changes in the runner's Chrome can be
+detected between releases.
+
+Tool count: 70 (unchanged).
+
 ## 2.6.1 — reliable audit headers and browser regression checks
 
 `audit_security` now waits up to five seconds for the response headers of its
