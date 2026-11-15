@@ -1,6 +1,6 @@
 [project]
 name = "nodriver-mcp"
-version = "2.6.1"
+version = "2.6.2"
 description = "Chrome automation via nodriver: 70 MCP tools, isolated browsers, configurable profile startup, network capture and passive security checks"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -23,12 +23,12 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "mcp>=1.26.0,<2",
+    "mcp>=1.30.0,<2",
     # Chrome 146+ CDP fixes (sameParty removal, localNetworkAccessRequestPolicy
     # rename) that once required the Saber-CC fork are upstream as of 0.50.x.
-    # Tested with nodriver 0.50.6 and Chrome 155.
-    "nodriver>=0.50.6",
-    "pillow>=12.1.1",
+    # Tested with nodriver 0.50.99 and Chrome 157.
+    "nodriver>=0.50.99",
+    "pillow>=13.0.0",
     "tomli-w>=1.0.0",
 ]
 

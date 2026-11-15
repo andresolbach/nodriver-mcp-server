@@ -45,7 +45,7 @@ Claiming "undetected" is easy, so here is what the standard fingerprint suite re
 | `navigator.languages` | 4 entries |
 | User agent | no `Headless` token |
 
-Measured on Chrome 151 / Windows 11, headful, with the default profile. The current functional test suite uses Chrome 155 and nodriver 0.50.6. See [Scope and limitations](#scope-and-limitations) for how to interpret the fingerprint result.
+Measured on Chrome 151 / Windows 11, headful, with the default profile. The current functional test suite uses Chrome 157 and nodriver 0.50.99. See [Scope and limitations](#scope-and-limitations) for how to interpret the fingerprint result.
 
 ## Features
 
@@ -87,7 +87,7 @@ uv tool install "nodriver-mcp @ git+https://github.com/andresolbach/nodriver-mcp
 
 Also listed in the [official MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.andresolbach/nodriver-mcp-server`, so clients and marketplaces that read the registry can find and install it directly.
 
-> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.6`, tested against Chrome 155. `uv tool install` keeps dependencies isolated from your global Python environment.
+> Uses upstream [`nodriver`](https://pypi.org/project/nodriver/) `>=0.50.99`, tested against Chrome 157. `uv tool install` keeps dependencies isolated from your global Python environment.
 
 You'll also need a local installation of **Google Chrome** (auto-detected).
 
@@ -99,19 +99,21 @@ uv tool upgrade nodriver-mcp
 
 ## Requirements & tested versions
 
-The automated suite runs schema, documentation and behavior checks plus real-browser integration tests. The current Windows browser test environment is **Chrome 155 / nodriver 0.50.6 / Python 3.12.11**. CI also runs the non-browser suite on macOS and Linux. Future Chrome or nodriver releases can require compatibility updates.
+The automated suite runs schema, documentation and behavior checks plus real-browser integration tests. The current Windows browser test environment is **Chrome 157 / nodriver 0.50.99 / Python 3.12.11**. CI also runs the non-browser suite on macOS and Linux. Future Chrome or nodriver releases can require compatibility updates.
 
 | Component | Requirement | Verified version |
 |-----------|-------------|------------------|
 | Python | 3.12+ | 3.12.11 |
-| Google Chrome | any recent stable | 155.0.8059.79 |
+| Google Chrome | any recent stable | 157.0.8103.52 |
 | Operating system | Windows / macOS / Linux | Windows 11 |
-| `nodriver` | >= 0.50.6 | 0.50.6 |
-| `mcp` (MCP SDK) | >= 1.26.0, < 2 | 1.26.0 |
-| `pillow` | >= 12.1.1 | 12.1.1 |
+| `nodriver` | >= 0.50.99 | 0.50.99 |
+| `mcp` (MCP SDK) | >= 1.30.0, < 2 | 1.30.0 |
+| `pillow` | >= 13.0.0 | 13.0.0 |
 | `tomli-w` | >= 1.0.0 | 1.2.0 |
 
 Runtime dependency ranges and tested versions are listed in [`requirements.txt`](https://github.com/andresolbach/nodriver-mcp-server/blob/main/requirements.txt). `uv tool install` creates an isolated installation; contributors can use `uv sync --locked --group dev` in this repository to reproduce the committed dependency set.
+
+Dependency updates are proposed weekly by Dependabot. CI tests the committed lockfile on every pull request and weekly against the runner's Chrome; updates are reviewed before merging. MCP SDK 2.x is not enabled until its API migration has been tested.
 
 ## One-command MCP client setup
 
@@ -330,7 +332,7 @@ A real Chrome window by default; set `NODRIVER_HEADLESS=true` for headless.
 Create a persistent profile with `create_profile` and switch to it with `use_profile`, or use `save_session` / `load_session`.
 
 **Does it work on Windows / macOS / Linux?**
-The project supports all three. Browser integration tests run on Windows 11 with Chrome 155; CI runs the non-browser suite on Windows, macOS and Linux.
+The project supports all three. Browser integration tests run on Windows 11 with Chrome 157; CI runs the non-browser suite on Windows, macOS and Linux.
 
 ## Scope and limitations
 
@@ -341,7 +343,7 @@ The project supports all three. Browser integration tests run on Windows 11 with
 
 ## Changelog
 
-See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Version 2.6.0 adds per-profile startup modes, fixes graceful browser shutdown and tab restoration, and updates nodriver to 0.50.6. Existing network capture, passive security checks and isolated browser sessions remain available.
+See [CHANGES.md](https://github.com/andresolbach/nodriver-mcp-server/blob/main/CHANGES.md). Version 2.6.0 adds per-profile startup modes, fixes graceful browser shutdown and tab restoration, and updates nodriver to 0.50.99. Existing network capture, passive security checks and isolated browser sessions remain available.
 
 ## Credits
 
