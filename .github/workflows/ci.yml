@@ -22,10 +22,10 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -52,10 +52,10 @@ jobs:
     # so they belong on a platform where a desktop Chrome behaves normally.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
 
@@ -73,10 +73,10 @@ jobs:
     name: build distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10.3.3
 
       - name: Build sdist and wheel
         run: uv build
@@ -84,7 +84,7 @@ jobs:
       - name: Verify metadata
         run: uvx twine check dist/*
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: dist
           path: dist/

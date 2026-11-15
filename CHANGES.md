@@ -10,7 +10,9 @@ Verified on Windows 11 with Chrome 157.0.8103.52 and Python 3.12.11: 131
 non-browser tests and all 66 browser tests pass. PNG, JPEG and WebP screenshot
 output was also checked with the updated image library.
 
-Dependabot now proposes weekly Python dependency and GitHub Actions updates.
+Refreshed checkout, uv setup and artifact upload actions for the current GitHub
+runner runtime. Dependabot now proposes weekly Python dependency and GitHub
+Actions updates.
 CI uses the committed lockfile without silently resolving changes and runs
 weekly as well as on pull requests, so changes in the runner's Chrome can be
 detected between releases.
